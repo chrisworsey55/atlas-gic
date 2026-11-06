@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
+import requests
 
 from atlas.data import fred_provider, yf_provider
 from atlas.data.fred_provider import FredAlfredProvider
@@ -94,11 +95,38 @@ def test_fred_provider_applies_publication_lag(monkeypatch):
     assert s.iloc[0] == 1.0
 
 
-def test_fred_provider_api_key_not_logged(monkeypatch, caplog):
-    p, _ = _fred(monkeypatch, [])
-    with caplog.at_level("DEBUG"):
-        s = p.fetch("X", date(2024, 3, 1))
-    assert s.empty and "KEY" not in caplog.text
+def _assert_sanitized(exc, key="SECRETKEY123"):
+    assert key not in str(exc.value) and key not in repr(exc.value)
+    assert key not in str(exc.value.__cause__)
+    assert key not in str(exc.value.__context__)
+    assert exc.value.__suppress_context__ is True
+
+
+def test_fred_provider_http_error_does_not_leak_api_key(monkeypatch):
+    url = "https://api.stlouisfed.org/fred/series/observations?api_key=SECRETKEY123"
+
+    class BadResp:
+        status_code = 500
+
+        def raise_for_status(self):
+            raise requests.HTTPError(f"500 Server Error for url: {url}", response=self)
+
+    monkeypatch.setattr(fred_provider.requests, "get", lambda *a, **k: BadResp())
+    with pytest.raises(Exception) as exc:
+        FredAlfredProvider("SECRETKEY123", {}).fetch("CPIAUCSL", date(2024, 3, 1))
+    _assert_sanitized(exc)
+    assert "CPIAUCSL" in str(exc.value) and "500" in str(exc.value)
+
+
+def test_fred_provider_connection_error_does_not_leak_api_key(monkeypatch):
+    def boom(*a, **k):
+        raise requests.ConnectionError("HTTPSConnectionPool: /fred?api_key=SECRETKEY123 failed")
+
+    monkeypatch.setattr(fred_provider.requests, "get", boom)
+    with pytest.raises(Exception) as exc:
+        FredAlfredProvider("SECRETKEY123", {}).fetch("CPIAUCSL", date(2024, 3, 1))
+    _assert_sanitized(exc)
+    assert "CPIAUCSL" in str(exc.value)
 
 
 def test_ibkr_import_does_not_require_ib_async():
