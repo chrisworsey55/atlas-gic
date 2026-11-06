@@ -11,6 +11,8 @@ from atlas.portfolio.simbroker import SimBroker, size_order
 
 DEC = date(2024, 1, 2)    # decision day (Tue)
 NEXT = date(2024, 1, 3)   # next trading day
+FRI = date(2024, 1, 5)
+MON = date(2024, 1, 8)
 
 
 class FakePrices:
@@ -24,7 +26,7 @@ class FakePrices:
         for t in tickers:
             for d, o in self.bars.get(t, {}).items():
                 if start <= d <= end:
-                    rows.append((d, t, o, o + 1, o - 1, o, o, 1000))
+                    rows.append((d, t, o, o + 3, o - 3, o + 0.7, o + 0.7, 1000))
         return pd.DataFrame(rows, columns=PRICE_COLUMNS)
 
 
@@ -44,9 +46,10 @@ def broker(store, cps=0.005, cmin=1.0, bps=10.0):
 @pytest.fixture
 def store(tmp_path):
     return make_store(tmp_path, {
-        "AAA": {DEC: 100.0, NEXT: 100.0},
+        "AAA": {DEC: 90.0, NEXT: 100.0},
         "GAP": {DEC: 100.0, NEXT: 120.0},
         "OLD": {DEC: 50.0},  # no later bar
+        "FRI": {FRI: 70.0, MON: 80.0},
     })
 
 
@@ -103,6 +106,7 @@ def test_cash_never_negative_after_fills(store):
     pf = Portfolio(cash=10_000.0, positions={})
     fills, dropped = broker(store).submit([Order("GAP", "buy", 100)], DEC, portfolio=pf)
     assert len(fills) == 1 and fills[0].order.shares < 100
+    assert fills[0].price == pytest.approx(120.0 * 1.001)
     for f in fills:
         pf.apply(f)
     assert pf.cash >= 0
@@ -180,3 +184,19 @@ def test_portfolio_equity_valuation():
     pf = Portfolio(cash=100.0, positions={"A": 2, "B": 3})
     assert pf.equity({"A": 10.0, "B": 20.0}) == pytest.approx(100 + 20 + 60)
     assert Portfolio(cash=5.0, positions={}).equity({}) == 5.0
+
+
+def test_friday_decision_fills_monday_at_monday_open(store):
+    b = broker(store, bps=25.0)
+    pf = Portfolio(cash=0.0, positions={"FRI": 4})
+    buys, _ = b.submit([Order("FRI", "buy", 1)], FRI)
+    sells, _ = b.submit([Order("FRI", "sell", 4)], FRI, portfolio=pf)
+    assert buys[0].date == MON and sells[0].date == MON
+    assert buys[0].price == 80.0 * 1.0025
+    assert sells[0].price == 80.0 * 0.9975
+
+
+def test_decision_on_last_bar_with_data_present_is_dropped_with_reason(store):
+    fills, dropped = broker(store).submit([Order("OLD", "buy", 1)], DEC)
+    assert fills == []
+    assert len(dropped) == 1 and dropped[0][1]
