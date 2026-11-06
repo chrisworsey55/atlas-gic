@@ -171,3 +171,42 @@ def test_collect_stats_horizon_non_overlapping():
     d = frame("a", 40)
     s = collect_stats(FakeScores(d), ["a"], asof_window=60, horizon=5)[0]
     assert s.n_picks == 8
+
+
+def test_identical_ics_zero_dead_zone_unchanged():
+    w = {"a": 1.0, "b": 1.0}
+    stats = [AgentStats("a", 100, 0.1), AgentStats("b", 100, 0.1)]
+    assert update_weights(w, stats, dead_zone=0.0, k=K, warmup_picks=WARM) == w
+
+
+def test_exact_dead_zone_boundary_is_strict():
+    w = {"a": 1.0, "b": 1.0}
+    stats = [AgentStats("a", 100, 0.5), AgentStats("b", 100, -0.5)]
+    # k=0 -> shrunk == raw exactly; group mean 0.0; |deviation| == 0.5 == dead_zone
+    assert update_weights(w, stats, dead_zone=0.5, k=0.0, warmup_picks=WARM) == w
+    out = update_weights(w, stats, dead_zone=0.4999999, k=0.0, warmup_picks=WARM)
+    assert out["a"] == pytest.approx(1.05) and out["b"] == pytest.approx(0.95)
+
+
+@settings(max_examples=200, deadline=None)
+@given(data=st.lists(st.tuples(st.floats(-1, 1) | st.just(NAN), st.sampled_from([0, 5, 29, 30, 100, 10**6]),
+                               st.floats(0.3, 2.5)), min_size=1, max_size=8),
+       dz=st.floats(0, 0.6), k=st.floats(0, 50))
+def test_move_rule_exact(data, dz, k):
+    w = {f"a{i}": d[2] for i, d in enumerate(data)}
+    stats = [AgentStats(f"a{i}", d[1], d[0]) for i, d in enumerate(data)]
+    out = update_weights(w, stats, dz, k, WARM)
+    elig = [s for s in stats if s.n_picks >= WARM and not math.isnan(s.ic)]
+    mean = sum(s.ic for s in elig) / len(elig) if elig else 0.0
+    for s in stats:
+        before, after = w[s.agent], out[s.agent]
+        if len(elig) < 2 or s not in elig:
+            assert after == before
+            continue
+        dev = (s.n_picks * s.ic + k * mean) / (s.n_picks + k) - mean
+        if dev > dz:
+            assert after == min(W_MAX, before * 1.05)
+        elif dev < -dz:
+            assert after == max(W_MIN, before * 0.95)
+        else:
+            assert after == before
