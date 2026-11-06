@@ -282,6 +282,76 @@ def test_duplicate_orders_for_one_ticker_rejected():
     assert sum(1 for o, r in d.rejected if o.ticker == "AAPL" and "duplicate" in r) == 3
 
 
+def test_full_exit_of_sub_100_dollar_position_allowed():
+    # $90 full exit: $1 commission is 1.1% (> 1%) but closing a position reduces risk
+    d = _layer().apply([Order("A", "sell", 1)], {"A": 1}, 1e5, {"A": 90.0},
+                       prior_close_equity=1e5, peak_equity=1e5)
+    assert [(o.ticker, o.side, o.shares) for o in d.orders] == [("A", "sell", 1)]
+    assert d.rejected == []
+
+
+def test_full_exit_under_50_frees_slot_in_full_portfolio():
+    held = {t: 1 for t in "BCDEFGHI"}  # 8 positions worth $40 each
+    prices = {t: 40.0 for t in held} | {"A": 100.0}
+    d = _layer().apply([Order("C", "sell", 1), Order("A", "buy", 10)], held, 1e5, prices,
+                       prior_close_equity=1e5, peak_equity=1e5)
+    assert [(o.ticker, o.side, o.shares) for o in d.orders] == [("C", "sell", 1),
+                                                                 ("A", "buy", 10)]
+    assert d.rejected == []
+
+
+def test_partial_sell_under_50_still_dropped():
+    d = _run([Order("A", "sell", 1)], {"A": 10}, 1e5, {"A": 40.0})
+    assert d.orders == [] and "minimum" in _reasons(d)["A"]
+
+
+def test_full_exit_rejected_if_commission_would_overdraw_cash():
+    d = _layer().apply([Order("A", "sell", 1)], {"A": 1}, 0.0, {"A": 0.5},
+                       prior_close_equity=0.5, peak_equity=0.5)
+    assert d.orders == [] and "overdraw" in _reasons(d)["A"]
+
+
+def test_huge_order_shares_fail_closed_without_raising():
+    d = _layer().apply([Order("A", "buy", 10**400), Order("B", "buy", 10)], {}, 1e5,
+                       {"A": 100.0, "B": 100.0}, prior_close_equity=1e5, peak_equity=1e5)
+    assert [o.ticker for o in d.orders] == ["B"]
+    assert "implausible" in _reasons(d)["A"]
+    d = _layer().apply([Order("A", "sell", 10**400)], {"A": 10}, 1e5, {"A": 100.0},
+                       prior_close_equity=1e5, peak_equity=1e5)
+    assert d.orders == [] and "implausible" in _reasons(d)["A"]
+
+
+def test_huge_held_position_fails_closed_without_raising():
+    d = _layer().apply([Order("A", "sell", 1)], {"A": 10**400}, 1e5, {"A": 100.0},
+                       prior_close_equity=1e5, peak_equity=1e5)
+    assert d.orders == [] and len(d.rejected) == 1 and "equity" in d.rejected[0][1]
+
+
+def test_orders_none_returns_empty_decision():
+    d = _layer().apply(None, {}, 1e5, {}, prior_close_equity=1e5, peak_equity=1e5)
+    assert d == RiskDecision([], [], False, None)
+
+
+def test_numpy_integers_accepted():
+    import numpy as np
+    prices = {"A": np.float64(100.0), "B": np.float32(50.0)}
+    positions = {"A": np.int64(20)}
+    orders = [Order("A", "sell", np.int64(5)), Order("B", "buy", np.int64(10))]
+    d = _layer().apply(orders, positions, np.float64(1e5), prices,
+                       prior_close_equity=np.float64(102_000.0), peak_equity=102_000.0)
+    assert [(o.ticker, o.side, o.shares) for o in d.orders] == [("A", "sell", 5),
+                                                                 ("B", "buy", 10)]
+    assert all(type(o.shares) is int for o in d.orders)
+    assert d.rejected == []
+
+
+def test_numpy_bool_shares_rejected():
+    import numpy as np
+    d = _run([Order("A", "buy", np.bool_(True)), Order("B", "buy", True)], {}, 1e5,
+             {"A": 100.0, "B": 100.0})
+    assert d.orders == [] and len(d.rejected) == 2
+
+
 def test_layer_is_pure_and_deterministic():
     prices = {"AAPL": 100.0, "MSFT": 50.0}
     positions = {"AAPL": 10}
@@ -338,8 +408,16 @@ def test_property_exposure_and_cash_invariants(scenario):
                              prior_close_equity=max(eq0, 1.0) * prior_mult,
                              peak_equity=max(eq0, 1.0) * peak_mult)
 
-    # every incoming order is either emitted (possibly clipped) or rejected, never both lost
-    assert len(d.rejected) <= len(orders)
+    # accounting: every incoming order is rejected exactly once or emitted exactly once
+    # (possibly clipped, same ticker and side); nothing is silently dropped or duplicated
+    rejected_ids = [id(o) for o, _ in d.rejected]
+    assert len(rejected_ids) == len(set(rejected_ids))
+    assert set(rejected_ids) <= {id(o) for o in orders}
+    if d.halted:
+        assert len(d.rejected) == len(orders)
+    else:
+        kept = sorted((o.ticker, o.side) for o in orders if id(o) not in set(rejected_ids))
+        assert kept == sorted((o.ticker, o.side) for o in d.orders)
     if not priced:
         assert d.orders == [] and len(d.rejected) == len(orders)
         return

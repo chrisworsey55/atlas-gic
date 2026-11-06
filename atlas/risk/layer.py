@@ -39,18 +39,27 @@ Policy (all thresholds come from `Limits`):
   held (after sells) is rejected; existing positions may still be increased.
 * Any order (after clipping) worth less than `min_order_usd`, or whose commission
   max(commission_min, commission_per_share * shares) exceeds max_commission_frac of its
-  value, is rejected. Orders clipped to zero shares are rejected. The kill-switch flatten
-  orders are exempt from these filters: flattening must be complete.
+  value, is rejected. Orders clipped to zero shares are rejected. Full exits (a sell that
+  closes the whole position) and the kill-switch flatten orders are exempt from these cost
+  filters: reducing risk must never be blocked by them (a full exit is still rejected if
+  its commission would overdraw cash). Partial sells remain filtered.
+* Numeric input may be Python or numpy (numbers.Integral shares/positions, numbers.Real
+  prices/cash), never bool; it is converted to plain int/float internally. An order worth
+  more than 1000x equity is rejected as malformed. `apply` never raises on bad input: a
+  non-iterable `orders` yields an empty decision and any arithmetic failure yields a
+  reject-all decision.
 """
 from __future__ import annotations
 
 import math
+import numbers
 from dataclasses import dataclass
 
 from atlas.config import Limits
 from atlas.portfolio.models import Order
 
 _SAFETY = 1e-9  # relative margin on the equity floor, absorbs float summation-order noise
+_MAX_ORDER_EQUITY_MULT = 1000  # an order worth more than 1000x equity is malformed input
 
 
 @dataclass(frozen=True)
@@ -62,16 +71,18 @@ class RiskDecision:
 
 
 def _is_int(x) -> bool:
-    return isinstance(x, int) and not isinstance(x, bool)
+    """Python or numpy integer (numbers.Integral), but never a bool."""
+    return isinstance(x, numbers.Integral) and not isinstance(x, bool)
 
 
 def _is_num(x) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
-
-
-def _good_price(prices: dict, ticker) -> bool:
-    p = prices.get(ticker)
-    return _is_num(p) and p > 0
+    """Finite real number (Python or numpy), but never a bool."""
+    if not isinstance(x, numbers.Real) or isinstance(x, bool):
+        return False
+    try:
+        return math.isfinite(float(x))
+    except (OverflowError, ValueError, TypeError):
+        return False
 
 
 class RiskLayer:
@@ -104,7 +115,20 @@ class RiskLayer:
     def apply(self, orders: list[Order], positions: dict[str, int], cash: float,
               prices: dict[str, float], prior_close_equity: float,
               peak_equity: float) -> RiskDecision:
-        incoming = list(orders)
+        """Never raises on bad input: anything unevaluable yields a fail-closed decision."""
+        try:
+            incoming = list(orders)
+        except TypeError:  # None / not iterable: nothing to trade, nothing to reject
+            return RiskDecision([], [], False, None)
+        try:
+            return self._apply(incoming, positions, cash, prices, prior_close_equity,
+                               peak_equity)
+        except (ArithmeticError, ValueError, TypeError) as e:  # backstop: fail closed
+            return RiskDecision([], [(o, f"risk evaluation failed ({type(e).__name__}): "
+                                         "fail closed") for o in incoming], False, None)
+
+    def _apply(self, incoming: list, positions, cash, prices, prior_close_equity,
+               peak_equity) -> RiskDecision:
         L = self.limits
 
         def reject_all(reason: str) -> RiskDecision:
@@ -119,19 +143,27 @@ class RiskLayer:
         for t, s in positions.items():
             if not isinstance(t, str) or not _is_int(s) or s < 0:
                 return reject_all(f"invalid position {t!r}={s!r}: equity cannot be computed")
-        held = {t: s for t, s in positions.items() if s > 0}
+        held = {t: int(s) for t, s in positions.items() if s > 0}
         if not _is_num(cash):
             return reject_all(f"invalid cash {cash!r}: equity cannot be computed")
+        cash = float(cash)
+        # usable prices only, as plain floats; anything missing/NaN/inf/<=0 is absent
+        prices = {t: float(p) for t, p in prices.items()
+                  if isinstance(t, str) and _is_num(p) and p > 0}
         for t in sorted(held):
-            if not _good_price(prices, t):
+            if t not in prices:
                 return reject_all(f"missing or invalid price for held {t}: "
                                   "equity cannot be computed")
-        equity = cash + sum(held[t] * prices[t] for t in sorted(held))
+        try:
+            equity = cash + sum(held[t] * prices[t] for t in sorted(held))
+        except OverflowError:
+            return reject_all("held position too large: equity cannot be computed")
         if not math.isfinite(equity):
             return reject_all("equity cannot be computed (non-finite)")
         for name, v in (("prior_close_equity", prior_close_equity), ("peak_equity", peak_equity)):
             if not _is_num(v) or v <= 0:
                 return reject_all(f"invalid {name} {v!r}: limits cannot be evaluated")
+        prior_close_equity, peak_equity = float(prior_close_equity), float(peak_equity)
 
         # ---- kill switch: flatten everything and halt
         if equity <= peak_equity * (1 - L.drawdown_kill_pct):
@@ -151,8 +183,9 @@ class RiskLayer:
         for o in incoming:
             if isinstance(o, Order) and isinstance(o.ticker, str):
                 counts[o.ticker] = counts.get(o.ticker, 0) + 1
-        sells: list[Order] = []
-        buys: list[Order] = []
+        # (original order, normalised copy with plain-int shares); rejections cite the original
+        sells: list[tuple[Order, Order]] = []
+        buys: list[tuple[Order, Order]] = []
         for o in incoming:
             if not isinstance(o, Order) or not isinstance(o.ticker, str) or not o.ticker:
                 rejected.append((o, "invalid order/ticker"))
@@ -162,10 +195,15 @@ class RiskLayer:
                 rejected.append((o, f"invalid side {o.side!r}"))
             elif not _is_int(o.shares) or o.shares <= 0:
                 rejected.append((o, f"invalid shares {o.shares!r}: must be a positive integer"))
-            elif not _good_price(prices, o.ticker):
+            elif o.ticker not in prices:
                 rejected.append((o, "missing or invalid price: fail closed"))
+            elif o.shares > _MAX_ORDER_EQUITY_MULT * equity / prices[o.ticker]:
+                # int-vs-float comparison is exact and cannot overflow
+                rejected.append((o, "order size implausible (> "
+                                    f"{_MAX_ORDER_EQUITY_MULT}x equity): fail closed"))
             else:
-                (sells if o.side == "sell" else buys).append(o)
+                norm = Order(o.ticker, o.side, int(o.shares))
+                (sells if o.side == "sell" else buys).append((o, norm))
 
         out: list[Order] = []
 
@@ -178,20 +216,28 @@ class RiskLayer:
             return None
 
         # ---- sells first
-        for o in sells:
+        for orig, o in sells:
             p = prices[o.ticker]
             h = held.get(o.ticker, 0)
             if h <= 0:
-                rejected.append((o, "short sell rejected: no shares held (long-only)"))
+                rejected.append((orig, "short sell rejected: no shares held (long-only)"))
                 continue
             n = min(o.shares, h)
-            why = size_filter(n, p)
-            if why is None and self.commission(n) > n * p:
-                why = "commission exceeds sale proceeds"
+            if n == h:
+                # Full exit: risk-reducing, so exempt from the min-order / commission cost
+                # filters (they are for new trades; otherwise a position worth < ~$100 could
+                # never be closed and could block a slot). Only cash may not go negative.
+                why = None
+                if cash + (n * p - self.commission(n)) < 0:
+                    why = "full exit would overdraw cash (commission exceeds proceeds)"
+            else:
+                why = size_filter(n, p)
+                if why is None and self.commission(n) > n * p:
+                    why = "commission exceeds sale proceeds"
             if why:
-                rejected.append((o, why))
+                rejected.append((orig, why))
                 continue
-            out.append(o if n == o.shares else Order(o.ticker, "sell", n))
+            out.append(Order(o.ticker, "sell", n))
             cash = cash + (n * p - self.commission(n))
             held[o.ticker] = h - n
             if held[o.ticker] == 0:
@@ -199,10 +245,10 @@ class RiskLayer:
 
         # ---- buys, in the order given
         if daily_loss:
-            rejected.extend((o, "daily loss limit") for o in buys)
+            rejected.extend((orig, "daily loss limit") for orig, _ in buys)
             buys = []
         gross = sum(held[t] * prices[t] for t in sorted(held))
-        reserve = sum(self.commission(o.shares) for o in buys)
+        reserve = sum(self.commission(o.shares) for _, o in buys)
         eq_floor = (cash + gross - reserve) * (1 - _SAFETY)
         pos_cap = L.max_position_pct * eq_floor
         gross_cap = L.max_gross_pct * eq_floor
@@ -211,14 +257,14 @@ class RiskLayer:
         def floor_room(room: float, p: float) -> int:
             return math.floor(room / p) if room > 0 else 0
 
-        for o in buys:
+        for orig, o in buys:
             t, p = o.ticker, prices[o.ticker]
             h = held.get(t, 0)
             if eq_floor <= 0:
-                rejected.append((o, "insufficient equity"))
+                rejected.append((orig, "insufficient equity"))
                 continue
             if h == 0 and n_positions >= L.max_positions:
-                rejected.append((o, f"max positions ({L.max_positions}) reached"))
+                rejected.append((orig, f"max positions ({L.max_positions}) reached"))
                 continue
             bounds = {"requested": o.shares,
                       "position cap": floor_room(pos_cap - h * p, p),
@@ -234,13 +280,13 @@ class RiskLayer:
                 n -= 1
             if n <= 0:
                 binding = min(bounds, key=lambda k: bounds[k])
-                rejected.append((o, f"clipped to zero shares by {binding}"))
+                rejected.append((orig, f"clipped to zero shares by {binding}"))
                 continue
             why = size_filter(n, p)
             if why:
-                rejected.append((o, why))
+                rejected.append((orig, why))
                 continue
-            out.append(o if n == o.shares else Order(t, "buy", n))
+            out.append(Order(t, "buy", n))
             cash = cash - (n * p + self.commission(n))
             gross = gross + n * p
             held[t] = h + n
