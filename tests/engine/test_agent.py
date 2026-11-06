@@ -142,9 +142,8 @@ def test_rate_limit_uses_backoff_then_gives_up(tmp_path):
     res = run(llm, log, sleeps)
     assert res.failure.reason == FailureReason.RATE_LIMITED and res.output is None
     n = client.calls
-    assert 2 <= n <= 6  # bounded
-    assert len(sleeps) == n - 1  # sleeps only between attempts
-    assert sleeps == sorted(sleeps) and sleeps[1] > sleeps[0]  # exponential growth
+    assert n == 4  # bounded: exactly 4 attempts
+    assert sleeps == [1.0, 2.0, 4.0]  # exponential backoff, sleeps only between attempts
     assert list(rows(log)["attempt"]) == list(range(1, n + 1))
     assert set(rows(log)["reason"]) == {"rate_limited"}
 
@@ -195,11 +194,12 @@ def test_fenced_json_accepted(tmp_path):
 
 
 def test_budget_exceeded_propagates_and_failed_tokens_count(tmp_path):
-    client, llm, log = setup(tmp_path, ["bad", good()], budget=0.00012)  # 150 tokens @ $1/Mtok = 0.00015
+    # worst case per call ~0.00411 (4096 max output tokens @ $1/Mtok); budget allows one, not two
+    client, llm, log = setup(tmp_path, ["bad", good()], budget=0.00415)
     with pytest.raises(BudgetExceeded):
         run(llm, log)
-    assert llm.spent_usd == pytest.approx(0.00015)
-    assert client.calls == 1
+    assert llm.spent_usd == pytest.approx(0.00015)  # the failed attempt's tokens still count
+    assert client.calls == 1  # the retry was refused before being made
 
 
 def test_summary_counts_by_agent_and_reason(tmp_path):
@@ -208,3 +208,46 @@ def test_summary_counts_by_agent_and_reason(tmp_path):
     s = log.summary()
     assert list(s.columns) == ["agent", "reason", "count"]
     assert s.iloc[0].to_dict() == {"agent": "macro", "reason": "malformed_json", "count": 2}
+
+
+def test_rerun_of_cached_bad_day_adds_no_replay_rows(tmp_path):
+    client, llm, log = setup(tmp_path, ["bad", "bad", "bad again"])
+    run(llm, log)
+    assert len(rows(log)) == 2 and client.calls == 2
+    # re-run: attempt 1 replays the cached bad response (not re-logged); the retry is a fresh
+    # live call (bypasses cache) and is the only new row
+    res = run(llm, log)
+    assert client.calls == 3 and res.status == "no_opinion"
+    assert res.failure.raw_response == "bad again" and res.failure.attempt == 2
+    assert len(rows(log)) == 3
+
+
+def test_cached_bad_then_good_retry_adds_no_rows(tmp_path):
+    client, llm, log = setup(tmp_path, ["bad", "bad", good()])
+    run(llm, log)
+    n = len(rows(log))
+    assert run(llm, log).status == "ok"
+    assert len(rows(log)) == n
+
+
+def test_dropped_picks_not_in_call_failure_summary(tmp_path):
+    picks = [{"ticker": "ZZZZ", "direction": "long", "conviction": 0.9, "horizon_days": 20}]
+    client, llm, log = setup(tmp_path, [good(picks)])
+    run(llm, log)
+    assert log.summary().empty
+    d = log.dropped_picks_summary()
+    assert d.iloc[0].to_dict() == {"agent": "macro", "reason": "schema_invalid", "count": 1}
+    r = rows(log)
+    assert list(r["kind"]) == ["dropped_pick"]
+    # replaying the cached good day does not re-log the drop
+    run(llm, log)
+    assert len(rows(log)) == 1
+
+
+def test_run_id_recorded(tmp_path):
+    client = Scripted(["bad", "bad"])
+    llm = CachedLLM(client, tmp_path / "c.db", "m", (1.0, 1.0), 100.0)
+    log = FailureLog(tmp_path / "f.db", run_id="run-7")
+    run(llm, log)
+    r = rows(log)
+    assert set(r["run_id"]) == {"run-7"} and set(r["kind"]) == {"call_failure"}

@@ -14,7 +14,7 @@ from typing import Callable
 from pydantic import ValidationError
 
 from atlas.config import AgentSpec
-from atlas.engine.failures import FailureLog
+from atlas.engine.failures import CALL_FAILURE, DROPPED_PICK, FailureLog
 from atlas.engine.llm import ApiError, CachedLLM, LLMResponse, RateLimited, Timeout
 from atlas.schemas import AgentOutput, AgentResult, FailureReason, FailureRecord
 
@@ -69,16 +69,18 @@ def run_agent(spec: AgentSpec, prompt: str, inputs: dict, asof: date, llm: Cache
     transient_failures = 0
     bypass = False
 
-    def log(reason: FailureReason, detail: str, raw: str) -> FailureRecord:
+    def log(reason: FailureReason, detail: str, raw: str, *, kind: str = CALL_FAILURE,
+            replayed: bool = False) -> FailureRecord:
         rec = FailureRecord(agent=spec.name, date=asof, reason=reason, detail=detail,
                             attempt=attempt, raw_response=raw)
-        failures.record(rec)
+        if not replayed:  # a cache replay was already logged by the run that made the call
+            failures.record(rec, kind=kind)
         return rec
 
     while True:
         attempt += 1
         try:
-            resp = llm.call(prompt, user, max_tokens=MAX_TOKENS, bypass_cache=bypass)
+            resp, replayed = llm.call_with_meta(prompt, user, max_tokens=MAX_TOKENS, bypass_cache=bypass)
         except (RateLimited, Timeout, ApiError) as e:
             reason = (FailureReason.RATE_LIMITED if isinstance(e, RateLimited)
                       else FailureReason.TIMEOUT if isinstance(e, Timeout) else FailureReason.API_ERROR)
@@ -91,7 +93,7 @@ def run_agent(spec: AgentSpec, prompt: str, inputs: dict, asof: date, llm: Cache
         try:
             out = _parse(spec, asof, resp)
         except _Fail as f:
-            rec = log(f.reason, f.detail, resp.text)
+            rec = log(f.reason, f.detail, resp.text, replayed=replayed)
             if f.reason == FailureReason.REFUSAL:
                 return AgentResult(agent=spec.name, date=asof, failure=rec)
             content_failures += 1
@@ -105,6 +107,7 @@ def run_agent(spec: AgentSpec, prompt: str, inputs: dict, asof: date, llm: Cache
                 kept.append(p)
             else:
                 log(FailureReason.SCHEMA_INVALID,
-                    f"pick dropped: ticker {p.ticker!r} not in universe", resp.text)
+                    f"pick dropped: ticker {p.ticker!r} not in universe", resp.text,
+                    kind=DROPPED_PICK, replayed=replayed)
         out = out.model_copy(update={"picks": kept})
         return AgentResult(agent=spec.name, date=asof, output=out)

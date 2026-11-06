@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -62,7 +63,7 @@ def test_cost_from_token_counts(tmp_path):
     assert llm.spent_usd == pytest.approx(3.0 + 7.5)
 
 
-def test_budget_exceeded_raises(tmp_path):
+def test_budget_exceeded_raises_before_call_that_would_exceed(tmp_path):
     class C:
         calls = 0
 
@@ -71,14 +72,50 @@ def test_budget_exceeded_raises(tmp_path):
             return LLMResponse("x", 1_000_000, 0, "end_turn")
 
     llm = CachedLLM(C(), tmp_path / "c.db", "m", (1.0, 1.0), 1.5)
-    llm.call("a", "u")  # spend 1.0, under budget
-    with pytest.raises(BudgetExceeded):  # pushes to 2.0 -> raised after the call
-        llm.call("b", "u")
-    assert C.calls == 2
-    with pytest.raises(BudgetExceeded):  # raised BEFORE a third call
-        llm.call("c", "u")
-    assert C.calls == 2
+    llm.call("a", "u", max_tokens=10)  # actual spend 1.0, under budget
+    # worst case for this call is ~1.0 (1M max output tokens): 1.0 + 1.0 > 1.5 -> refused, NOT made
+    with pytest.raises(BudgetExceeded):
+        llm.call("b", "u", max_tokens=1_000_000)
+    assert C.calls == 1 and llm.spent_usd == pytest.approx(1.0)
     llm.call("a", "u")  # cache hit still free and allowed
+    assert C.calls == 1
+
+
+def test_budget_exhausted_refuses_further_calls(tmp_path):
+    client, llm = make(tmp_path, budget=0.0)
+    with pytest.raises(BudgetExceeded):
+        llm.call("s", "u")
+    assert client.calls == 0
+
+
+def test_concurrent_calls_never_exceed_budget(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    lock = threading.Lock()
+    state = {"calls": 0}
+
+    class C:
+        def complete(self, system, user, max_tokens):
+            with lock:
+                state["calls"] += 1
+            time.sleep(0.02)  # widen the race window
+            return LLMResponse("x", 1000, 0, "end_turn")  # $1 per call at $1000/Mtok
+
+    llm = CachedLLM(C(), tmp_path / "c.db", "m", (1000.0, 1000.0), 3.0)
+
+    def go(i):
+        try:
+            llm.call(f"{i:02d}" + "x" * 3998, "u", max_tokens=1)  # ~1000 input tokens
+            return "ok"
+        except BudgetExceeded:
+            return "refused"
+
+    with ThreadPoolExecutor(16) as ex:
+        results = list(ex.map(go, range(16)))
+    assert results.count("ok") == 2 and results.count("refused") == 14  # worst-case reservations: 2 fit under $3, 3rd does not
+    assert state["calls"] == 2 and llm.spent_usd <= 3.0
+    assert sqlite3.connect(tmp_path / "c.db").execute("select count(*) from llm_cache").fetchone()[0] == 2
 
 
 def test_bypass_cache_forces_call_and_overwrites_entry(tmp_path):
