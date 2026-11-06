@@ -56,7 +56,7 @@ atlas/
   portfolio/{models.py, simbroker.py}
   risk/layer.py
   scoring/{store.py, metrics.py, weights.py}
-  backtest/{runner.py, checkpoint.py, predlog.py, nulltest.py, control.py, ablation.py, report.py}
+  backtest/{runner.py, checkpoint.py, predlog.py, nulltest.py, control.py, ablation.py, report.py, contamination.py (optional), oldmodel.py (optional)}
   autoresearch/{gitops.py, loop.py}
   cli.py
 tests/                   # mirrors the package
@@ -317,10 +317,29 @@ tests/                   # mirrors the package
 - [ ] **Step 4: Run** the full suite: `pytest -q`. Expected: PASS, with `live` tests skipped.
 - [ ] **Step 5: Commit** `feat: add CLI and golden end-to-end backtest`
 
+### Task 17 (optional): Contamination probe and older-model check
+
+Optional per the spec (validity controls 4 and 5). Build only after Tasks 1-16 pass; the core system does not depend on it.
+
+**Files:**
+- Create: `atlas/backtest/contamination.py`, `atlas/backtest/oldmodel.py`
+- Modify: `atlas/backtest/report.py` (add a contamination section when a score is supplied), `atlas/cli.py` (add `probe` subcommand)
+- Test: `tests/backtest/test_contamination.py`, `tests/backtest/test_oldmodel.py`
+
+**Interfaces:**
+- Consumes: `anonymize_snapshot` and `CachedLLM`, `Snapshot`, `Settings.model_cutoff`.
+- Produces: `contamination_probe(snapshots:list[tuple[Snapshot,date,str]], llm:CachedLLM, tolerance_days:int)->ContaminationScore` (`ContaminationScore(n:int, date_hits:int, ticker_hits:int, rate:float)`; a date hit is a guess within `tolerance_days` of the true date); `period_after_cutoff(periods:Periods, model_cutoff:date)->tuple[date,date]|None`; `available_models()->list[ModelInfo]` is NOT provided (model availability is checked by the user, passed in as config `older_model:str|None`); `run_older_model_check(cfg:BacktestConfig, older_model:str, older_cutoff:date, ...)->BacktestResult|None` (returns `None` when no period lies after the older model's cutoff).
+
+- [ ] **Step 1: Write failing tests**: `test_probe_scores_exact_date_guess_as_hit`; `test_probe_scores_guess_outside_tolerance_as_miss`; `test_probe_uses_anonymised_snapshots_only` (user prompt contains no real ticker or date); `test_probe_rate_zero_when_stub_always_wrong`; `test_period_after_cutoff_none_when_all_dates_precede_cutoff`; `test_older_model_check_skipped_with_clear_message_when_no_window`; `test_report_includes_contamination_section_only_when_score_given`.
+- [ ] **Step 2: Run** `pytest tests/backtest/test_contamination.py tests/backtest/test_oldmodel.py -v`. Expected: FAIL.
+- [ ] **Step 3: Implement** both modules; the probe asks the model to guess date and ticker and parses a small JSON reply through the same failure handling as `run_agent`.
+- [ ] **Step 4: Run** the tests, then the full suite `pytest -q`. Expected: PASS.
+- [ ] **Step 5: Commit** `feat: add optional contamination probe and older-model check`
+
 ---
 
 ## Self-review notes
 
-- **Spec coverage:** roster and benchmarks (T1, T6); data flow, contract, fills, costs (T2, T3, T6, T8); scoring, weights, null test (T9, T10, T13); autoresearch (T14); risk layer (T7); harness, periods, determinism, cost control, resumability (T5, T12); validity controls 1-7 (labelling T15; control agent T13; anonymisation T12; contamination probe and older-model check are marked optional/opportunistic in the spec and are **deliberately left out of this plan**; point-in-time data T3-T4; prediction log T11); report (T15); error handling (T5, T6, T7); testing strategy including the golden and null tests (T3, T13, T16).
+- **Spec coverage:** roster and benchmarks (T1, T6); data flow, contract, fills, costs (T2, T3, T6, T8); scoring, weights, null test (T9, T10, T13); autoresearch (T14); risk layer (T7); harness, periods, determinism, cost control, resumability (T5, T12); validity controls 1-7 (labelling T15; control agent T13; anonymisation T12; contamination probe and older-model check T17 (optional); point-in-time data T3-T4; prediction log T11); report (T15); error handling (T5, T6, T7); testing strategy including the golden and null tests (T3, T13, T16).
 - **Deferred by the spec:** open items in spec section 12 (final risk values, holdout model cutoff, universe, window lengths) are `Settings`/`Limits` config values, finalised after the first null-test run.
 - **Type consistency:** `Order` is first defined in Task 7 and extended in Task 8; the pipeline in Task 6 uses a plain dict state to avoid depending on Task 8's `Portfolio`.
