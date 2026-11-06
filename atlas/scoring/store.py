@@ -55,8 +55,19 @@ class ScoreStore:
         finally:
             conn.close()
 
+    def discard_unscored(self, agent: str, day: date) -> None:
+        """Delete (agent, day) pick rows that have no scored horizon (left by an earlier,
+        uncommitted attempt at the day). Rows with any scored horizon are never touched."""
+        with self._conn() as c:
+            c.execute("DELETE FROM picks WHERE agent=? AND date=? AND excess_1 IS NULL "
+                      "AND excess_5 IS NULL AND excess_10 IS NULL", (agent, day.isoformat()))
+
     def record_picks(self, result: AgentResult) -> None:
+        """Replace the (agent, date) picks unless any is scored. A non-ok result records
+        nothing and discards that agent's unscored rows for the date (a re-run day where
+        the agent now fails must not keep the crashed attempt's picks)."""
         if result.status != "ok" or result.output is None:
+            self.discard_unscored(result.agent, result.date)
             return
         rows = {}
         for p in result.output.picks:

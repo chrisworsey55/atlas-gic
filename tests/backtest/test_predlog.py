@@ -174,3 +174,40 @@ def test_torn_last_line_fails_verify_and_append_raises(tmp_path):
     assert log.verify() is False
     with pytest.raises(ValueError):
         log.append(D3, _res(D3))
+
+
+def test_drop_uncommitted_tail_removes_only_the_single_uncheckpointed_line(tmp_path):
+    log, hashes = make(tmp_path)
+    before = log.path.read_text().splitlines(keepends=True)
+    log.drop_uncommitted_tail(D3, 2, hashes[1])
+    assert log.path.read_text() == "".join(before[:2])
+    assert log.verify() and log.head() == (2, hashes[1])
+    assert not (tmp_path / "p.jsonl.tmp").exists()
+    # re-append different content for the dropped day is now allowed
+    log.append(D3, _res(D3, "BBB"))
+    assert log.head()[0] == 3
+
+
+@pytest.mark.parametrize("args", [
+    (D3, 1, None),          # log is two lines ahead
+    (D3, 3, "x"),           # log is not ahead at all
+    (D2, 2, None),          # wrong expected day   (hash replaced below)
+    (D3, 2, "0" * 64),      # committed prefix does not match the checkpoint
+])
+def test_drop_uncommitted_tail_refuses_anything_else(tmp_path, args):
+    log, hashes = make(tmp_path)
+    day, count, h = args
+    if day == D2:
+        h = hashes[1]
+    if count == 1:
+        h = hashes[0]
+    raw = log.path.read_bytes()
+    with pytest.raises(ValueError):
+        log.drop_uncommitted_tail(day, count, h)
+    assert log.path.read_bytes() == raw
+
+
+def test_drop_uncommitted_tail_from_empty_checkpoint(tmp_path):
+    log, _ = make(tmp_path, days=(D1,))
+    log.drop_uncommitted_tail(D1, 0, None)
+    assert log.path.read_text() == "" and log.head() == (0, None)

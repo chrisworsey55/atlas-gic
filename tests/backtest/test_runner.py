@@ -449,6 +449,7 @@ def test_budget_exceeded_pauses_and_spend_is_restored_on_resume(tmp_path):
     env2.pipeline = env2._pipeline(budget=cp["spent_usd"])  # no headroom left after restore
     with pytest.raises(RunPaused, match="budget"):
         env2.run()
+    assert env2.calls == []  # restored spend blocked the very first live call of the resumed day
     assert env2.llm.spent_usd >= cp["spent_usd"]
     assert json.loads(env2.checkpoint.path.read_text())["last_completed_day"] == last
 
@@ -591,3 +592,201 @@ def test_anonymize_hides_tickers_and_dates_but_keeps_sector(tmp_path):
     for f in fills:
         if f.order.side == "buy":
             assert f.order.shares * f.price <= 0.31 * INITIAL * 1.2
+
+
+# ---------------------------------------------------------------------------- fix round 1
+
+DAY6 = WEEKDAYS[5]
+
+
+def _crash_then_resume(root, phase1, phase2, n_days=10, crash_on=6):
+    """Run with `phase1` until the kill at the crash_on-th checkpoint save, then resume with
+    fresh objects on the same files using `phase2`."""
+    env = Env(root, phase1, n_days=n_days, checkpoint=CrashingCheckpoint(root / "cp.json", crash_on))
+    with pytest.raises(KeyboardInterrupt):
+        env.run()
+    assert json.loads(env.predlog.path.read_text().splitlines()[-1])["day"] == WEEKDAYS[crash_on - 1].isoformat()
+    env2 = Env(root, phase2, n_days=n_days, checkpoint=Checkpoint(root / "cp.json"))
+    return env2, env2.run()
+
+
+def _assert_same_run(env, res, ref_env, ref_res):
+    a, b = _final(env, res), _final(ref_env, ref_res)
+    assert a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and a[4] == b[4]
+    pd.testing.assert_frame_equal(a[5], b[5])
+    assert a[6] == b[6] and a[7] == b[7]
+
+
+def _on(day, names, action):
+    def handler(name, u):
+        if u["asof"] == day.isoformat() and name in names:
+            return action()
+        return default_handler(name, u)
+    return handler
+
+
+def _raise_api():
+    raise ApiError("503 upstream")
+
+
+def test_resume_when_crashed_day_had_content_failure_that_now_succeeds(tmp_path):
+    # phase 1: s3's response is bad (and cached); on resume the replay is bad but the live
+    # retry succeeds, so the re-run's results differ from the logged (uncommitted) line
+    env, res = _crash_then_resume(tmp_path / "a", _on(DAY6, {"s3"}, lambda: "not json"), default_handler)
+    ref_env = Env(tmp_path / "ref", n_days=10)
+    _assert_same_run(env, res, ref_env, ref_env.run())
+    assert res.day_results[DAY6].results["s3"].status == "ok"
+
+
+def test_resume_when_crashed_day_had_transient_failure_that_now_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_mod, "BACKOFF_BASE_S", 0.0)
+    env, res = _crash_then_resume(tmp_path / "b", _on(DAY6, {"s3"}, _raise_api), default_handler)
+    ref_env = Env(tmp_path / "ref", n_days=10)
+    _assert_same_run(env, res, ref_env, ref_env.run())
+
+
+def test_resume_leaves_no_stale_picks_for_agent_that_fails_on_rerun(tmp_path, monkeypatch):
+    # phase 1: m1 fails transiently (not decisive), s3 is ok and its picks are recorded.
+    # phase 2: m1 succeeds, so s3's inputs change (cache miss) and s3 now fails.
+    monkeypatch.setattr(agent_mod, "BACKOFF_BASE_S", 0.0)
+    phase2 = _on(DAY6, {"s3"}, lambda: "not json")
+    env, res = _crash_then_resume(tmp_path / "c", _on(DAY6, {"m1"}, _raise_api), phase2)
+    assert res.day_results[DAY6].results["s3"].status == "no_opinion"
+    rows = env.score_rows()
+    assert rows[(rows["agent"] == "s3") & (rows["date"] == DAY6)].empty
+    ref_env = Env(tmp_path / "ref", phase2, n_days=10)
+    _assert_same_run(env, res, ref_env, ref_env.run())
+
+
+def test_resume_refused_when_uncommitted_line_is_not_for_the_rerun_day(tmp_path):
+    env = Env(tmp_path, n_days=6, checkpoint=CrashingCheckpoint(tmp_path / "cp.json", 4))
+    with pytest.raises(KeyboardInterrupt):
+        env.run()
+    # tamper: make the checkpoint claim day 4 was committed while the log's extra line is day 4
+    cp = json.loads((tmp_path / "cp.json").read_text())
+    cp["last_completed_day"] = WEEKDAYS[3].isoformat()
+    (tmp_path / "cp.json").write_text(json.dumps(cp))
+    with pytest.raises(ResumeRefused, match="uncommitted"):
+        Env(tmp_path, n_days=6, checkpoint=Checkpoint(tmp_path / "cp.json")).run()
+
+
+def test_cio_content_failure_with_unrelated_transient_failure_is_ordinary_skip(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_mod, "BACKOFF_BASE_S", 0.0)
+    d = WEEKDAYS[3]
+
+    def handler(name, u):
+        if u["asof"] == d.isoformat():
+            if name == "s3":
+                raise ApiError("503")
+            if name == "cio":
+                return "not json"
+        return default_handler(name, u)
+
+    res = Env(tmp_path, handler, n_days=6).run()
+    assert set(res.skipped) == {d} and "cio" in res.skipped[d]
+
+
+def test_cio_transient_failure_pauses(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_mod, "BACKOFF_BASE_S", 0.0)
+    d = WEEKDAYS[3]
+    with pytest.raises(RunPaused) as ei:
+        Env(tmp_path, _on(d, {"cio"}, _raise_api), n_days=6).run()
+    assert ei.value.day == d and ei.value.failed == {"cio": "api_error"}
+
+
+def test_too_few_valid_with_enough_transient_failures_pauses(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_mod, "BACKOFF_BASE_S", 0.0)
+    d = WEEKDAYS[3]
+    calls = {"n": 0}
+
+    def handler(name, u):
+        if u["asof"] == d.isoformat():
+            if name in ("m1", "m2", "m3"):
+                return "not json"   # 3 content failures
+            if name in ("s1", "s2"):
+                raise ApiError("503")   # 2 transient: 4 valid + 3 layer-4 = 7; +2 = 9 >= 8
+        return default_handler(name, u)
+
+    with pytest.raises(RunPaused) as ei:
+        Env(tmp_path, handler, n_days=6).run()
+    assert ei.value.failed["s1"] == "api_error" and ei.value.failed["m1"] == "malformed_json"
+
+
+def test_too_few_valid_where_transients_cannot_reach_minimum_is_skip(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_mod, "BACKOFF_BASE_S", 0.0)
+    d = WEEKDAYS[3]
+
+    def handler(name, u):
+        if u["asof"] == d.isoformat():
+            if name in ("m1", "m2", "m3", "s1", "s2"):
+                return "not json"   # 5 content failures: 4 valid + 3 layer-4 = 7
+            if name == "s3":
+                raise ApiError("503")   # +1 transient -> 3 valid + 1 + 3 = 7 < 8
+        return default_handler(name, u)
+
+    res = Env(tmp_path, handler, n_days=6).run()
+    assert set(res.skipped) == {d}
+
+
+def _resume_with(tmp_path, mutate):
+    env = Env(tmp_path, n_days=4)
+    env.run()
+    env2 = Env(tmp_path, n_days=4)
+    mutate(env2)
+    with pytest.raises(ResumeRefused) as ei:
+        env2.run()
+    return str(ei.value)
+
+
+def test_resume_refused_when_a_limit_changed(tmp_path):
+    def mutate(e):
+        e.cfg = BacktestConfig(periods=e.cfg.periods, settings=e.settings,
+                               limits=limits(daily_loss_pct=0.4), anonymize=False, dry_run=False)
+        e.risk = RiskLayer(e.cfg.limits, 0.005, 1.0)
+    assert "limits.daily_loss_pct" in _resume_with(tmp_path, mutate)
+
+
+def test_resume_refused_when_a_prompt_changed(tmp_path):
+    def mutate(e):
+        e.pipeline.prompts = dict(PROMPTS, s2="PROMPT<s2> be bolder")
+    msg = _resume_with(tmp_path, mutate)
+    assert "prompt.s2" in msg and "prompt.s1" not in msg
+
+
+def test_resume_refused_when_settings_or_sectors_changed(tmp_path):
+    def mutate(e):
+        e.settings = settings(slippage_bps=9.0)
+        e.cfg = BacktestConfig(periods=e.cfg.periods, settings=e.settings, limits=e.cfg.limits,
+                               anonymize=False, dry_run=False)
+    assert "slippage_bps" in _resume_with(tmp_path / "s", mutate)
+    env = Env(tmp_path / "u", n_days=4)
+    env.run()
+    with pytest.raises(ResumeRefused, match="universe_sectors"):
+        Env(tmp_path / "u", n_days=4).run(universe_sectors=dict(SECTORS, XAA="software"))
+
+
+def test_cfg_limits_must_match_risk_layer(tmp_path):
+    env = Env(tmp_path, n_days=4)
+    env.risk = RiskLayer(limits(max_position_pct=0.5), 0.005, 1.0)
+    with pytest.raises(ValueError, match="limits"):
+        env.run()
+
+
+def test_run_backtest_has_no_separate_llm_parameter(tmp_path):
+    env = Env(tmp_path, n_days=4)
+    with pytest.raises(TypeError):
+        env.run(llm=env.llm)
+
+
+def test_resume_leaves_no_stale_picks_for_layer4_agents_not_run_on_rerun(tmp_path, monkeypatch):
+    # phase 1: m1 fails transiently (not decisive), the day trades and cro/cio/execution picks
+    # are recorded. phase 2: m1 succeeds, so layers 2-3 see new inputs (cache misses) and five
+    # of them now fail on content -> early skip, layer 4 never runs on the re-run.
+    monkeypatch.setattr(agent_mod, "BACKOFF_BASE_S", 0.0)
+    phase2 = _on(DAY6, {"s1", "s2", "s3", "s4", "si1"}, lambda: "not json")
+    env, res = _crash_then_resume(tmp_path / "c", _on(DAY6, {"m1"}, _raise_api), phase2)
+    assert DAY6 in res.skipped and "cio" not in res.day_results[DAY6].results
+    rows = env.score_rows()
+    assert rows[(rows["date"] == DAY6) & rows["agent"].isin(["cro", "cio", "execution"])].empty
+    ref_env = Env(tmp_path / "ref", phase2, n_days=10)
+    _assert_same_run(env, res, ref_env, ref_env.run())

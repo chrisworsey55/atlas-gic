@@ -207,3 +207,21 @@ def test_nan_next_open_dropped_never_filled(tmp_path):
     fills, dropped = broker(s).submit([Order("NAN", "buy", 5)], DEC, portfolio=Portfolio(cash=1e6))
     assert fills == []
     assert len(dropped) == 1 and "open" in dropped[0][1] and "NAN" in dropped[0][1]
+
+
+class _OpenStore:
+    def __init__(self, opens):
+        self.opens = opens
+
+    def next_open(self, ticker, after):
+        return NEXT, self.opens[ticker]
+
+
+def test_numpy_scalar_opens_fill_and_unusable_opens_drop():
+    opens = {"F32": np.float32(10.0), "F64": np.float64(20.0), "I64": np.int64(30),
+             "NAN": float("nan"), "INF": float("inf"), "NONE": None, "STR": "10", "NEG": -1.0}
+    b = SimBroker(_OpenStore(opens), commission_per_share=0.005, commission_min=1.0, slippage_bps=0.0)
+    fills, dropped = b.submit([Order(t, "buy", 1) for t in opens], DEC, portfolio=Portfolio(cash=1e6))
+    assert {f.order.ticker for f in fills} == {"F32", "F64", "I64"}
+    assert all(type(f.price) is float and f.price == float(opens[f.order.ticker]) for f in fills)
+    assert {o.ticker for o, _ in dropped} == {"NAN", "INF", "NONE", "STR", "NEG"}

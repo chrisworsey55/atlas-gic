@@ -28,10 +28,14 @@ For each trading day T (spec section 4, in this order):
 8. the checkpoint is saved: it is the commit point. Mid-day state is never checkpointed.
 
 Crash safety: a crash after T's log append / fills / scoring but before the checkpoint
-re-runs T on resume from the checkpoint of T-1. LLM outputs come from the cache, so the
-idempotent ``PredictionLog.append`` no-ops, ``record_picks`` and ``score_matured`` are
-idempotent, weights are restored from the checkpoint, and fills apply exactly once because
-the portfolio comes from the checkpoint. A ``BudgetExceeded`` from the LLM layer also
+re-runs T on resume from the checkpoint of T-1. The checkpoint is the commit point, so T's
+log line (one line beyond the checkpointed head) is uncommitted and is dropped with
+``PredictionLog.drop_uncommitted_tail`` before T is re-run: the re-run may legitimately
+differ (a cached bad response now succeeds on its live retry, a transient failure has
+cleared). ``record_picks`` replaces T's unscored picks and discards them for agents that now
+fail or are not run; ``score_matured`` is idempotent; weights are restored from the
+checkpoint; and fills apply exactly once because the portfolio comes from the checkpoint.
+A log that cannot be reconciled with the checkpoint raises ``ResumeRefused``. A ``BudgetExceeded`` from the LLM layer also
 pauses: the checkpoint is re-saved with the spend and ``RunPaused`` (kind "budget") is
 raised from it.
 
@@ -335,21 +339,31 @@ def _check_predlog(predlog: PredictionLog, head: tuple[int, str | None]) -> None
 def _pause_failed(pipeline: Pipeline, day: DayResult) -> dict[str, str] | None:
     """Agents' failure codes if transient failures decide this skipped day, else None.
 
-    Decisive means: had the transient failures (and any layer-4 agents not run because of
-    the early skip) succeeded, the day could have reached min_valid_agents. A day that
-    falls short through content failures alone is an ordinary skip."""
+    Pause only if (a) the day fell below min_valid_agents AND the transient failures (plus
+    any layer-4 agents not run because of the early skip) could have lifted it to the
+    minimum, or (b) enough agents were valid and the skip was decided by a failed
+    CIO/execution agent whose OWN failure reason is transient. Anything else (content
+    failures decided the day) is an ordinary skip."""
     if day.skipped_reason is None:
         return None
     res = day.results
-    transient = [n for n, r in res.items() if r.failure is not None and r.failure.reason in TRANSIENT]
-    if not transient:
-        return None
+    failed = {n: (r.failure.reason.value if r.failure is not None else "no_output")
+              for n, r in sorted(res.items()) if r.status != "ok"}
     valid = sum(1 for r in res.values() if r.status == "ok")
-    not_run = sum(1 for s in pipeline.specs.values() if s.kind != "control" and s.name not in res)
-    if valid + len(transient) + not_run < pipeline.min_valid_agents:
-        return None
-    return {n: (r.failure.reason.value if r.failure is not None else "no_output")
-            for n, r in sorted(res.items()) if r.status != "ok"}
+    if valid < pipeline.min_valid_agents:
+        transient = sum(1 for r in res.values() if r.failure is not None and r.failure.reason in TRANSIENT)
+        not_run = sum(1 for sp in pipeline.specs.values() if sp.kind != "control" and sp.name not in res)
+        decisive = transient > 0 and valid + transient + not_run >= pipeline.min_valid_agents
+    else:
+        decisive = False
+        for kind in ("cio", "execution"):  # the same order the pipeline uses to pick the reason
+            bad = [sp.name for sp in pipeline.specs.values()
+                   if sp.kind == kind and sp.name in res and res[sp.name].status != "ok"]
+            if bad:
+                f = res[bad[0]].failure
+                decisive = f is not None and f.reason in TRANSIENT
+                break
+    return failed if decisive else None
 
 
 def _filter(snap: Snapshot, tickers: set[str]) -> Snapshot:
@@ -368,19 +382,44 @@ def _closes_on(snap: Snapshot, day: date) -> dict[str, float]:
     return out
 
 
+def _sha(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+FINGERPRINT_SETTINGS = ("model", "dead_zone", "shrinkage_k", "warmup_picks", "rolling_ic_window",
+                        "slippage_bps", "commission_per_share", "commission_min", "min_valid_agents")
+
+
+def _fingerprint(cfg: BacktestConfig, pipeline: Pipeline, initial_cash, universe, universe_sectors,
+                 lookback_days, macro_series) -> dict:
+    """Everything a resumed run must share with the run that wrote the checkpoint, as flat
+    JSON-stable keys so a mismatch can name the changed field."""
+    s = cfg.settings
+    fp = {"periods": [[dump_date(a), dump_date(b)] for _, (a, b) in cfg.periods.items()],
+          "anonymize": cfg.anonymize, "dry_run": cfg.dry_run, "initial_cash": float(initial_cash),
+          "universe": sorted(universe), "lookback_days": int(lookback_days),
+          "macro_series": [str(m) for m in macro_series],
+          "universe_sectors": dict(sorted(universe_sectors.items())) if universe_sectors else None,
+          "agents": _sha(sorted((sp.model_dump(mode="json") for sp in pipeline.specs.values()),
+                                key=lambda d: d["name"]))}
+    fp.update({f"settings.{k}": getattr(s, k) for k in FINGERPRINT_SETTINGS})
+    fp.update({f"limits.{k}": v for k, v in cfg.limits.model_dump().items()})
+    fp.update({f"prompt.{n}": _sha(t) for n, t in sorted(pipeline.prompts.items())})
+    return json.loads(json.dumps(fp))  # normalise to what a checkpoint round-trip yields
+
+
 # ---------------------------------------------------------------------------- the run
 
 def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, broker, risk: RiskLayer,
                  scores: ScoreStore, weightbook: WeightBook, predlog: PredictionLog,
-                 checkpoint: Checkpoint, *, confirm: bool = False, llm: CachedLLM | None = None,
-                 initial_cash: float = 100_000.0, universe_sectors: dict[str, str] | None = None,
+                 checkpoint: Checkpoint, *, confirm: bool = False, initial_cash: float = 100_000.0, universe_sectors: dict[str, str] | None = None,
                  lookback_days: int = 60, macro_series=(), run_dir: Path | None = None
                  ) -> BacktestResult:
     """Run (or resume) the backtest over train, validation and holdout in date order.
 
     One continuous portfolio spans all three periods; use ``cfg.periods.period_of`` to split
-    the result per period. ``llm`` defaults to ``pipeline.llm`` (its spend is restored from
-    the checkpoint). ``run_dir`` holds the dry-run stub cache (a temp dir if omitted).
+    the result per period. All LLM calls and spend accounting go through ONE object,
+    ``pipeline.llm``: its spend is restored from the checkpoint so the budget spans resumes. ``run_dir`` holds the dry-run stub cache (a temp dir if omitted).
     Raises CostConfirmationRequired, RunPaused, ResumeRefused (see module docstring).
     """
     s = cfg.settings
@@ -391,15 +430,17 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
         if not ds:
             raise ValueError(f"{n} period {getattr(cfg.periods, n)} contains no trading days")
     all_days = sorted({d for ds in period_days.values() for d in ds})
-    fingerprint = {"periods": [[dump_date(a), dump_date(b)] for _, (a, b) in cfg.periods.items()],
-                   "anonymize": cfg.anonymize, "dry_run": cfg.dry_run,
-                   "initial_cash": float(initial_cash), "universe": sorted(universe)}
+    if getattr(risk, "limits", None) != cfg.limits:
+        raise ValueError("cfg.limits differ from the risk layer's limits; refusing to run")
+    fingerprint = _fingerprint(cfg, pipeline, initial_cash, universe, universe_sectors,
+                               lookback_days, macro_series)
 
     # ---- resume validation (before any spend)
     raw = checkpoint.load()
     if raw is not None:
         st = _State.from_json(raw)
-        diff = sorted(k for k in fingerprint if fingerprint[k] != st.fingerprint.get(k))
+        diff = sorted(k for k in set(fingerprint) | set(st.fingerprint)
+                      if fingerprint.get(k) != st.fingerprint.get(k))
         if diff:
             raise ResumeRefused(f"checkpoint was written by a different configuration ({', '.join(diff)}); "
                                 "refusing to resume")
@@ -415,10 +456,21 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
     if est > s.confirm_cost_usd and not confirm:
         raise CostConfirmationRequired(est, s.confirm_cost_usd)
 
+    if predlog.head()[0] == st.predlog_head[0] + 1:
+        # the last line was appended by a day that crashed before its checkpoint: it is
+        # uncommitted, and the re-run may legitimately differ, so drop it (the only rewrite)
+        try:
+            if not todo:
+                raise ValueError("no day left to re-run")
+            predlog.drop_uncommitted_tail(todo[0], *st.predlog_head)
+        except ValueError as e:
+            raise ResumeRefused(f"prediction log {predlog.path} has an uncommitted last line that "
+                                f"cannot be matched to the day being re-run: {e}") from e
+
     with ExitStack() as stack:
         # ---- the pipeline as run: dry-run stub LLM and/or anonymised universe
         active = copy.copy(pipeline)
-        active_llm = llm if llm is not None else pipeline.llm
+        active_llm = pipeline.llm
         if cfg.dry_run:
             d = Path(run_dir) if run_dir is not None else Path(stack.enter_context(tempfile.TemporaryDirectory()))
             active_llm = CachedLLM(StubClient(lambda _s, _u: DRY_RUN_RESPONSE), d / "dry_run_llm.db",
@@ -531,9 +583,16 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                     _apply_fill(portfolio, f, st.last_known)
 
             # ---- (5) log before scoring, then score matured horizons (data <= T only)
-            predlog.append(T, results)
+            try:
+                predlog.append(T, results)
+            except ValueError as e:
+                raise ResumeRefused(f"prediction log {predlog.path} is inconsistent with the run "
+                                    f"on {T}: {e}") from e
             for n in sorted(results):
-                scores.record_picks(results[n])
+                scores.record_picks(results[n])  # a non-ok result discards stale unscored picks
+            for sp in agent_specs:  # agents not run today (early skip) keep no stale picks either
+                if sp.name not in results:
+                    scores.discard_unscored(sp.name, T)
             scores.score_matured(T, store, list(pipeline.specs.values()), cost_frac)
 
             # ---- (6) Darwinian weights

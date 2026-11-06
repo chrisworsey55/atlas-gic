@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 from datetime import date
 from typing import Protocol
 
@@ -16,6 +17,17 @@ def size_order(target_value: float, price: float) -> int:
     if target_value <= 0 or price <= 0:
         return 0
     return int(math.floor(target_value / price))
+
+
+def _price(x) -> float | None:
+    """A finite positive real (Python or numpy scalar, never bool/str) as float, else None."""
+    if not isinstance(x, numbers.Real) or isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
 
 
 class Broker(Protocol):
@@ -76,9 +88,11 @@ class SimBroker:
                 dropped.append((o, f"no next open for {o.ticker} after {decision_date}"))
                 continue
             fdate, open_px = nxt
-            if not (isinstance(open_px, (int, float)) and math.isfinite(open_px) and open_px > 0):
+            usable = _price(open_px)
+            if usable is None:
                 dropped.append((o, f"unusable next open {open_px!r} for {o.ticker} on {fdate}"))
                 continue
+            open_px = usable
             if o.side == "sell":
                 if held is not None and o.shares > held.get(o.ticker, 0):
                     dropped.append((o, f"sell {o.shares} exceeds holdings "

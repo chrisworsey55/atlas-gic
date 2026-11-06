@@ -190,3 +190,22 @@ def test_rerecord_after_scoring_leaves_rows_untouched(ss):
     ss.record_picks(result(picks=[pick("BBB", "short", 0.9)]))
     after = ss.picks_frame("tech", 5)
     assert after.equals(before) and after.scored.all()
+
+
+def test_failed_rerun_discards_unscored_picks_but_keeps_scored(ss):
+    """A re-run of a day (crash before checkpoint) where an agent that was ok now fails must
+    not leave the crashed attempt's picks behind; scored history is never touched."""
+    ss.record_picks(result(picks=[pick("AAA")]))
+    fail = AgentResult(agent="tech", date=D0, failure=FailureRecord(
+        agent="tech", date=D0, reason=FailureReason.MALFORMED_JSON, detail="", attempt=2, raw_response=""))
+    ss.record_picks(fail)
+    assert ss.picks_frame(None, 1).empty
+    # scored rows stay
+    st = FakeStore({"AAA": px(100, 0.01), "SMH": px(100, 0.0)})
+    d1 = DAYS[1]
+    ss.record_picks(result(day=d1, picks=[pick("AAA")]))
+    assert ss.score_matured(DAYS[3], st, SPECS, 0.0) > 0
+    ss.record_picks(AgentResult(agent="tech", date=d1, failure=fail.failure.model_copy(update={"date": d1})))
+    assert len(ss.picks_frame("tech", 1)) == 1
+    ss.discard_unscored("tech", d1)  # explicit form, also a no-op on scored rows
+    assert len(ss.picks_frame("tech", 1)) == 1

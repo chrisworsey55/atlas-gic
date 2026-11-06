@@ -11,6 +11,17 @@ count, last hash) in its checkpoint and, on resume, requires
 ``contains_head(count, hash)`` -- the log must still hold the checkpointed line
 at that position and be at most ``max_ahead`` (default 1: crash after append,
 before checkpoint) lines beyond it. ``verify()`` alone does not catch this.
+
+REWRITES: the log is append-only with exactly ONE sanctioned rewrite,
+``drop_uncommitted_tail``. The runner's checkpoint is the commit point; a line
+appended for day T after the last checkpoint (crash between append and
+checkpoint) is uncommitted. When T is re-run its agent results may legitimately
+differ (a live retry now succeeds, a transient failure has cleared), so the
+runner drops that single line before re-running T. It only ever removes the
+last line, only when the log is exactly one line beyond the checkpointed head,
+the committed prefix matches the checkpointed hash and the line is for the day
+being re-run; anything else raises. Committed lines are still protected by
+``contains_head`` (the tail-truncation limits above are unchanged).
 """
 from __future__ import annotations
 
@@ -92,6 +103,40 @@ class PredictionLog:
         if count == 0:
             return head_hash is None
         return lines[count - 1]["hash"] == head_hash
+
+    def drop_uncommitted_tail(self, expected_day: date, checkpoint_count: int,
+                              checkpoint_hash: str | None) -> None:
+        """Remove the single uncommitted last line (see module docstring). Raises
+        ValueError unless the log verifies, has exactly ``checkpoint_count + 1`` lines,
+        line ``checkpoint_count`` has ``checkpoint_hash`` (0 lines <=> None) and the last
+        line's day is ``expected_day``. Atomic: temp file, fsync, os.replace."""
+        lines = self._read()
+        if lines is None:
+            raise ValueError(f"prediction log {self.path} failed verification")
+        if checkpoint_count < 0 or len(lines) != checkpoint_count + 1:
+            raise ValueError(f"log has {len(lines)} lines; expected exactly {checkpoint_count + 1} "
+                             "(one uncommitted line beyond the checkpoint)")
+        committed = lines[checkpoint_count - 1]["hash"] if checkpoint_count else None
+        if committed != checkpoint_hash:
+            raise ValueError("committed prefix of the log does not match the checkpoint head")
+        if lines[-1]["day"] != expected_day.isoformat():
+            raise ValueError(f"uncommitted line is for {lines[-1]['day']}, not the re-run day "
+                             f"{expected_day.isoformat()}")
+        keep = "".join(self.path.read_text(encoding="utf-8").splitlines(keepends=True)[:-1])
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(keep)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+        try:
+            fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
 
     def append(self, day: date, results: dict[str, AgentResult]) -> str:
         lines = self._read()
