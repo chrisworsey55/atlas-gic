@@ -3,6 +3,14 @@
 Each line: {"day", "agents", "prev_hash", "hash"}; hash = sha256 of the canonical
 JSON (sorted keys, no whitespace) of the line without the "hash" field.
 Task 12 must append (fsynced) before scoring outcomes.
+
+LIMITATION: a pure hash chain cannot detect deletion of the *tail* line(s):
+after dropping the last line the log still verifies, and one could re-append
+different picks for that day. Mitigation: the runner stores ``head()`` (line
+count, last hash) in its checkpoint and, on resume, requires
+``contains_head(count, hash)`` -- the log must still hold the checkpointed line
+at that position and be at most ``max_ahead`` (default 1: crash after append,
+before checkpoint) lines beyond it. ``verify()`` alone does not catch this.
 """
 from __future__ import annotations
 
@@ -62,6 +70,28 @@ class PredictionLog:
 
     def verify(self) -> bool:
         return self._read() is not None
+
+    def head(self) -> tuple[int, str | None]:
+        """(number of lines, hash of last line); (0, None) if empty/missing.
+
+        Raises ValueError if the log fails verification.
+        """
+        lines = self._read()
+        if lines is None:
+            raise ValueError(f"prediction log {self.path} failed verification")
+        return (len(lines), lines[-1]["hash"] if lines else None)
+
+    def contains_head(self, count: int, head_hash: str | None, max_ahead: int = 1) -> bool:
+        """True iff the log verifies, line number ``count`` has hash ``head_hash``
+        (count 0 <=> head_hash None), and it has at most ``max_ahead`` further lines.
+        Detects tail truncation and replaced history relative to a checkpointed head.
+        """
+        lines = self._read()
+        if lines is None or count < 0 or len(lines) < count or len(lines) - count > max_ahead:
+            return False
+        if count == 0:
+            return head_hash is None
+        return lines[count - 1]["hash"] == head_hash
 
     def append(self, day: date, results: dict[str, AgentResult]) -> str:
         lines = self._read()

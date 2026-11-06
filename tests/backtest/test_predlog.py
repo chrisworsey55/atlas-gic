@@ -119,3 +119,58 @@ def test_older_day_cannot_be_reappended(tmp_path):
     log, _ = make(tmp_path, (D1, D2))
     with pytest.raises(ValueError):
         log.append(D1, _res(D1))
+
+
+def test_head_empty_and_nonempty(tmp_path):
+    assert PredictionLog(tmp_path / "x.jsonl").head() == (0, None)
+    log, hashes = make(tmp_path)
+    assert log.head() == (3, hashes[-1])
+
+
+def test_tail_deletion_passes_verify_but_caught_by_contains_head(tmp_path):
+    log, _ = make(tmp_path)
+    count, h = log.head()
+    p = tmp_path / "p.jsonl"
+    lines = p.read_text().splitlines(keepends=True)
+    p.write_text("".join(lines[:2]))
+    assert log.verify() is True  # documented limitation
+    assert log.contains_head(count, h) is False
+    # re-appending different picks for the deleted day is still caught
+    log.append(D3, _res(D3, ticker="ZZZ"))
+    assert log.verify() is True
+    assert log.contains_head(count, h) is False
+
+
+def test_contains_head_accepts_exact_and_one_ahead(tmp_path):
+    log, hashes = make(tmp_path, (D1, D2))
+    count, h = log.head()
+    assert log.contains_head(count, h) is True
+    log.append(D3, _res(D3))
+    assert log.contains_head(count, h) is True
+    assert log.contains_head(count, h, max_ahead=0) is False
+    assert log.contains_head(0, None) is False  # 3 lines ahead of empty
+
+
+def test_contains_head_empty_log(tmp_path):
+    log = PredictionLog(tmp_path / "x.jsonl")
+    assert log.contains_head(0, None) is True
+    assert log.contains_head(1, "abc") is False
+
+
+def test_contains_head_rejects_replaced_history(tmp_path):
+    log, _ = make(tmp_path, (D1, D2))
+    count, h = log.head()
+    other = PredictionLog(tmp_path / "q.jsonl")
+    other.append(D1, _res(D1, ticker="ZZZ"))
+    other.append(D2, _res(D2, ticker="ZZZ"))
+    assert other.verify() is True
+    assert other.contains_head(count, h) is False
+
+
+def test_torn_last_line_fails_verify_and_append_raises(tmp_path):
+    log, _ = make(tmp_path, (D1, D2))
+    p = tmp_path / "p.jsonl"
+    p.write_bytes(p.read_bytes()[:-1])
+    assert log.verify() is False
+    with pytest.raises(ValueError):
+        log.append(D3, _res(D3))
