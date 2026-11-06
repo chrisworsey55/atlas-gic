@@ -64,3 +64,8 @@ def test_baseline_layers_arg_excludes_non_layer_1_3():
     days = {"a": res("a", [("X", "long", 0.5)]), "z": res("z", [("Y", "long", 0.5)])}
     w = baseline_target_weights(days, {"a": 1.0, "z": 1.0}, layers={"a": 2, "z": 4})
     assert set(w) == {"X"}
+
+
+def test_baseline_excludes_control_by_default():
+    days = {"a": res("a", [("X", "long", 0.5)]), "control": res("control", [("Y", "long", 0.9)])}
+    assert set(baseline_target_weights(days, {"a": 1.0, "control": 1.0})) == {"X"}

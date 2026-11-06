@@ -5,7 +5,7 @@ import pandas as pd
 
 from atlas.schemas import AgentResult
 
-NON_BASELINE = frozenset({"cro", "cio", "execution"})
+NON_BASELINE = frozenset({"cro", "cio", "execution", "control"})
 
 
 def _total(r: pd.Series) -> float:

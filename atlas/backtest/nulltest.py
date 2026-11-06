@@ -30,22 +30,33 @@ class LeakageSuspected(Exception):
 
 
 class NullDistribution:
-    def __init__(self, ics: np.ndarray, dead_zone: float | None = None,
-                 keep_margin: float | None = None):
+    """`ics` are all raw shuffled ICs (histogram, `quantile`). `deviations` and `pair_diffs`
+    are filled by `null_test`; `dead_zone()` / `keep_margin()` raise if they are absent."""
+
+    def __init__(self, ics: np.ndarray, deviations: np.ndarray | None = None,
+                 pair_diffs: np.ndarray | None = None):
         self.ics = np.asarray(ics, dtype=float)
-        self._dead_zone = dead_zone
-        self._keep_margin = keep_margin
+        self.deviations = None if deviations is None else np.asarray(deviations, dtype=float)
+        self.pair_diffs = None if pair_diffs is None else np.asarray(pair_diffs, dtype=float)
 
     def quantile(self, q: float) -> float:
         return float(np.quantile(np.abs(self.ics), q))
 
     def dead_zone(self) -> float:
         """95th percentile of |shrunk_ic - group_mean| under the null (the production rule)."""
-        return self.quantile(0.95) if self._dead_zone is None else self._dead_zone
+        if self.deviations is None or len(self.deviations) == 0:
+            raise ValueError("no shrunk-IC deviations: build this distribution with null_test")
+        return float(np.quantile(self.deviations, 0.95))
 
     def keep_margin(self) -> float:
-        """95th percentile of |IC_a - IC_b| for two independent shuffles of one agent."""
-        return self.quantile(0.95) if self._keep_margin is None else self._keep_margin
+        """95th percentile of |IC_a - IC_b| for two independent shuffles of one agent.
+
+        Independent shuffles OVERSTATE the null spread of a paired replay whose old and new
+        picks are correlated (measured 95th pct of |dIC|: 0.223 at 0% overlap, 0.156 at 50%,
+        0.103 at 80%), so this margin is conservative: no false keeps, lower power."""
+        if self.pair_diffs is None or len(self.pair_diffs) == 0:
+            raise ValueError("no paired-IC differences: build this distribution with null_test")
+        return float(np.quantile(self.pair_diffs, 0.95))
 
 
 def _check_centred(ics: np.ndarray) -> None:
@@ -58,13 +69,21 @@ def _check_centred(ics: np.ndarray) -> None:
 
 
 def null_test(picks: pd.DataFrame, n_shuffles: int, seed: int, *, k: float = 20.0,
-              warmup_picks: int = 30,
+              warmup_picks: int = 30, window: int | None = None,
               shuffle_fn: Callable[[np.ndarray, np.random.Generator], np.ndarray] | None = None
               ) -> NullDistribution:
+    """`picks` is a picks_frame-like frame, already non-overlapping 1-day-horizon samples.
+
+    `window` keeps each agent's last `window` rows (by date, ticker) as `collect_stats` does;
+    it MUST equal Settings.rolling_ic_window. The default None uses all rows, which
+    calibrates a too-tight dead zone for production's shorter window (more false moves)."""
     shuffle = shuffle_fn or (lambda x, rng: rng.permutation(x))
     df = picks[picks["scored"].astype(bool)].dropna(subset=["conviction", "excess"])
     data = {}
     for agent, g in df.groupby("agent", sort=True):
+        g = g.sort_values(["date", "ticker"], kind="stable")
+        if window is not None:
+            g = g.tail(window)
         if len(g) >= warmup_picks:
             data[agent] = (g["conviction"].to_numpy(float), g["excess"].to_numpy(float))
     if len(data) < 2:
@@ -92,4 +111,4 @@ def null_test(picks: pd.DataFrame, n_shuffles: int, seed: int, *, k: float = 20.
     _check_centred(arr)
     if not devs or not diffs:
         raise ValueError("null test produced no usable shuffles (constant convictions/excess?)")
-    return NullDistribution(arr, float(np.quantile(devs, 0.95)), float(np.quantile(diffs, 0.95)))
+    return NullDistribution(arr, np.asarray(devs), np.asarray(diffs))
