@@ -131,7 +131,8 @@ def test_picks_frame_columns_and_filter(ss):
     ss.record_picks(result("tech", picks=[pick("AAA")]))
     ss.record_picks(result("cro", picks=[pick("BBB")]))
     f = ss.picks_frame(None, 5)
-    assert list(f.columns) == ["agent", "date", "ticker", "conviction", "horizon", "excess", "scored"]
+    assert list(f.columns) == ["agent", "date", "ticker", "direction", "conviction", "horizon", "excess",
+                               "signed_excess", "scored"]
     assert len(f) == 2 and (f.horizon == 5).all()
     assert len(ss.picks_frame("cro", 5)) == 1
 
@@ -145,3 +146,47 @@ def test_non_overlapping_samples_spaced_by_horizon():
     assert a == [DAYS[0], DAYS[5], DAYS[10]]
     assert sorted(out[out.agent == "b"].date.unique()) == [DAYS[0], DAYS[10]]
     assert len(non_overlapping(df, 1)) == len(df)
+
+
+def test_short_cost_is_charged_not_credited(ss):
+    fs = FakeStore({"FLAT": px(100, 0.0), "SMH": px(100, 0.0)})
+    ss.record_picks(result(picks=[pick("FLAT", "short", 0.5)]))
+    ss.score_matured(DAYS[10], fs, SPECS, 0.01)
+    f = ss.picks_frame("tech", 5).iloc[0]
+    assert f.excess == pytest.approx(0.01)
+    assert f.signed_excess == pytest.approx(-0.01)
+
+
+def test_long_cost_charged(ss):
+    fs = FakeStore({"FLAT": px(100, 0.0), "SMH": px(100, 0.0)})
+    ss.record_picks(result(picks=[pick("FLAT", "long", 0.5)]))
+    ss.score_matured(DAYS[10], fs, SPECS, 0.01)
+    f = ss.picks_frame("tech", 5).iloc[0]
+    assert f.excess == pytest.approx(-0.01) and f.signed_excess == pytest.approx(-0.01)
+
+
+def test_successful_short_is_hit_and_zero_conviction_keeps_direction(ss):
+    fs = FakeStore({"DN": px(100, -0.02), "SMH": px(100, 0.0)})
+    ss.record_picks(result(picks=[pick("DN", "short", 0.0)]))
+    ss.score_matured(DAYS[10], fs, SPECS, 0.001)
+    f = ss.picks_frame("tech", 5).iloc[0]
+    assert f.direction == "short" and f.conviction == 0
+    assert f.excess < 0 and f.signed_excess > 0
+    from atlas.scoring.metrics import hit_rate
+    assert hit_rate([f.signed_excess]) == 1.0
+
+
+def test_rerecord_different_tickers_before_scoring_replaces(ss):
+    ss.record_picks(result(picks=[pick("AAA")]))
+    ss.record_picks(result(picks=[pick("BBB")]))
+    assert list(ss.picks_frame("tech", 1).ticker) == ["BBB"]
+
+
+def test_rerecord_after_scoring_leaves_rows_untouched(ss):
+    fs = FakeStore({"AAA": px(100, 0.01), "SMH": px(100, 0.0)})
+    ss.record_picks(result(picks=[pick("AAA")]))
+    ss.score_matured(DAYS[10], fs, SPECS, 0.0)
+    before = ss.picks_frame("tech", 5)
+    ss.record_picks(result(picks=[pick("BBB", "short", 0.9)]))
+    after = ss.picks_frame("tech", 5)
+    assert after.equals(before) and after.scored.all()

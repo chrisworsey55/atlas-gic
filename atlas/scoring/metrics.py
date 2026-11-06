@@ -40,11 +40,13 @@ def hit_rate(excess: Sequence[float]) -> float:
 
 
 def excess_return(ticker_prices: pd.Series, bench_prices: pd.Series,
-                  horizon: int, cost_frac: float) -> float:
+                  horizon: int, cost_frac: float, sign: int = 1) -> float:
     """Long-side return over `horizon` bars minus benchmark return minus cost.
 
     Both series start at the entry bar (position 0); exit is position `horizon`.
-    `cost_frac` (round trip) is charged to the pick leg only. NaN if a series
+    `cost_frac` (round trip) is charged to the pick leg only: in this long-side
+    frame that is `- sign*cost_frac` (sign +1 long, -1 short), so the
+    direction-adjusted net return `sign*excess` is always `sign*(t-b) - cost`. NaN if a series
     is too short or an endpoint is missing.
     """
     if len(ticker_prices) <= horizon or len(bench_prices) <= horizon:
@@ -53,4 +55,4 @@ def excess_return(ticker_prices: pd.Series, bench_prices: pd.Series,
     b0, b1 = float(bench_prices.iloc[0]), float(bench_prices.iloc[horizon])
     if any(math.isnan(x) for x in (t0, t1, b0, b1)) or t0 == 0 or b0 == 0:
         return NAN
-    return (t1 / t0 - 1.0) - cost_frac - (b1 / b0 - 1.0)
+    return (t1 / t0 - 1.0) - sign * cost_frac - (b1 / b0 - 1.0)

@@ -3,6 +3,9 @@
 One row per (agent, date, ticker) with excess-return columns for the 1, 5 and
 10 trading-day horizons (NULL until matured). `conviction` is SIGNED (+ long,
 - short); excess is the raw long-side excess return (see metrics docstring).
+Rank IC uses (conviction, excess); hit rate MUST use `signed_excess`
+(= +1 long / -1 short times excess, i.e. the net direction-adjusted return;
+hit = signed_excess > 0). Cost is charged to the pick leg in both directions.
 Picks with direction "none" and results with status != ok are never recorded.
 A connection is opened per operation and closed after.
 """
@@ -21,7 +24,8 @@ from atlas.scoring.metrics import excess_return
 
 HORIZONS = (1, 5, 10)
 DEFAULT_BENCHMARK = "SPY"
-COLUMNS = ["agent", "date", "ticker", "conviction", "horizon", "excess", "scored"]
+COLUMNS = ["agent", "date", "ticker", "direction", "conviction", "horizon", "excess",
+           "signed_excess", "scored"]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS picks (
@@ -61,22 +65,28 @@ class ScoreStore:
             sign = 1.0 if p.direction == "long" else -1.0
             rows[p.ticker] = (result.agent, result.date.isoformat(), p.ticker,
                               p.direction, sign * p.conviction)
-        if not rows:
-            return
-        with self._conn() as c:  # REPLACE resets scores: content may have changed
-            c.executemany("INSERT OR REPLACE INTO picks "
+        with self._conn() as c:  # one transaction per (agent, date)
+            c.execute("BEGIN IMMEDIATE")
+            scored = c.execute("SELECT 1 FROM picks WHERE agent=? AND date=? AND (excess_1 IS NOT NULL "
+                               "OR excess_5 IS NOT NULL OR excess_10 IS NOT NULL) LIMIT 1",
+                               (result.agent, result.date.isoformat())).fetchone()
+            if scored:  # never rewrite scored history
+                return
+            c.execute("DELETE FROM picks WHERE agent=? AND date=?",
+                      (result.agent, result.date.isoformat()))
+            c.executemany("INSERT INTO picks "
                           "(agent, date, ticker, direction, conviction) VALUES (?,?,?,?,?)",
                           list(rows.values()))
 
     def score_matured(self, asof: date, store, specs: list[AgentSpec], cost_frac: float) -> int:
         bench = {s.name: (s.benchmark or DEFAULT_BENCHMARK) for s in specs}
         with self._conn() as c:
-            pending = c.execute("SELECT agent, date, ticker, excess_1, excess_5, excess_10 "
+            pending = c.execute("SELECT agent, date, ticker, direction, excess_1, excess_5, excess_10 "
                                 "FROM picks WHERE excess_1 IS NULL OR excess_5 IS NULL "
                                 "OR excess_10 IS NULL").fetchall()
         scored = 0
         cal: dict[date, list[date]] = {}
-        for agent, d, ticker, *cur in pending:
+        for agent, d, ticker, direction, *cur in pending:
             t = date.fromisoformat(d)
             if t > asof:
                 continue
@@ -92,7 +102,7 @@ class ScoreStore:
                 window = days[: h + 1]
                 tp = store.outcome_prices(ticker, window[0], window[-1]).reindex(window)
                 bp = store.outcome_prices(b, window[0], window[-1]).reindex(window)
-                ex = excess_return(tp, bp, h, cost_frac)
+                ex = excess_return(tp, bp, h, cost_frac, 1 if direction == "long" else -1)
                 if ex != ex:  # NaN: missing data, leave NULL
                     continue
                 with self._conn() as c:
@@ -104,7 +114,7 @@ class ScoreStore:
     def picks_frame(self, agent: str | None, horizon: int) -> pd.DataFrame:
         if horizon not in HORIZONS:
             raise ValueError(f"horizon must be one of {HORIZONS}")
-        q = f"SELECT agent, date, ticker, conviction, excess_{horizon} FROM picks"
+        q = f"SELECT agent, date, ticker, direction, conviction, excess_{horizon} FROM picks"
         args: tuple = ()
         if agent is not None:
             q += " WHERE agent=?"
@@ -112,10 +122,11 @@ class ScoreStore:
         q += " ORDER BY agent, date, ticker"
         with self._conn() as c:
             rows = c.execute(q, args).fetchall()
-        df = pd.DataFrame(rows, columns=["agent", "date", "ticker", "conviction", "excess"])
+        df = pd.DataFrame(rows, columns=["agent", "date", "ticker", "direction", "conviction", "excess"])
         df["date"] = [date.fromisoformat(x) for x in df["date"]]
         df["excess"] = df["excess"].astype(float)  # NULL -> NaN
         df["horizon"] = horizon
+        df["signed_excess"] = df["excess"] * df["direction"].map({"long": 1.0, "short": -1.0})
         df["scored"] = df["excess"].notna()
         return df[COLUMNS]
 
