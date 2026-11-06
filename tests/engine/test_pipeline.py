@@ -257,4 +257,4 @@ def test_prompt_file_exists_for_every_agent():
         text = (root / spec.prompt_file).read_text(encoding="utf-8")
         assert text.strip(), spec.name
         assert "JSON" in text and "picks" in text and "horizon_days" in text, spec.name
-    assert (root / "prompts" / "control_date_only.md").read_text().strip()
+    assert not (root / "prompts" / "control_date_only.md").exists()
