@@ -31,7 +31,7 @@ class _Fail(Exception):
         self.reason, self.detail = reason, detail
 
 
-def _parse(spec: AgentSpec, asof: date, resp: LLMResponse) -> AgentOutput:
+def _parse(spec: AgentSpec, asof: date, resp: LLMResponse, force_date: bool = False) -> AgentOutput:
     if resp.stop_reason == "refusal":
         raise _Fail(FailureReason.REFUSAL, "model refused")
     if resp.stop_reason == "max_tokens":
@@ -49,6 +49,8 @@ def _parse(spec: AgentSpec, asof: date, resp: LLMResponse) -> AgentOutput:
     if not isinstance(data, dict):
         raise _Fail(FailureReason.SCHEMA_INVALID, "top-level JSON is not an object")
     data.setdefault("agent", spec.name)
+    if force_date:  # the model was shown a label, not the date: the runner sets the date
+        data["date"] = asof.isoformat()
     data.setdefault("date", asof.isoformat())
     try:
         out = AgentOutput.model_validate(data)
@@ -62,8 +64,12 @@ def _parse(spec: AgentSpec, asof: date, resp: LLMResponse) -> AgentOutput:
 
 def run_agent(spec: AgentSpec, prompt: str, inputs: dict, asof: date, llm: CachedLLM,
               failures: FailureLog, universe: set[str], *,
-              sleep: Callable[[float], None] = time.sleep) -> AgentResult:
-    user = json.dumps({"asof": asof.isoformat(), "inputs": inputs}, sort_keys=True, default=str)
+              sleep: Callable[[float], None] = time.sleep,
+              asof_label: str | None = None) -> AgentResult:
+    """`asof_label` (anonymised runs) replaces the date shown to the model; the output's
+    date is then set to `asof` by this function rather than taken from the model."""
+    shown = asof.isoformat() if asof_label is None else asof_label
+    user = json.dumps({"asof": shown, "inputs": inputs}, sort_keys=True, default=str)
     attempt = 0
     content_failures = 0
     transient_failures = 0
@@ -91,7 +97,7 @@ def run_agent(spec: AgentSpec, prompt: str, inputs: dict, asof: date, llm: Cache
             sleep(BACKOFF_BASE_S * 2 ** (transient_failures - 1))
             continue
         try:
-            out = _parse(spec, asof, resp)
+            out = _parse(spec, asof, resp, force_date=asof_label is not None)
         except _Fail as f:
             rec = log(f.reason, f.detail, resp.text, replayed=replayed)
             if f.reason == FailureReason.REFUSAL:

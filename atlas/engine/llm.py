@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import sqlite3
 import threading
 from contextlib import closing
@@ -97,7 +98,10 @@ class CachedLLM:
     """
 
     def __init__(self, client: LLMClient, cache_path: Path, model: str,
-                 usd_per_mtok: tuple[float, float], budget_usd: float):
+                 usd_per_mtok: tuple[float, float], budget_usd: float, *,
+                 initial_spent_usd: float = 0.0):
+        """`initial_spent_usd` carries spend from earlier runs (e.g. a backtest checkpoint)
+        so the budget cap spans resumes."""
         self.client = client
         self.model = model
         self.usd_per_mtok = usd_per_mtok
@@ -105,6 +109,7 @@ class CachedLLM:
         self._spent = 0.0
         self._reserved = 0.0
         self._lock = threading.Lock()
+        self.restore_spent(initial_spent_usd)
         self.cache_path = Path(cache_path)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._conn()) as c, c:
@@ -119,6 +124,15 @@ class CachedLLM:
     @property
     def spent_usd(self) -> float:
         return self._spent
+
+    def restore_spent(self, usd: float) -> None:
+        """Raise the spend counter to at least `usd` (spend persisted by a checkpoint).
+        Never lowers it: money already spent by this instance is not forgotten."""
+        usd = float(usd)
+        if not math.isfinite(usd) or usd < 0:
+            raise ValueError(f"invalid spend {usd!r}")
+        with self._lock:
+            self._spent = max(self._spent, usd)
 
     def _key(self, system: str, user: str) -> str:
         h = hashlib.sha256()

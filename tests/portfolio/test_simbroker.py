@@ -200,3 +200,10 @@ def test_decision_on_last_bar_with_data_present_is_dropped_with_reason(store):
     fills, dropped = broker(store).submit([Order("OLD", "buy", 1)], DEC)
     assert fills == []
     assert len(dropped) == 1 and dropped[0][1]
+
+
+def test_nan_next_open_dropped_never_filled(tmp_path):
+    s = make_store(tmp_path, {"NAN": {DEC: 50.0, NEXT: float("nan")}})
+    fills, dropped = broker(s).submit([Order("NAN", "buy", 5)], DEC, portfolio=Portfolio(cash=1e6))
+    assert fills == []
+    assert len(dropped) == 1 and "open" in dropped[0][1] and "NAN" in dropped[0][1]

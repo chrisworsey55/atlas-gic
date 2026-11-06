@@ -48,8 +48,8 @@ class SimBroker:
                ) -> tuple[list[Fill], list[tuple[Order, str]]]:
         """Fill orders at each ticker's next open after `decision_date`.
 
-        Sells are processed before buys. Orders with no later bar are dropped, never
-        filled at a stale price. The portfolio is never mutated; the caller applies
+        Sells are processed before buys. Orders with no later bar, or whose next open is
+        NaN/non-positive, are dropped, never filled at a stale or missing price. The portfolio is never mutated; the caller applies
         the returned fills. If `portfolio` is omitted the broker is stateless about
         cash and holdings, so NO cash or holdings checks are possible (buys are not
         reduced for affordability and oversized sells are not rejected); the backtest
@@ -76,6 +76,9 @@ class SimBroker:
                 dropped.append((o, f"no next open for {o.ticker} after {decision_date}"))
                 continue
             fdate, open_px = nxt
+            if not (isinstance(open_px, (int, float)) and math.isfinite(open_px) and open_px > 0):
+                dropped.append((o, f"unusable next open {open_px!r} for {o.ticker} on {fdate}"))
+                continue
             if o.side == "sell":
                 if held is not None and o.shares > held.get(o.ticker, 0):
                     dropped.append((o, f"sell {o.shares} exceeds holdings "

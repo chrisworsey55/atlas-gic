@@ -46,6 +46,12 @@ class Settings(BaseModel):
     confirm_cost_usd: float = 25.0
     older_model: str | None = None
     tolerance_days: int = 5
+    # pricing assumptions for the up-front backtest cost estimate (USD per million tokens and
+    # typical tokens per agent call); the hard cap is enforced by CachedLLM on actual usage
+    usd_per_mtok_input: float = 3.0
+    usd_per_mtok_output: float = 15.0
+    est_input_tokens_per_call: int = 4000
+    est_output_tokens_per_call: int = 800
 
 
 def _load(path: str | Path) -> dict | list:

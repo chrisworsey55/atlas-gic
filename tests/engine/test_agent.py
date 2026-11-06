@@ -251,3 +251,21 @@ def test_run_id_recorded(tmp_path):
     run(llm, log)
     r = rows(log)
     assert set(r["run_id"]) == {"run-7"} and set(r["kind"]) == {"call_failure"}
+
+
+def test_asof_label_replaces_date_in_prompt_and_date_is_set_by_runner(tmp_path):
+    from atlas.engine.agent import run_agent as _run
+    seen = []
+
+    def fn(system, user):
+        seen.append(user)
+        # the model echoes the label it was shown, not a calendar date
+        return json.dumps({"agent": "a", "date": "day 7", "view": "neutral", "confidence": 0.5,
+                           "picks": []})
+
+    llm = CachedLLM(StubClient(fn), tmp_path / "c.db", "m", (0.0, 0.0), 1e9)
+    spec = AgentSpec(name="a", layer=1, kind="macro", prompt_file="x")
+    r = _run(spec, "P", {"k": 1}, date(2024, 3, 1), llm, FailureLog(tmp_path / "f.db"), set(),
+             asof_label="day 7")
+    assert r.status == "ok" and r.output.date == date(2024, 3, 1)
+    assert "2024" not in seen[0] and "day 7" in seen[0]

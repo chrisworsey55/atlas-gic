@@ -74,6 +74,8 @@ def _market_summary(snap: Snapshot) -> dict:
         c = df.sort_values("date")["close"].astype(float).tolist()
         ret = lambda n: _num(c[-1] / c[-1 - n] - 1) if len(c) > n and c[-1 - n] else None  # noqa: E731
         prices[t] = {"last_close": _num(c[-1]), "ret_5d": ret(5), "ret_20d": ret(20)}
+        if "sector" in df.columns:  # anonymised snapshots carry a sector label per ticker
+            prices[t]["sector"] = str(df["sector"].iloc[-1])
     macro = {}
     for sid, s in sorted(snap.macro.items()):
         s = s.dropna()
@@ -136,7 +138,9 @@ class Pipeline:
                     "views": self._valid(upstream, range(1, 3), weights)}
         views = self._valid(upstream, range(1, 4), weights)
         cro = upstream.get("cro")
-        review = cro.output.model_dump(mode="json") if cro is not None and cro.status == "ok" else None
+        # the review's date is omitted: it duplicates asof and would defeat anonymised labels
+        review = (cro.output.model_dump(mode="json", exclude={"date"})
+                  if cro is not None and cro.status == "ok" else None)
         if spec.kind == "cro":
             return {**base, "regime": regime, "views": views, "state": state}
         if spec.kind == "cio":
@@ -149,14 +153,15 @@ class Pipeline:
 
     def run_single(self, name: str, asof: date, snapshot: Snapshot, weights: dict[str, float],
                    state: dict, upstream: dict[str, AgentResult],
-                   prompt_override: str | None = None) -> AgentResult:
+                   prompt_override: str | None = None, *, asof_label: str | None = None) -> AgentResult:
         spec = self.specs[name]
         prompt = prompt_override if prompt_override is not None else self.prompts[name]
         inputs = self._inputs(spec, snapshot, weights, state, upstream)
-        return run_agent(spec, prompt, inputs, asof, self.llm, self.failures, self.universe)
+        return run_agent(spec, prompt, inputs, asof, self.llm, self.failures, self.universe,
+                         asof_label=asof_label)
 
     # ---- the day ----
-    def _run_layer(self, layer: int, asof, snapshot, weights, state, results) -> None:
+    def _run_layer(self, layer: int, asof, snapshot, weights, state, results, asof_label=None) -> None:
         specs = sorted((s for s in self.specs.values() if s.layer == layer and s.kind != "control"),
                        key=lambda s: s.name)
         if not specs:
@@ -165,13 +170,14 @@ class Pipeline:
         if layer <= 3:
             with ThreadPoolExecutor(max_workers=len(specs)) as ex:
                 futs = {s.name: ex.submit(self.run_single, s.name, asof, snapshot, weights, state,
-                                          snap_results) for s in specs}
+                                          snap_results, asof_label=asof_label) for s in specs}
                 for n, f in futs.items():
                     results[n] = f.result()
         else:  # layer 4 is sequential CRO -> CIO -> execution
             order = {"cro": 0, "cio": 1, "execution": 2}
             for s in sorted(specs, key=lambda s: order.get(s.kind, 9)):
-                results[s.name] = self.run_single(s.name, asof, snapshot, weights, state, results)
+                results[s.name] = self.run_single(s.name, asof, snapshot, weights, state, results,
+                                                  asof_label=asof_label)
 
     def _failed_text(self, results: dict[str, AgentResult]) -> str:
         return ", ".join(f"{n} ({r.failure.reason.value})" for n, r in sorted(results.items())
@@ -184,17 +190,19 @@ class Pipeline:
                     f"{self._failed_text(results)}")
         return None
 
-    def run_day(self, asof: date, snapshot: Snapshot, weights: dict[str, float], state: dict) -> DayResult:
+    def run_day(self, asof: date, snapshot: Snapshot, weights: dict[str, float], state: dict, *,
+                asof_label: str | None = None) -> DayResult:
+        """`asof_label` replaces the date shown to agents (anonymised runs)."""
         results: dict[str, AgentResult] = {}
         for layer in (1, 2, 3):
-            self._run_layer(layer, asof, snapshot, weights, state, results)
+            self._run_layer(layer, asof, snapshot, weights, state, results, asof_label)
         regime = self._regime(results, weights)
         # fail fast: layer 4 cannot raise the count above the minimum by more than its 3 agents
         remaining = sum(1 for s in self.specs.values() if s.layer == 4 and s.kind != "control")
         valid = sum(1 for r in results.values() if r.status == "ok")
         if valid + remaining < self.min_valid_agents:
             return DayResult(asof, regime, results, None, self._too_few(results))
-        self._run_layer(4, asof, snapshot, weights, state, results)
+        self._run_layer(4, asof, snapshot, weights, state, results, asof_label)
         reason = self._too_few(results)
         if reason is None:
             for kind in ("cio", "execution"):

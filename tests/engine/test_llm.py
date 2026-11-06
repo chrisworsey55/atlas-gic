@@ -191,3 +191,22 @@ def test_anthropic_client_maps_errors():
     for exc, expected in cases:
         with pytest.raises(expected):
             AnthropicClient("m", sdk=FakeSDK(exc)).complete("s", "u", 10)
+
+
+def test_initial_spent_counts_toward_budget(tmp_path):
+    client = CountingStub(lambda s, u: "ok")
+    llm = CachedLLM(client, tmp_path / "c.db", "m1", (1.0, 2.0), 10.0, initial_spent_usd=9.999)
+    assert llm.spent_usd == 9.999
+    with pytest.raises(BudgetExceeded):
+        llm.call("s", "u")
+    assert client.calls == 0
+
+
+def test_restore_spent_never_lowers_spend(tmp_path):
+    client, llm = make(tmp_path)
+    llm.restore_spent(3.0)
+    assert llm.spent_usd == 3.0
+    llm.restore_spent(1.0)  # an older checkpoint must not erase money already spent
+    assert llm.spent_usd == 3.0
+    with pytest.raises(ValueError):
+        llm.restore_spent(float("nan"))
