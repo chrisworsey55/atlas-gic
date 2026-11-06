@@ -63,7 +63,14 @@ class PriceStore:
         lo, hi = (min(start, cov[0]), max(end, cov[1])) if cov else (start, end)
         new = self._prices.fetch([t], lo, hi)
         new = new[new["ticker"] == t][PRICE_COLUMNS].copy() if len(new) else pd.DataFrame(columns=PRICE_COLUMNS)
+        if new.empty:
+            return  # empty/failed response: record no coverage, refetch next time
         new["date"] = pd.to_datetime(new["date"]).dt.date
+        # coverage is what the provider actually returned, never the requested
+        # range and never beyond today
+        hi = min(hi, max(new["date"]), date.today())
+        if cov:
+            lo, hi = min(lo, cov[0]), max(hi, cov[1])
         old = self._load(t)
         merged = pd.concat([old, new], ignore_index=True)
         merged = merged.drop_duplicates("date", keep="last").sort_values("date")

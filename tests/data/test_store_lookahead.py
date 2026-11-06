@@ -132,3 +132,43 @@ def test_provider_cached_to_disk_second_call_makes_no_fetch(prov, tmp_path):
     again = s2.snapshot(date(2024, 1, 31), ["AAA", "BBB"], 20)
     assert len(prov.calls) == n
     pd.testing.assert_frame_equal(first.prices, again.prices)
+
+
+class GrowingPrices(FakePrices):
+    """Provider whose data ends at `last` (mutable); can also fail with empty frames."""
+
+    def __init__(self, last):
+        super().__init__()
+        self.last = last
+        self.fail = False
+
+    def fetch(self, tickers, start, end):
+        if self.fail:
+            self.calls.append((tuple(tickers), start, end))
+            return pd.DataFrame(columns=PRICE_COLUMNS)
+        return super().fetch(tickers, start, min(end, self.last))
+
+
+def test_live_edge_not_poisoned_when_provider_gains_bars(tmp_path):
+    prov = GrowingPrices(date(2024, 1, 10))
+    st = PriceStore(prov, FakeMacro(), tmp_path / "c")
+    assert st.next_open("AAA", date(2024, 1, 10)) is None
+    prov.last = date(2024, 1, 20)
+    assert st.next_open("AAA", date(2024, 1, 10))[0] == date(2024, 1, 11)
+    assert not st.snapshot(date(2024, 1, 19), ["AAA"], 5).prices.empty
+
+
+def test_empty_response_records_no_coverage_and_refetches(tmp_path):
+    prov = GrowingPrices(date(2024, 2, 29))
+    prov.fail = True
+    st = PriceStore(prov, FakeMacro(), tmp_path / "c")
+    assert st.snapshot(date(2024, 1, 19), ["AAA"], 5).prices.empty
+    n = len(prov.calls)
+    prov.fail = False
+    snap = st.snapshot(date(2024, 1, 19), ["AAA"], 5)
+    assert len(prov.calls) == n + 1
+    assert not snap.prices.empty
+    # a later failure leaves existing coverage untouched
+    prov.fail = True
+    assert not st.snapshot(date(2024, 1, 19), ["AAA"], 5).prices.empty
+    assert len(prov.calls) == n + 1
