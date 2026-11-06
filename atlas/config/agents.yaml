@@ -1,0 +1,15 @@
+agents:
+  - {name: macro_rates, layer: 1, kind: macro, prompt_file: prompts/macro_rates.md, benchmark: SPY}
+  - {name: macro_volatility, layer: 1, kind: macro, prompt_file: prompts/macro_volatility.md, benchmark: SPY}
+  - {name: macro_dollar_commodities, layer: 1, kind: macro, prompt_file: prompts/macro_dollar_commodities.md, benchmark: SPY}
+  - {name: sector_semiconductors, layer: 2, kind: sector, prompt_file: prompts/sector_semiconductors.md, benchmark: SMH}
+  - {name: sector_financials, layer: 2, kind: sector, prompt_file: prompts/sector_financials.md, benchmark: XLF}
+  - {name: sector_energy, layer: 2, kind: sector, prompt_file: prompts/sector_energy.md, benchmark: XLE}
+  - {name: sector_healthcare, layer: 2, kind: sector, prompt_file: prompts/sector_healthcare.md, benchmark: XLV}
+  - {name: superinvestor_druckenmiller, layer: 3, kind: superinvestor, prompt_file: prompts/superinvestor_druckenmiller.md, benchmark: SPY}
+  - {name: superinvestor_ackman, layer: 3, kind: superinvestor, prompt_file: prompts/superinvestor_ackman.md, benchmark: SPY}
+  - {name: cro, layer: 4, kind: cro, prompt_file: prompts/cro.md, benchmark: null}
+  - {name: cio, layer: 4, kind: cio, prompt_file: prompts/cio.md, benchmark: null}
+  - {name: execution, layer: 4, kind: execution, prompt_file: prompts/execution.md, benchmark: null}
+  # Date-only control agent; NOT one of the 12.
+  - {name: control, layer: 4, kind: control, prompt_file: prompts/control.md, benchmark: null}

@@ -1,0 +1,8 @@
+max_position_pct: 0.15
+max_gross_pct: 1.0
+max_positions: 8
+min_order_usd: 50
+max_commission_frac: 0.01
+daily_loss_pct: 0.03
+drawdown_kill_pct: 0.15
+long_only: true
