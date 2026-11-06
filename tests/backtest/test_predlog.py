@@ -1,0 +1,121 @@
+from datetime import date
+
+import pytest
+
+from atlas.backtest.predlog import PredictionLog
+from atlas.schemas import AgentOutput, AgentResult, FailureReason, FailureRecord, Pick
+
+
+def ok(agent="a1", day=date(2024, 1, 2), ticker="AAA"):
+    out = AgentOutput(agent=agent, date=day, view="bullish", confidence=0.6, picks=[
+        Pick(ticker=ticker, direction="long", conviction=0.5, horizon_days=5)])
+    return AgentResult(agent=agent, date=day, output=out)
+
+
+def no_op(agent="a2", day=date(2024, 1, 2)):
+    return AgentResult(agent=agent, date=day, failure=FailureRecord(
+        agent=agent, date=day, reason=FailureReason.TIMEOUT, detail="d", attempt=3, raw_response="SECRET"))
+
+
+def _res(day, ticker="AAA"):
+    return {"a1": ok("a1", day, ticker), "a2": no_op("a2", day)}
+
+
+D1, D2, D3 = date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)
+
+
+def make(tmp_path, days=(D1, D2, D3)):
+    log = PredictionLog(tmp_path / "p.jsonl")
+    hashes = [log.append(d, _res(d)) for d in days]
+    return log, hashes
+
+
+def test_log_hash_chain_verifies(tmp_path):
+    log, hashes = make(tmp_path)
+    assert log.verify() is True
+    assert len(set(hashes)) == 3
+    import json
+    lines = [json.loads(x) for x in (tmp_path / "p.jsonl").read_text().splitlines()]
+    assert lines[1]["prev_hash"] == hashes[0] and lines[1]["hash"] == hashes[1]
+
+
+def test_empty_or_missing_log_verifies(tmp_path):
+    assert PredictionLog(tmp_path / "none.jsonl").verify() is True
+
+
+def test_tampering_with_a_past_line_fails_verify(tmp_path):
+    log, _ = make(tmp_path)
+    p = tmp_path / "p.jsonl"
+    p.write_text(p.read_text().replace("AAA", "BBB", 1))
+    assert log.verify() is False
+
+
+def test_deleted_middle_line_fails_verify(tmp_path):
+    log, _ = make(tmp_path)
+    p = tmp_path / "p.jsonl"
+    lines = p.read_text().splitlines(keepends=True)
+    p.write_text(lines[0] + lines[2])
+    assert log.verify() is False
+
+
+def test_reordered_and_malformed_fail_verify(tmp_path):
+    log, _ = make(tmp_path)
+    p = tmp_path / "p.jsonl"
+    lines = p.read_text().splitlines(keepends=True)
+    p.write_text(lines[1] + lines[0] + lines[2])
+    assert log.verify() is False
+    p.write_text("".join(lines) + "not json\n")
+    assert log.verify() is False
+
+
+def test_log_append_only_never_rewrites(tmp_path):
+    p = tmp_path / "p.jsonl"
+    log = PredictionLog(p)
+    log.append(D1, _res(D1))
+    before = p.read_bytes()
+    log.append(D2, _res(D2))
+    assert p.read_bytes().startswith(before)
+    # reopening continues the chain
+    log2 = PredictionLog(p)
+    log2.append(D3, _res(D3))
+    assert p.read_bytes().startswith(before)
+    assert log2.verify() is True
+
+
+def test_no_opinion_recorded_with_reason_and_no_partial_output(tmp_path):
+    import json
+    log = PredictionLog(tmp_path / "p.jsonl")
+    log.append(D1, _res(D1))
+    line = json.loads((tmp_path / "p.jsonl").read_text())
+    rec = next(a for a in line["agents"] if a["agent"] == "a2")
+    assert rec == {"agent": "a2", "status": "no_opinion", "reason": "timeout"}
+    assert "SECRET" not in (tmp_path / "p.jsonl").read_text()
+
+
+def test_append_refuses_to_extend_tampered_log(tmp_path):
+    log, _ = make(tmp_path, (D1, D2))
+    p = tmp_path / "p.jsonl"
+    p.write_text(p.read_text().replace("AAA", "BBB", 1))
+    with pytest.raises(ValueError):
+        PredictionLog(p).append(D3, _res(D3))
+
+
+def test_idempotent_reappend_same_day(tmp_path):
+    log, hashes = make(tmp_path, (D1, D2))
+    p = tmp_path / "p.jsonl"
+    before = p.read_bytes()
+    assert log.append(D2, _res(D2)) == hashes[1]
+    assert PredictionLog(p).append(D2, _res(D2)) == hashes[1]
+    assert p.read_bytes() == before
+
+
+def test_different_content_for_existing_day_raises(tmp_path):
+    log, _ = make(tmp_path, (D1, D2))
+    with pytest.raises(ValueError):
+        log.append(D2, _res(D2, ticker="ZZZ"))
+
+
+def test_older_day_cannot_be_reappended(tmp_path):
+    log, _ = make(tmp_path, (D1, D2))
+    with pytest.raises(ValueError):
+        log.append(D1, _res(D1))
