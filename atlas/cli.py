@@ -6,6 +6,7 @@ Commands (``atlas <command> --help`` for options)::
     atlas calibrate --config RUN.yaml
     atlas autoresearch --config RUN.yaml
     atlas report --run-dir RUN_DIR
+    atlas probe --run-dir RUN_DIR [--samples N] [--yes]      (optional)
 
 The run config (documented by ``atlas/config/run.example.yaml``) names a run directory that
 holds everything a run writes::
@@ -22,6 +23,9 @@ holds everything a run writes::
     control.json           spend of the optional date-only control agent (--with-control)
     autoresearch_log.jsonl one line per autoresearch attempt
     autoresearch_failures.sqlite  failures of autoresearch replay calls (kept separate)
+    probe.json             spend of the (optional) contamination probe (counts against the cap)
+    contamination.json     (optional) probe result: rate, n, tolerance, seed, model, spend
+    probe_failures.sqlite  (optional) unusable probe replies, with their reason codes
     prices/                price cache (unless data.cache_dir says otherwise)
     dry_run/               ALL state of `backtest --dry-run` (same layout): never the real run's
     report/                report.md, equity.png, agents.csv, autoresearch.csv
@@ -45,6 +49,12 @@ location) is refused with exit 1 and the file is left untouched; `calibrate` and
 settings; `report` reads only the stored record. Unknown config keys are rejected with a
 did-you-mean hint. One LLM hard cap (budget_usd) spans the backtest, the control agent and
 autoresearch of a run directory.
+
+(optional) ``atlas probe`` asks the model to guess the date and ticker of ANONYMISED snapshots of
+the run's own days (opaque ids, rebased prices, relative day index, sector labels) and records
+how often it succeeds; a high rate means the model can recognise those periods, so trust their
+results less. It is the only feature that builds anonymised snapshots and it sends them only to
+the probe prompt. Its spend counts against the same hard cap.
 
 Anonymised runs are refused (ruling W): anonymised prompt variants do not exist yet and the
 real prompt files name tickers and ask for dates.
@@ -107,6 +117,7 @@ ANTHROPIC_KEY, FRED_KEY = "ANTHROPIC_API_KEY", "FRED_API_KEY"
 CHECKPOINT, PREDLOG, SCORES, FAILURES = "checkpoint.json", "prediction_log.jsonl", "scores.sqlite", "failures.sqlite"
 LLM_CACHE, WEIGHTS, RUN_CONFIG, CALIBRATION = "llm_cache.sqlite", "weights.json", "run_config.json", "calibration.json"
 CONTROL_STATE, AR_LOG, AR_FAILURES = "control.json", "autoresearch_log.jsonl", "autoresearch_failures.sqlite"
+PROBE_STATE, CONTAMINATION, PROBE_FAILURES = "probe.json", "contamination.json", "probe_failures.sqlite"
 DRY_RUN_CACHE = "dry_run_llm.db"
 ABLATION_NOTE = ("CIO ablation: the decision layer's portfolio is the execution agent's stated long "
                  "target weights (scaled down to max_gross_pct); the baseline is the weight-averaged "
@@ -630,14 +641,16 @@ def _drop_torn_tail(path: Path) -> None:
 
 
 def spend_so_far(run_dir: Path) -> dict[str, float]:
-    """LLM spend recorded in a run directory: backtest (checkpoint), control, autoresearch."""
+    """LLM spend recorded in a run directory: backtest (checkpoint), control, autoresearch and
+    the optional contamination probe."""
     run_dir = Path(run_dir)
     raw = _load_checkpoint(Checkpoint(run_dir / CHECKPOINT)) or {}
-    ctl = run_dir / CONTROL_STATE
+    ctl, probe = run_dir / CONTROL_STATE, run_dir / PROBE_STATE
     ar_cost = sum((float(r.get("cost_usd") or 0.0) for r in read_ar_log(run_dir / AR_LOG)), 0.0)
     return {"backtest": float(raw.get("spent_usd", 0.0)),
             "control": float(json.loads(ctl.read_text())["spent_usd"]) if ctl.exists() else 0.0,
-            "autoresearch": ar_cost}
+            "autoresearch": ar_cost,
+            "probe": float(json.loads(probe.read_text())["spent_usd"]) if probe.exists() else 0.0}
 
 
 # ============================================================================ backtest
@@ -691,11 +704,12 @@ def cmd_backtest(args, llm_client=None) -> int:
     fresh = stored is None and not checkpoint.path.exists()
     if not args.dry_run:  # one hard cap: control and autoresearch spend count against the backtest too
         other = spend_so_far(rc.run_dir)
-        run.llm.budget_usd = max(0.0, run.settings.budget_usd - other["control"] - other["autoresearch"])
+        run.llm.budget_usd = max(0.0, run.settings.budget_usd - other["control"] - other["autoresearch"]
+                                     - other["probe"])
         if sum(other.values()) >= run.settings.budget_usd and (lcd is None or lcd < max(run.trading_days())):
             raise OperationalError(
                 f"LLM budget exhausted: ${sum(other.values()):.2f} of ${run.settings.budget_usd:.2f} already "
-                "spent on this run (backtest + control + autoresearch); raise budget_usd to continue")
+                "spent on this run (backtest + control + autoresearch + probe); raise budget_usd to continue")
     all_days = run.trading_days()
     todo = [d for d in all_days if lcd is None or d > lcd]
     n_agents = sum(1 for sp in run.specs if sp.kind != "control") + (1 if args.with_control else 0)
@@ -765,7 +779,8 @@ def run_control_pass(run: Run, scores: ScoreStore, result: BacktestResult, all_d
                         (0.0, 0.0), math.inf)
     else:
         other = spend_so_far(run.rc.run_dir)  # one hard cap across backtest, control, autoresearch
-        remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev - other["autoresearch"])
+        remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev - other["autoresearch"]
+                        - other["probe"])
         llm = CachedLLM(run.llm.client, run.rc.llm_cache_path, run.settings.model,
                         (run.settings.usd_per_mtok_input, run.settings.usd_per_mtok_output), remaining)
     last = max(result.equity.index)
@@ -988,7 +1003,7 @@ def cmd_autoresearch(args, llm_client=None) -> int:
     remaining = run.settings.budget_usd - sum(spent.values())
     if remaining <= 0:
         raise OperationalError(f"LLM budget exhausted: ${sum(spent.values()):.2f} of ${run.settings.budget_usd:.2f} "
-                               "already spent on this run (backtest + control + autoresearch); raise budget_usd")
+                               "already spent on this run (backtest + control + autoresearch + probe); raise budget_usd")
     run.llm.budget_usd = remaining  # one hard cap across the run directory
     print(f"autoresearch budget: ${remaining:.2f} remaining of ${run.settings.budget_usd:.2f}")
     scores = ScoreStore(rc.path(SCORES))
@@ -1114,21 +1129,25 @@ def ablation_from_run(history: dict[date, dict], results: dict[date, dict[str, A
     return out
 
 
-def cmd_report(args, llm_client=None) -> int:
-    from atlas.autoresearch.loop import EditRecord
-    from atlas.backtest.report import build_report
-    run_dir = Path(args.run_dir)
+def load_stored_run(run_dir: Path, missing: type[Exception]) -> tuple[RunConfig, Settings, Limits, list[AgentSpec], Periods]:
+    """The stored run (run_config.json) as the single source of truth, for commands that take
+    only --run-dir (report, probe). `missing` is the error raised when there is no stored run."""
     stored_path = run_dir / RUN_CONFIG
     if not stored_path.exists():
-        raise UsageError(f"{run_dir} is not a run directory (no {RUN_CONFIG}); run `atlas backtest` first")
+        raise missing(f"{run_dir} is not a run directory (no {RUN_CONFIG}); run `atlas backtest` first")
     stored = json.loads(stored_path.read_text(encoding="utf-8"))
     rc = RunConfig.model_validate(stored["run_config"]).model_copy(update={"run_dir": run_dir})
     if rc.data.cache_dir is None:
         rc = rc.model_copy(update={"data": rc.data.model_copy(update={"cache_dir": run_dir / "prices"})})
-    settings = Settings(**stored["settings"])
-    limits = Limits(**stored["limits"])
-    specs = [AgentSpec(**a) for a in stored["agents"]]
-    periods = resolve_periods(rc)
+    return (rc, Settings(**stored["settings"]), Limits(**stored["limits"]),
+            [AgentSpec(**a) for a in stored["agents"]], resolve_periods(rc))
+
+
+def cmd_report(args, llm_client=None) -> int:
+    from atlas.autoresearch.loop import EditRecord
+    from atlas.backtest.report import build_report
+    run_dir = Path(args.run_dir)
+    rc, settings, limits, specs, periods = load_stored_run(run_dir, UsageError)
     ckpt = Checkpoint(run_dir / CHECKPOINT)
     raw = _load_checkpoint(ckpt)
     if not raw or not raw.get("last_completed_day"):
@@ -1156,22 +1175,122 @@ def cmd_report(args, llm_client=None) -> int:
     edits = [EditRecord(**{k: v for k, v in r.items() if k in known}) for r in ar_records]
     ar_metas = [r.get("null_test") for r in ar_records]
     failures = FailureLog(run_dir / FAILURES)
-    spent = spend_so_far(run_dir)  # backtest + control + autoresearch: one total
+    spent = spend_so_far(run_dir)  # backtest + control + autoresearch + probe: one total
     weights = WeightBook(run_dir / WEIGHTS).load()
     final_weights = {sp.name: weights.get(sp.name, W_INIT) for sp in specs if sp.kind in WEIGHTED_KINDS}
     history = read_day_history(run_dir / HISTORY_NAME, ckpt)
     turnover = turnover_by_period(history, result.equity, periods)
     by_period = ablation_from_run(history, predlog_results(run_dir / PREDLOG), run.store, specs, limits, periods)
     ablation = by_period.get("holdout") if by_period else None
+    contamination = None
+    if (run_dir / CONTAMINATION).exists():
+        try:
+            contamination = json.loads((run_dir / CONTAMINATION).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise OperationalError(f"{run_dir / CONTAMINATION} is corrupt; delete it or re-run "
+                                   "`atlas probe`") from None
     path = build_report(result, scores, null, edits, ablation, None, failures.summary(),
                         sum(spent.values()), run_dir / "report", settings=settings,
                         ablation_by_period=by_period, null_meta=null_meta, null_source=null_src,
                         autoresearch_null_meta=ar_metas,
                         holdout_edit_ics=None, final_weights=final_weights,
-                        dropped_picks=failures.dropped_picks_summary(), turnover=turnover)
+                        dropped_picks=failures.dropped_picks_summary(), turnover=turnover,
+                        contamination=contamination)
     print(f"null distribution: {null_src}; CIO ablation: {'computed' if by_period else 'not provided'}; "
           f"turnover: {'computed' if turnover is not None else 'not provided'}")
     print(f"wrote {path}")
+    return EXIT_OK
+
+
+# ============================================================================ probe (optional)
+
+PROBE_SEED = 17
+PROBE_DEFAULT_SAMPLES = 30
+PROBE_SECTORS = {"SPY": "Broad market", "SMH": "Semiconductors", "XLF": "Financials", "XLE": "Energy",
+                 "XLV": "Healthcare"}  # the example universe; anything else is "Unclassified"
+
+
+def probe_selection(days: list[date], universe: list[str], n: int, seed: int) -> list[tuple[date, str]]:
+    """n (day, ticker) pairs, deterministic in `seed`: days evenly spread over the run, tickers
+    dealt from a seeded shuffle of the universe so every ticker is used before any repeats."""
+    import random
+    n = min(n, len(days))
+    idx = sorted({round(i * (len(days) - 1) / max(1, n - 1)) for i in range(n)}) if n > 1 else [0]
+    rng = random.Random(seed)
+    order: list[str] = []
+    while len(order) < len(idx):
+        deck = sorted(universe)
+        rng.shuffle(deck)
+        order += deck
+    return [(days[i], order[k]) for k, i in enumerate(idx)]
+
+
+def cmd_probe(args, llm_client=None) -> int:
+    """(optional) Contamination probe on anonymised snapshots of the stored run's days."""
+    from atlas.backtest.contamination import contamination_probe
+    from atlas.backtest.runner import anonymize_snapshot
+    run_dir = Path(args.run_dir)
+    rc, settings, limits, specs, periods = load_stored_run(run_dir, OperationalError)
+    require_keys(rc, anthropic=llm_client is None, fred=False)
+    run = Run(rc, settings, limits, specs, {}, periods, PriceStore(CacheOnlyPrices(), NoMacro(), rc.cache_dir), [])
+    days = _cached_days(run)
+    samples = args.samples
+    if samples < 1:
+        raise UsageError("--samples must be at least 1")
+    if samples > len(days):
+        print(f"note: only {len(days)} trading days in the run; probing {len(days)} samples instead of {samples}")
+        samples = len(days)
+    spent = spend_so_far(run_dir)
+    remaining = settings.budget_usd - sum(spent.values())
+    if remaining <= 0:
+        raise OperationalError(f"LLM budget exhausted: ${sum(spent.values()):.2f} of ${settings.budget_usd:.2f} "
+                               "already spent on this run (backtest + control + autoresearch + probe); "
+                               "raise budget_usd")
+    est = samples * (settings.est_input_tokens_per_call * settings.usd_per_mtok_input
+                     + 100 * settings.usd_per_mtok_output) / 1e6
+    if est > settings.confirm_cost_usd and not _confirm(est, settings.confirm_cost_usd, args.yes):
+        return EXIT_USAGE
+    client = llm_client
+    if client is None:
+        from atlas.engine.llm import AnthropicClient
+        client = AnthropicClient(settings.model)
+    llm = CachedLLM(client, rc.llm_cache_path, settings.model,
+                    (settings.usd_per_mtok_input, settings.usd_per_mtok_output), remaining)
+    chosen = probe_selection(days, list(dict.fromkeys(settings.universe)), samples, PROBE_SEED)
+    items = []
+    for day, ticker in chosen:
+        snap = run.store.snapshot(day, [ticker], rc.data.lookback_days)
+        anon, _ = anonymize_snapshot(snap, {ticker: PROBE_SECTORS.get(ticker, "Unclassified")})
+        items.append((anon, day, ticker))
+    failures = FailureLog(run_dir / PROBE_FAILURES)
+    prev = json.loads((run_dir / PROBE_STATE).read_text())["spent_usd"] if (run_dir / PROBE_STATE).exists() else 0.0
+    try:
+        score = contamination_probe(items, llm, settings.tolerance_days, failures=failures)
+    finally:
+        _write_json(run_dir / PROBE_STATE, {"spent_usd": prev + llm.spent_usd})
+    out = {"n": score.n, "date_hits": score.date_hits, "ticker_hits": score.ticker_hits,
+           "any_hits": score.any_hits, "rate": score.rate, "failed": score.failed,
+           "budget_exhausted": score.budget_exhausted, "tolerance_days": settings.tolerance_days,
+           "seed": PROBE_SEED, "model": settings.model, "requested_samples": samples,
+           "spent_usd": prev + llm.spent_usd,
+           "samples": [{"date": d.isoformat(), "ticker": t} for _, d, t in items[:score.n]]}
+    _write_json(run_dir / CONTAMINATION, out)
+    if score.empty:
+        print(f"contamination probe (optional): no probe completed"
+              + (" (LLM budget exhausted)" if score.budget_exhausted else "") + f"; wrote {run_dir / CONTAMINATION}")
+        return EXIT_OK
+    print(f"contamination probe (optional): the model ({settings.model}) recognised {score.any_hits} of "
+          f"{score.n} anonymised snapshots ({score.rate:.1%}; date within {settings.tolerance_days} days: "
+          f"{score.date_hits}, ticker: {score.ticker_hits}; seed {PROBE_SEED}; spend ${llm.spent_usd:.4f}). "
+          "A high rate means the model can identify these dates from price shape alone, so trust results "
+          "for those periods less; a low rate is not proof it has not seen them. It is not a measure of "
+          f"skill. Wrote {run_dir / CONTAMINATION}; `atlas report` will include it.")
+    if score.budget_exhausted:
+        print(f"note: stopped early: LLM budget exhausted after {score.n} of {samples} probes")
+    if score.failed == score.n:
+        print(f"error: all {score.n} probe replies were unusable (see {run_dir / PROBE_FAILURES}); is "
+              f"'{settings.model}' reachable and returning JSON?", file=sys.stderr)
+        return EXIT_FAILED
     return EXIT_OK
 
 
@@ -1180,7 +1299,7 @@ def cmd_report(args, llm_client=None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="atlas", description="ATLAS backtest system: multi-agent LLM "
                                 "trading research with honest, leakage-aware evaluation.")
-    sub = p.add_subparsers(dest="command", required=True, metavar="{backtest,calibrate,autoresearch,report}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{backtest,calibrate,autoresearch,report,probe}")
     b = sub.add_parser("backtest", help="run or resume a backtest over train, validation and holdout")
     b.add_argument("--config", required=True, help="run config YAML (see atlas/config/run.example.yaml)")
     b.add_argument("--dry-run", action="store_true", help="no keys, zero LLM calls: plumbing check")
@@ -1193,11 +1312,21 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--config", required=True)
     r = sub.add_parser("report", help="write report.md, equity.png, agents.csv, autoresearch.csv")
     r.add_argument("--run-dir", required=True)
+    q = sub.add_parser("probe", help="(optional) contamination probe: can the model name the date and "
+                       "ticker of anonymised data? -> contamination.json", description="(optional) Ask the "
+                       "model to guess the calendar date and real ticker of anonymised snapshots from the "
+                       "stored run. A high rate means the model can recognise those periods, so trust "
+                       "their results less. Spend counts against the run's hard budget cap.")
+    q.add_argument("--run-dir", required=True, help="a run directory made by `atlas backtest`")
+    q.add_argument("--samples", type=int, default=PROBE_DEFAULT_SAMPLES,
+                   help="(optional) number of snapshots to probe, spread over the run's days "
+                        "(default %(default)s)")
+    q.add_argument("--yes", action="store_true", help="do not ask before spending above confirm_cost_usd")
     return p
 
 
 COMMANDS = {"backtest": cmd_backtest, "calibrate": cmd_calibrate, "autoresearch": cmd_autoresearch,
-            "report": cmd_report}
+            "report": cmd_report, "probe": cmd_probe}
 
 
 def main(argv: list[str] | None = None, *, llm_client=None) -> int:

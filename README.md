@@ -240,6 +240,7 @@ atlas calibrate --config my_run.yaml                # null test on train picks -
 atlas backtest --config my_run_pass2.yaml           # adaptive Darwinian weights
 atlas report --run-dir runs/pass2                   # report.md, equity.png, agents.csv, autoresearch.csv
 atlas autoresearch --config my_run_pass2.yaml       # optional: prompt edits judged on train days only
+atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination probe -> contamination.json
 ```
 
 * Weights stay frozen until a dead zone is calibrated by the null test (pass 1). The calibrated
@@ -251,6 +252,14 @@ atlas autoresearch --config my_run_pass2.yaml       # optional: prompt edits jud
   the report next to the real agents'.
 * `autoresearch` needs a clean git working tree, edits only `atlas/prompts/`, never pushes, and needs
   at least 40 train days. `anonymize: true` is refused for now (the prompt files name tickers).
+* `probe` (optional) shows the model anonymised snapshots of the run's own days (opaque ids, rebased
+  prices, relative day index, sector labels; never a real ticker or date) and asks it to guess the
+  calendar date and real ticker. A high hit rate means the model can recognise those periods, so
+  trust their results less; it is not a measure of skill. Its spend counts against `budget_usd`,
+  and `atlas report` adds a "Contamination probe (optional)" section once `contamination.json`
+  exists. The older-model check (optional, `atlas.backtest.oldmodel.run_older_model_check`) reruns
+  only the window after an older model's cutoff in `<run_dir>/older_model/<model>/`; the model
+  name is yours to supply and availability is not checked.
 * A run directory remembers its validated config (`run_config.json`): re-running, calibrating or
   researching it with a different config is refused. Unknown config keys are rejected.
 * Exit codes: 0 success, 1 operational failure (the message says how to fix it), 2 usage, config

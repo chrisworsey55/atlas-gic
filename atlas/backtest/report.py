@@ -20,6 +20,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from atlas.autoresearch.loop import EditRecord  # noqa: E402
+from atlas.backtest.contamination import ContaminationScore  # noqa: E402,F401
 from atlas.backtest.nulltest import NullDistribution  # noqa: E402
 from atlas.backtest.runner import BacktestResult  # noqa: E402
 from atlas.config import Settings  # noqa: E402
@@ -184,6 +185,38 @@ def _real(df: pd.DataFrame, col: str) -> pd.Series:
 
 # ------------------------------------------------------------------------------ report
 
+def _contamination_section(c, settings: Settings | None) -> list[str]:
+    head = "## Contamination probe (optional)\n"
+    try:
+        d = asdict(c) if hasattr(c, "__dataclass_fields__") else dict(c)
+        n, rate = int(d["n"]), float(d["rate"])
+        date_hits, ticker_hits = int(d["date_hits"]), int(d["ticker_hits"])
+    except (KeyError, TypeError, ValueError):
+        return [head, "n/a (contamination result unreadable).\n"]
+    tol = d.get("tolerance_days", settings.tolerance_days if settings is not None else None)
+    any_hits = d.get("any_hits")
+    out = [head]
+    if n <= 0:
+        out.append("No probes completed (n = 0), so there is no contamination estimate.\n")
+    else:
+        hits = f" ({int(any_hits)} of {n} probes)" if any_hits is not None else ""
+        out.append(f"Recognition rate: {_f(rate, pct=True)}{hits}; n = {n} probes; a date guess counts "
+                   f"as a hit within {tol} day(s) of the true date, a ticker guess as a hit when it "
+                   f"equals the true ticker (date hits {date_hits}, ticker hits {ticker_hits}).\n")
+    if d.get("failed"):
+        out.append(f"{int(d['failed'])} probe(s) got an unusable reply and count as misses "
+                   "(see the failure log).\n")
+    if d.get("budget_exhausted"):
+        out.append("The probe stopped early: the LLM budget was exhausted, so n is the number of "
+                   "completed probes.\n")
+    out.append("Interpretation: the model was shown anonymised price data (no dates, no tickers) and "
+               "asked to name the date and the ticker. A high rate means the model can identify these "
+               "dates, so trust results for those periods less. A low rate does not prove the model "
+               "has not seen the period. This probe is a data-quality check, not a measure of skill, "
+               "and it does not enter the verdict.\n")
+    return out
+
+
 def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribution | None,
                  edits: list[EditRecord], ablation: dict | None, control_ic: float | None,
                  failures: pd.DataFrame, cost_usd: float, out_dir: Path, *,
@@ -194,10 +227,13 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                  turnover: dict[str, float] | None = None,
                  ablation_by_period: dict[str, dict | None] | None = None,
                  null_meta: dict | None = None, null_source: str | None = None,
-                 autoresearch_null_meta: list[dict | None] | None = None) -> Path:
+                 autoresearch_null_meta: list[dict | None] | None = None,
+                 contamination: "ContaminationScore | dict | None" = None) -> Path:
     """`ablation_by_period` (optional, period name -> ablation dict or None, plus "all") renders
     the CIO ablation per period with the holdout as the headline; without it the single
-    `ablation` dict is shown as before."""
+    `ablation` dict is shown as before. `contamination` (optional, a ContaminationScore or its
+    dict form from contamination.json) adds a "Contamination probe (optional)" section; without
+    it the section is absent. It never changes the verdict."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cutoff = settings.model_cutoff if settings is not None else None
@@ -397,6 +433,10 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                       f"{beat}.\n")
         except Exception:
             md.append("n/a (ablation result unreadable).\n")
+
+    # ---- contamination probe (optional)
+    if contamination is not None:
+        md += _contamination_section(contamination, settings)
 
     # ---- failures
     md += ["## Failures\n", "Failed calls by agent and reason:\n", _table(failures),
