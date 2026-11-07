@@ -192,3 +192,11 @@ def test_loaded_frames_are_memoised_and_invalidated_when_the_cache_file_changes(
     df = store._load("AAA")
     df.loc[df.index[0], "close"] = -1.0
     assert store._load("AAA")["close"].iloc[0] != -1.0
+
+
+def test_outcome_prices_excludes_bars_after_end(store):
+    s = store.outcome_prices("AAA", date(2024, 1, 8), date(2024, 1, 10))
+    assert list(s.index) == [date(2024, 1, 8), date(2024, 1, 9), date(2024, 1, 10)]
+    store.outcome_prices("AAA", date(2024, 1, 8), date(2024, 2, 20))  # widen the cache
+    s = store.outcome_prices("AAA", date(2024, 1, 8), date(2024, 1, 10))
+    assert max(s.index) == date(2024, 1, 10)

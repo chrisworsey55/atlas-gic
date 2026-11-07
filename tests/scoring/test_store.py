@@ -209,3 +209,24 @@ def test_failed_rerun_discards_unscored_picks_but_keeps_scored(ss):
     assert len(ss.picks_frame("tech", 1)) == 1
     ss.discard_unscored("tech", d1)  # explicit form, also a no-op on scored rows
     assert len(ss.picks_frame("tech", 1)) == 1
+
+
+def test_score_matured_never_overwrites_a_cell_filled_meanwhile(ss, tmp_path):
+    """A concurrent scorer may fill a cell between the pending-rows read and the batched
+    update: the UPDATE must only ever fill NULL cells."""
+    import sqlite3
+    fs = FakeStore({"AAA": px(100, 0.01), "SMH": px(100, 0.0)})
+    ss.record_picks(result(picks=[pick("AAA")]))
+    real = fs.outcome_prices
+    done = []
+
+    def racing(ticker, start, end):
+        if not done:  # another process scores the h=1 cell first
+            with sqlite3.connect(tmp_path / "s.db") as c:
+                c.execute("UPDATE picks SET excess_1=? WHERE agent='tech'", (123.0,))
+            done.append(1)
+        return real(ticker, start, end)
+
+    fs.outcome_prices = racing
+    ss.score_matured(DAYS[3], fs, SPECS, 0.0)
+    assert ss.picks_frame("tech", 1).excess.iloc[0] == 123.0

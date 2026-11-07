@@ -36,6 +36,7 @@ class PriceStore:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._cal = calendar_ticker
         # parsed CSVs keyed by ticker, valid while the file's (mtime_ns, size) is unchanged
+        # NOT thread-safe: the memo assumes single-threaded access to a PriceStore
         self._frames: dict[str, tuple[tuple[int, int], pd.DataFrame]] = {}
         self._adj: dict[str, tuple[tuple[int, int], list, np.ndarray]] = {}  # sorted adj closes
 

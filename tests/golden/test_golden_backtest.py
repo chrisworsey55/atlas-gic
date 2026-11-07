@@ -172,8 +172,9 @@ def test_cli_backtest_dry_run_exits_zero_and_makes_no_llm_calls(golden, tmp_path
     stub = GoldenStub()
     assert cli(["backtest", "--config", conf, "--dry-run"], stub) == 0
     assert stub.calls == 0
-    cp = json.loads((tmp_path / "run" / "checkpoint.json").read_text())
+    cp = json.loads((tmp_path / "run" / "dry_run" / "checkpoint.json").read_text())
     assert len(cp["equity"]) == GOLDEN_DAYS  # the full loop ran
+    assert sorted(p.name for p in (tmp_path / "run").iterdir()) == ["dry_run"]  # real run untouched
     assert cp["fingerprint"]["dry_run"] is True
     assert cp["spent_usd"] == 0.0
     assert "dry run" in capsys.readouterr().out.lower()
@@ -317,8 +318,9 @@ def test_calibrate_writes_calibration_and_second_pass_reads_it(golden, tmp_path,
 
 
 def test_calibrate_with_too_few_picks_fails_cleanly(golden, tmp_path, keys, capsys):
-    conf = write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"], periods=SHORT_PERIODS)
-    assert cli(["backtest", "--config", conf, "--dry-run"]) == 0  # dry run: no picks at all
+    conf = write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"], periods=SHORT_PERIODS,
+                        settings={"warmup_picks": 30})  # 2 safe train days cannot reach warm-up
+    assert cli(["backtest", "--config", conf], GoldenStub()) == 0
     assert cli(["calibrate", "--config", conf]) == 1
     assert "cannot calibrate" in "".join(capsys.readouterr()).lower()
     assert not (tmp_path / "run" / "calibration.json").exists()
@@ -482,3 +484,228 @@ def test_example_run_config_is_valid():
     resolve_periods(rc)
     s = resolve_settings(rc)
     assert s.dead_zone is None  # pass 1: frozen weights
+
+
+# ---------------------------------------------------------------------------- fix round 1
+
+ALT_PERIODS = {"train": {"start": "2024-01-01", "end": "2024-02-02"},
+               "validation": {"start": "2024-02-05", "end": "2024-02-09"},
+               "holdout": {"start": "2024-02-12", "end": "2024-02-23"}}
+
+
+def test_readme_order_dry_run_then_real_run_both_succeed(golden, tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    conf = write_config(tmp_path / "my_run.yaml", tmp_path / "run", golden["repo"], periods=SHORT_PERIODS)
+    assert cli(["backtest", "--config", conf, "--dry-run"]) == 0
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_ANTHROPIC)
+    assert cli(["backtest", "--config", conf], GoldenStub()) == 0
+    real = json.loads((tmp_path / "run" / "checkpoint.json").read_text())
+    dry = json.loads((tmp_path / "run" / "dry_run" / "checkpoint.json").read_text())
+    assert real["fingerprint"]["dry_run"] is False and dry["fingerprint"]["dry_run"] is True
+    with sqlite3.connect(tmp_path / "run" / "scores.sqlite") as c:  # only the real run's picks
+        assert c.execute("SELECT COUNT(*) FROM picks").fetchone()[0] > 0
+    assert len((tmp_path / "run" / "prediction_log.jsonl").read_text().splitlines()) == 7
+
+
+def test_refused_rerun_with_changed_periods_leaves_stored_config_untouched(golden, tmp_path, keys, capsys):
+    run_dir, _ = copy_run(golden, tmp_path)
+    before = (run_dir / "run_config.json").read_bytes()
+    conf = write_config(tmp_path / "changed.yaml", run_dir, golden["repo"], periods=ALT_PERIODS,
+                        settings={"model_cutoff": "2024-02-09"})
+    stub = GoldenStub()
+    assert cli(["backtest", "--config", conf, "--yes"], stub) == 1
+    text = "".join(capsys.readouterr())
+    assert "periods.holdout.start" in text and "settings.model_cutoff" in text
+    assert stub.calls == 0
+    assert (run_dir / "run_config.json").read_bytes() == before
+    assert cli(["report", "--run-dir", run_dir]) == 0
+    md = (run_dir / "report" / "report.md").read_text()
+    assert "### holdout (2024-02-05 to 2024-02-23)" in md  # the periods the run traded with
+
+
+def test_calibrate_refuses_a_config_that_disagrees_with_the_stored_run(golden, tmp_path, capsys):
+    run_dir, conf = copy_run(golden, tmp_path)
+    for key, over in (("periods.train.end", {"periods": ALT_PERIODS, "settings": {"model_cutoff": "2024-02-09"}}),
+                      ("settings.rolling_ic_window", {"settings": {"rolling_ic_window": 7}}),
+                      ("settings.warmup_picks", {"settings": {"warmup_picks": 1}})):
+        bad = write_config(tmp_path / "bad.yaml", run_dir, golden["repo"], **over)
+        assert cli(["calibrate", "--config", bad]) == 2, key
+        text = "".join(capsys.readouterr())
+        assert "disagrees with the stored run" in text and key in text and "Traceback" not in text
+        assert not (run_dir / "calibration.json").exists()
+    assert cli(["calibrate", "--config", conf]) == 0  # the matching config is accepted
+
+
+def test_autoresearch_refuses_a_config_that_disagrees_with_the_stored_run(golden, tmp_path, keys, capsys):
+    run_dir, _ = copy_run(golden, tmp_path)
+    bad = write_config(tmp_path / "bad.yaml", run_dir, golden["repo"], periods=ALT_PERIODS,
+                       settings={"model_cutoff": "2024-02-09"})
+    stub = GoldenStub()
+    assert cli(["autoresearch", "--config", bad], stub) == 2
+    text = "".join(capsys.readouterr())
+    assert "periods.train.end" in text and stub.calls == 0
+    assert not (run_dir / "autoresearch_log.jsonl").exists()
+
+
+def test_calibrate_without_stored_config_fails_clearly(golden, tmp_path, capsys):
+    run_dir, conf = copy_run(golden, tmp_path)
+    (run_dir / "run_config.json").unlink()
+    assert cli(["calibrate", "--config", conf]) == 1
+    assert "run_config.json" in "".join(capsys.readouterr())
+
+
+@pytest.mark.parametrize("over,needle", [
+    ({"settings": {"budget_usdd": 1}}, "settings.budget_usdd (did you mean 'budget_usd'?)"),
+    ({"settings": {"confirm_cost": 0}}, "settings.confirm_cost (did you mean 'confirm_cost_usd'?)"),
+    ({"periods": {"train": {"start": "2024-01-01", "endd": "2024-01-19"}}}, "periods.train.endd (did you mean 'end'?)"),
+    ({"budgett_usd": 1}, "budgett_usd (did you mean 'budget_usd'?)"),
+    ({"data": {"macro": {"sereis": []}}}, "data.macro.sereis (did you mean 'series'?)"),
+])
+def test_typos_in_the_run_config_are_rejected_with_a_hint(golden, tmp_path, capsys, over, needle):
+    conf = write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"], **over)
+    assert cli(["backtest", "--config", conf, "--dry-run"]) == 2
+    assert needle in "".join(capsys.readouterr())
+    assert not (tmp_path / "run").exists()
+
+
+def test_stored_run_config_holds_validated_settings_not_raw_overrides(golden):
+    rec = json.loads((golden["run_dir"] / "run_config.json").read_text())
+    assert "settings" not in rec["run_config"]
+    assert rec["settings"]["warmup_picks"] == 5 and rec["settings"]["budget_usd"] == 50
+
+
+def test_keys_never_reach_output_or_run_dir_on_success(golden, tmp_path, monkeypatch, capsys):
+    from atlas.data.fred_provider import FredAlfredProvider
+    import pandas as pd
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_ANTHROPIC)
+    monkeypatch.setenv("FRED_API_KEY", FAKE_FRED)
+    monkeypatch.setattr(FredAlfredProvider, "fetch", lambda self, sid, asof: pd.Series(dtype=float, name=sid))
+    conf = write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"], periods=SHORT_PERIODS,
+                        data={"macro": {"source": "fred", "series": ["DGS10"]}})
+    assert cli(["backtest", "--config", conf, "--with-control"], GoldenStub()) == 0
+    assert cli(["calibrate", "--config", conf]) in (0, 1)
+    assert cli(["report", "--run-dir", tmp_path / "run"]) == 0
+    text = "".join(capsys.readouterr())
+    for secret in (FAKE_ANTHROPIC, FAKE_FRED):
+        assert secret not in text
+        for f in (tmp_path / "run").rglob("*"):
+            if f.is_file():
+                assert secret.encode() not in f.read_bytes(), f
+
+
+def test_control_gets_only_the_remaining_budget(golden, tmp_path, keys, monkeypatch):
+    import atlas.cli as cli_mod
+    made = []
+
+    class Recording(cli_mod.CachedLLM):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    monkeypatch.setattr(cli_mod, "CachedLLM", Recording)
+    conf = write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"], periods=SHORT_PERIODS,
+                        budget_usd=10)
+    assert cli(["backtest", "--config", conf, "--with-control"], GoldenStub()) == 0
+    bt_spent = json.loads((tmp_path / "run" / "checkpoint.json").read_text())["spent_usd"]
+    assert bt_spent > 0
+    control_llm = made[-1]
+    assert control_llm.budget_usd == pytest.approx(10 - bt_spent)
+    ctl = json.loads((tmp_path / "run" / "control.json").read_text())
+    assert ctl["days"] == 7 and ctl["spent_usd"] == pytest.approx(control_llm.spent_usd)
+
+
+def test_autoresearch_gets_what_remains_of_the_hard_cap(golden, tmp_path, keys, monkeypatch, capsys):
+    import atlas.autoresearch.loop as loop_mod
+    seen = {}
+
+    def fake_loop(cfg, *, llm, **kw):
+        seen["budget"] = llm.budget_usd
+        return []
+
+    monkeypatch.setattr(loop_mod, "run_autoresearch", fake_loop)
+    run_dir, conf = copy_run(golden, tmp_path)
+    rec = {"agent": "sector_energy", "branch": None, "n_days": 0, "old_ic": None, "new_ic": None,
+           "diff": None, "keep_margin": 0.2, "decision": "rejected", "reason": "x", "commit_sha": None,
+           "cost_usd": 0.75}
+    (run_dir / "autoresearch_log.jsonl").write_text(json.dumps(rec) + "\n")
+    (run_dir / "control.json").write_text(json.dumps({"spent_usd": 0.25, "days": 40}))
+    bt = json.loads((run_dir / "checkpoint.json").read_text())["spent_usd"]
+    assert cli(["autoresearch", "--config", conf], GoldenStub()) == 0
+    assert seen["budget"] == pytest.approx(50 - bt - 0.25 - 0.75)
+    assert cli(["report", "--run-dir", run_dir]) == 0
+    md = (run_dir / "report" / "report.md").read_text()
+    assert f"Total API cost: ${bt + 1.0:.2f}" in md
+    # an exhausted cap refuses before any call
+    (run_dir / "control.json").write_text(json.dumps({"spent_usd": 60.0, "days": 40}))
+    assert cli(["autoresearch", "--config", conf], GoldenStub()) == 1
+    assert "budget exhausted" in "".join(capsys.readouterr())
+
+
+def test_corrupt_checkpoint_is_a_clear_error_for_every_command(golden, tmp_path, keys, capsys):
+    run_dir, conf = copy_run(golden, tmp_path)
+    (run_dir / "checkpoint.json").write_text("{not json")
+    for cmd in (["report", "--run-dir", run_dir], ["calibrate", "--config", conf],
+                ["backtest", "--config", conf], ["autoresearch", "--config", conf]):
+        assert cli(cmd, GoldenStub()) == 1, cmd
+        text = "".join(capsys.readouterr())
+        assert f"checkpoint is corrupt: {run_dir / 'checkpoint.json'}" in text and "Traceback" not in text
+
+
+def test_report_ablation_is_per_period_with_holdout_headline(golden, tmp_path):
+    run_dir, _ = copy_run(golden, tmp_path)
+    assert cli(["report", "--run-dir", run_dir]) == 0
+    sec = (run_dir / "report" / "report.md").read_text().split("## CIO ablation")[1].split("## Failures")[0]
+    assert "Headline: holdout" in sec
+    assert "- train [NOT EVIDENCE OF SKILL" in sec and "- all periods [NOT EVIDENCE OF SKILL" in sec
+    assert "SAME gross exposure" in (run_dir / "report" / "report.md").read_text()
+
+
+# ---------------------------------------------------------------------------- ablation unit
+
+def _abl_inputs(tmp_path):
+    from atlas.backtest.runner import Periods
+    from atlas.config import AgentSpec, Limits
+    from atlas.data.csv_provider import CsvPriceProvider, NoMacro
+    from atlas.data.store import PriceStore
+    from atlas.schemas import AgentOutput, AgentResult, Pick
+    store = PriceStore(CsvPriceProvider(FIX / "prices"), NoMacro(), tmp_path / "prices")
+    specs = [AgentSpec(name="m1", layer=1, kind="macro", prompt_file="x"),
+             AgentSpec(name="m2", layer=1, kind="macro", prompt_file="x"),
+             AgentSpec(name="execution", layer=4, kind="execution", prompt_file="x")]
+    limits = Limits(max_position_pct=0.5, max_gross_pct=1.0, max_positions=8, min_order_usd=1,
+                    max_commission_frac=0.01, daily_loss_pct=0.5, drawdown_kill_pct=0.9, long_only=True)
+    days = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
+    nxt = {days[0]: days[1], days[1]: days[2], days[2]: date(2024, 1, 5)}
+
+    def res(d, name, ticker, conv):
+        return AgentResult(agent=name, date=d, output=AgentOutput(
+            agent=name, date=d, view="neutral", confidence=0.5,
+            picks=[Pick(ticker=ticker, direction="long", conviction=conv, horizon_days=1)]))
+
+    results = {d: {"m1": res(d, "m1", "AAA", 0.5), "m2": res(d, "m2", "BBB", 0.5),
+                   "execution": res(d, "execution", "CCC", 0.4)} for d in days}
+    w = {"m1": 2.5, "m2": 0.3}
+    history = {days[0]: {"weights": w, "skipped": None}, days[1]: {"weights": w, "skipped": None},
+               days[2]: {"weights": w, "skipped": "cio failed (malformed_json); no decision to trade on"}}
+    periods = Periods(train=(days[0], days[2]), validation=(date(2024, 1, 8), date(2024, 1, 9)),
+                      holdout=(date(2024, 2, 5), date(2024, 2, 6)))
+
+    def r(t, d):
+        s = store.outcome_prices(t, d, nxt[d])
+        return float(s.iloc[-1] / s.iloc[0] - 1)
+
+    return store, specs, limits, history, results, periods, days, r
+
+
+def test_ablation_uses_the_days_weights_gross_match_and_skips_skipped_days(tmp_path):
+    from atlas.cli import ablation_from_run
+    store, specs, limits, history, results, periods, days, r = _abl_inputs(tmp_path)
+    out = ablation_from_run(history, results, store, specs, limits, periods)
+    wa, wb = 2.5 * 0.5 / (2.5 * 0.5 + 0.3 * 0.5), 0.3 * 0.5 / (2.5 * 0.5 + 0.3 * 0.5)
+    base = [0.4 * (wa * r("AAA", d) + wb * r("BBB", d)) for d in days[:2]]  # gross-matched to 0.4
+    cio = [0.4 * r("CCC", d) for d in days[:2]]                              # day 3 skipped
+    tot = lambda xs: (1 + xs[0]) * (1 + xs[1]) - 1  # noqa: E731
+    assert out["train"]["baseline_total"] == pytest.approx(tot(base), rel=1e-12)
+    assert out["train"]["cio_total"] == pytest.approx(tot(cio), rel=1e-12)
+    assert out["all"] == out["train"]
+    assert out["validation"] is None and out["holdout"] is None

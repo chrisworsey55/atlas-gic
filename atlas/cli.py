@@ -23,6 +23,7 @@ holds everything a run writes::
     autoresearch_log.jsonl one line per autoresearch attempt
     autoresearch_failures.sqlite  failures of autoresearch replay calls (kept separate)
     prices/                price cache (unless data.cache_dir says otherwise)
+    dry_run/               ALL state of `backtest --dry-run` (same layout): never the real run's
     report/                report.md, equity.png, agents.csv, autoresearch.csv
 
 Keys: ANTHROPIC_API_KEY and (for ``data.macro.source: fred``) FRED_API_KEY are read from the
@@ -36,6 +37,15 @@ writes ``calibration.json``. Pass 2 is a new run directory whose config sets
 ``calibration: <pass-1 run_dir>/calibration.json``; it runs with adaptive weights. Resuming
 pass 1 with a calibration is refused (the checkpoint's fingerprint changes).
 
+Stored run = single source of truth: run_config.json holds the VALIDATED config of the run
+(written on a fresh run only). A later `backtest` on the same run_dir that disagrees with it
+(except ALLOWED_DRIFT: budget, confirmation ceiling, null-test/autoresearch options, cache
+location) is refused with exit 1 and the file is left untouched; `calibrate` and
+`autoresearch` refuse a disagreeing --config with exit 2 and use the stored periods and
+settings; `report` reads only the stored record. Unknown config keys are rejected with a
+did-you-mean hint. One LLM hard cap (budget_usd) spans the backtest, the control agent and
+autoresearch of a run directory.
+
 Anonymised runs are refused (ruling W): anonymised prompt variants do not exist yet and the
 real prompt files name tickers and ask for dates.
 
@@ -47,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import json
 import logging
 import math
@@ -97,9 +108,12 @@ LLM_CACHE, WEIGHTS, RUN_CONFIG, CALIBRATION = "llm_cache.sqlite", "weights.json"
 CONTROL_STATE, AR_LOG, AR_FAILURES = "control.json", "autoresearch_log.jsonl", "autoresearch_failures.sqlite"
 DRY_RUN_CACHE = "dry_run_llm.db"
 ABLATION_NOTE = ("CIO ablation: the decision layer's portfolio is the execution agent's stated long "
-                 "target weights (scaled to max_gross_pct), the baseline is baseline_target_weights "
-                 "from the same day's valid layer 1-3 outputs and weights; both are held for one "
-                 "day (adjusted close to next adjusted close, no costs); skipped days are excluded.")
+                 "target weights (scaled down to max_gross_pct); the baseline is the weight-averaged "
+                 "portfolio (baseline_target_weights) of the same day's valid layer 1-3 outputs and "
+                 "Darwinian weights, scaled to the SAME gross exposure as that day's execution targets, "
+                 "so only selection and weighting differ. Both are held one day, adjusted close to next "
+                 "adjusted close, with no costs; skipped days are excluded. It is reported per period, "
+                 "with the holdout as the headline; pre-cutoff periods are not evidence of skill.")
 
 
 class UsageError(Exception):
@@ -197,6 +211,33 @@ def _errors(e: ValidationError) -> str:
                      for err in e.errors())
 
 
+def _did_you_mean(key: str, valid) -> str:
+    close = difflib.get_close_matches(str(key), sorted(valid), n=1, cutoff=0.6)
+    return f" (did you mean {close[0]!r}?)" if close else ""
+
+
+def _unknown_keys(raw, model: type[BaseModel], prefix: str = "") -> list[str]:
+    """Unknown keys anywhere in a run config mapping (strict sections and `settings:`),
+    with a did-you-mean hint. A misspelt hard cap must never fall back to its default."""
+    if not isinstance(raw, dict):
+        return []
+    out = []
+    fields = model.model_fields
+    for k, v in raw.items():
+        name = f"{prefix}{k}"
+        if k not in fields:
+            out.append(f"{name}{_did_you_mean(k, fields)}")
+            continue
+        if model is RunConfig and k == "settings" and isinstance(v, dict):
+            out += [f"settings.{sk}{_did_you_mean(sk, Settings.model_fields)}"
+                    for sk in v if sk not in Settings.model_fields]
+            continue
+        ann = fields[k].annotation
+        if isinstance(ann, type) and issubclass(ann, BaseModel):
+            out += _unknown_keys(v, ann, f"{name}.")
+    return out
+
+
 def load_run_config(path: str | Path) -> RunConfig:
     """Parse and validate a run config; relative paths are relative to the config file."""
     path = Path(path)
@@ -208,6 +249,9 @@ def load_run_config(path: str | Path) -> RunConfig:
         raise UsageError(f"cannot read run config {path}: {type(e).__name__}") from None
     if not isinstance(raw, dict):
         raise UsageError(f"run config {path} must be a YAML mapping")
+    unknown = _unknown_keys(raw, RunConfig)
+    if unknown:
+        raise UsageError(f"invalid run config {path}: unknown key(s): {', '.join(unknown)}")
     try:
         rc = RunConfig.model_validate(raw)
     except ValidationError as e:
@@ -427,12 +471,107 @@ def _write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
-def _last_completed(checkpoint: Checkpoint) -> date | None:
+def _load_checkpoint(checkpoint: Checkpoint) -> dict | None:
     try:
-        raw = checkpoint.load()
-    except ValueError as e:
-        raise OperationalError(str(e)) from None
+        return checkpoint.load()
+    except ValueError:
+        raise OperationalError(f"checkpoint is corrupt: {checkpoint.path}") from None
+
+
+def _last_completed(checkpoint: Checkpoint) -> date | None:
+    raw = _load_checkpoint(checkpoint)
     return load_date(raw["last_completed_day"]) if raw and raw.get("last_completed_day") else None
+
+
+# ============================================================================ stored run record
+
+# Keys of the stored record that may legitimately change between invocations on one run
+# directory (prefix match on the flattened key): where the directory is, how the null test /
+# autoresearch are run, the response-cache location, the spend cap and confirmation ceiling.
+ALLOWED_DRIFT = ("run_config.run_dir", "run_config.null_test", "run_config.autoresearch",
+                 "run_config.llm_cache", "settings.budget_usd", "settings.confirm_cost_usd", "macro_series")
+
+
+def run_record(rc: RunConfig, run: Run) -> dict:
+    """What run_config.json stores: the VALIDATED config (the raw `settings:` dict, universe and
+    budget overrides are folded into the validated Settings dump, never copied verbatim)."""
+    return {"run_config": rc.model_dump(mode="json", exclude={"settings", "universe", "budget_usd"}),
+            "settings": run.settings.model_dump(mode="json"),
+            "limits": run.limits.model_dump(mode="json"),
+            "agents": [sp.model_dump(mode="json") for sp in run.specs],
+            "macro_series": list(run.macro_series)}
+
+
+def _flat(obj, prefix: str = "") -> dict:
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out.update(_flat(v, f"{prefix}{k}."))
+        return out or {prefix.rstrip("."): {}}
+    if isinstance(obj, list) and obj and all(isinstance(x, dict) and "name" in x for x in obj):
+        return _flat({x["name"]: x for x in obj}, prefix)  # agents: diff by name
+    return {prefix.rstrip("."): obj}
+
+
+# raw override fields of records written before the validated-only format; their effect is
+# compared through the validated "settings" dump
+LEGACY_RAW = ("run_config.settings", "run_config.universe", "run_config.budget_usd")
+
+
+def record_diff(stored: dict, current: dict) -> list[str]:
+    a, b = _flat(stored), _flat(current)
+    skip = ALLOWED_DRIFT + LEGACY_RAW
+    return sorted(k for k in set(a) | set(b) if a.get(k, "<absent>") != b.get(k, "<absent>")
+                  and not any(k == p or k.startswith(p + ".") for p in skip))
+
+
+def read_stored(run_dir: Path) -> dict | None:
+    p = Path(run_dir) / RUN_CONFIG
+    if not p.exists():
+        return None
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise OperationalError(f"stored run config is corrupt: {p}") from None
+    if not isinstance(rec, dict) or not {"run_config", "settings", "limits", "agents"} <= set(rec):
+        raise OperationalError(f"stored run config is corrupt: {p}")
+    return rec
+
+
+def stored_run(rc: RunConfig, run: Run, command: str) -> dict:
+    """Make the stored run the single source of truth for `command`: the supplied config must
+    agree with run_config.json on everything but ALLOWED_DRIFT (exit 2 otherwise); periods and
+    settings are then taken from the stored record."""
+    stored = read_stored(rc.run_dir)
+    if stored is None:
+        raise OperationalError(f"no stored run in {rc.run_dir} (no {RUN_CONFIG}): run "
+                               f"`atlas backtest --config ...` first")
+    diff = record_diff(stored, run_record(rc, run))
+    if diff:
+        raise UsageError(f"`atlas {command}`: the config disagrees with the stored run in {rc.run_dir} on "
+                         f"{', '.join(diff)}; use the config the run was made with (its record is "
+                         f"{rc.path(RUN_CONFIG)})")
+    src = RunConfig.model_validate(stored["run_config"]).model_copy(update={"run_dir": rc.run_dir})
+    run.periods = resolve_periods(src)
+    run.settings = Settings(**{**stored["settings"], "budget_usd": run.settings.budget_usd,
+                               "confirm_cost_usd": run.settings.confirm_cost_usd})
+    return stored
+
+
+def spend_so_far(run_dir: Path) -> dict[str, float]:
+    """LLM spend recorded in a run directory: backtest (checkpoint), control, autoresearch."""
+    run_dir = Path(run_dir)
+    raw = _load_checkpoint(Checkpoint(run_dir / CHECKPOINT)) or {}
+    ctl = run_dir / CONTROL_STATE
+    ar = run_dir / AR_LOG
+    ar_cost = 0.0
+    if ar.exists():
+        for line in ar.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                ar_cost += float(json.loads(line).get("cost_usd") or 0.0)
+    return {"backtest": float(raw.get("spent_usd", 0.0)),
+            "control": float(json.loads(ctl.read_text())["spent_usd"]) if ctl.exists() else 0.0,
+            "autoresearch": ar_cost}
 
 
 # ============================================================================ backtest
@@ -452,12 +591,17 @@ def _confirm(estimate: float, ceiling: float, yes: bool) -> bool:
     return False
 
 
+DRY_RUN_DIR = "dry_run"
+
+
 def cmd_backtest(args, llm_client=None) -> int:
     rc = load_run_config(args.config)
     refuse_anonymize(rc, "backtest")
     fred_key = require_keys(rc, anthropic=not args.dry_run, fred=not args.dry_run)
     if args.dry_run:
         fred_key = os.environ.get(FRED_KEY) or None
+        # a dry run keeps ALL its state in <run_dir>/dry_run/: it never touches the real run
+        rc = rc.model_copy(update={"run_dir": rc.run_dir / DRY_RUN_DIR, "llm_cache": None})
     run = build_run(rc, fred_key=fred_key, llm_client=llm_client, dry_run=args.dry_run)
     cfg = make_backtest_config(run.periods, run.settings, run.limits, False, args.dry_run)
     control = [sp for sp in run.specs if sp.kind == "control"]
@@ -466,9 +610,19 @@ def cmd_backtest(args, llm_client=None) -> int:
     for n in run.notes:
         print(f"note: {n}")
     if args.dry_run:
-        print("dry run: zero LLM calls (built-in neutral stub); no keys needed")
+        print(f"dry run: zero LLM calls (built-in neutral stub); no keys needed; state in {rc.run_dir}")
     checkpoint = Checkpoint(rc.path(CHECKPOINT))
     lcd = _last_completed(checkpoint)
+    stored = read_stored(rc.run_dir)
+    record = run_record(rc, run)
+    if stored is not None:
+        diff = record_diff(stored, record)
+        if diff:
+            raise OperationalError(
+                f"{rc.run_dir} holds a run made with a different configuration ({', '.join(diff)}); "
+                f"refusing to run. Restore the original config (recorded in {rc.path(RUN_CONFIG)}) to "
+                "resume, or use a new run_dir for the new configuration.")
+    fresh = stored is None and not checkpoint.path.exists()
     all_days = run.trading_days()
     todo = [d for d in all_days if lcd is None or d > lcd]
     n_agents = sum(1 for sp in run.specs if sp.kind != "control") + (1 if args.with_control else 0)
@@ -480,11 +634,9 @@ def cmd_backtest(args, llm_client=None) -> int:
         confirmed = True
     if lcd is not None:
         print(f"resuming after {lcd} ({len(todo)} trading days left)")
-    _write_json(rc.path(RUN_CONFIG), {"run_config": rc.model_dump(mode="json"),
-                                      "settings": run.settings.model_dump(mode="json"),
-                                      "limits": run.limits.model_dump(mode="json"),
-                                      "agents": [sp.model_dump(mode="json") for sp in run.specs],
-                                      "macro_series": run.macro_series})
+    if fresh:  # a fresh run: nothing to disagree with
+        _write_json(rc.path(RUN_CONFIG), record)
+        stored = record
     broker = SimBroker(run.store, run.settings.commission_per_share, run.settings.commission_min,
                        run.settings.slippage_bps)
     risk = RiskLayer(run.limits, run.settings.commission_per_share, run.settings.commission_min)
@@ -496,6 +648,8 @@ def cmd_backtest(args, llm_client=None) -> int:
                               lookback_days=rc.data.lookback_days, macro_series=run.macro_series,
                               run_dir=rc.run_dir, history_path=rc.path(HISTORY_NAME))
     except RunPaused as e:
+        if stored != record:  # the runner accepted the checkpoint: record the (allowed) changes
+            _write_json(rc.path(RUN_CONFIG), record)
         print(f"{e}\nThe checkpoint is intact (it holds the last completed day); fix the cause if "
               "needed and re-run the same command to resume.", file=sys.stderr)
         if e.failed:
@@ -504,6 +658,8 @@ def cmd_backtest(args, llm_client=None) -> int:
     except CostConfirmationRequired as e:  # belt and braces: the estimate is checked above
         print(f"{e} (use --yes)", file=sys.stderr)
         return EXIT_USAGE
+    if stored != record:  # resumed with only ALLOWED_DRIFT changes, or a pre-record checkpoint
+        _write_json(rc.path(RUN_CONFIG), record)
     spent = result.spent_usd
     if args.with_control:
         try:
@@ -535,17 +691,20 @@ def run_control_pass(run: Run, scores: ScoreStore, result: BacktestResult, all_d
         llm = CachedLLM(StubClient(lambda _s, _u: DRY_RUN_RESPONSE), run.rc.path(DRY_RUN_CACHE), "dry-run",
                         (0.0, 0.0), math.inf)
     else:
-        remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev)
+        other = spend_so_far(run.rc.run_dir)  # one hard cap across backtest, control, autoresearch
+        remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev - other["autoresearch"])
         llm = CachedLLM(run.llm.client, run.rc.llm_cache_path, run.settings.model,
                         (run.settings.usd_per_mtok_input, run.settings.usd_per_mtok_output), remaining)
     last = max(result.equity.index)
     days = [d for d in all_days if d <= last]
+    done = 0
     try:
         for d in days:
             scores.record_picks(run_control_agent(d, run.universe, run.prompts[spec.name], llm,
                                                   run.failures, spec=spec))
+            done += 1
     finally:
-        _write_json(state_path, {"spent_usd": prev + llm.spent_usd, "days": len(days)})
+        _write_json(state_path, {"spent_usd": prev + llm.spent_usd, "days": done})
     scores.score_matured(last, run.store, run.specs, run.cost_frac)
     return prev + llm.spent_usd
 
@@ -580,8 +739,10 @@ def _cached_days(run: Run) -> list[date]:
 def cmd_calibrate(args, llm_client=None) -> int:
     rc = load_run_config(args.config)
     run = build_run(rc, offline=True)
+    stored_run(rc, run, "calibrate")  # periods and settings of the STORED run (ruling T)
     if not rc.path(SCORES).exists():
         raise OperationalError(f"no stored run in {rc.run_dir}: run `atlas backtest --config {args.config}` first")
+    _last_completed(Checkpoint(rc.path(CHECKPOINT)))  # a corrupt checkpoint fails clearly
     scores = ScoreStore(rc.path(SCORES))
     try:
         null, safe_end = train_null(scores, run, _cached_days(run))
@@ -739,7 +900,15 @@ def cmd_autoresearch(args, llm_client=None) -> int:
     except DirtyWorkingTree as e:
         raise OperationalError(f"autoresearch refused: {e} (in {rc.prompt_repo})") from None
     run = build_run(rc, fred_key=fred_key, llm_client=llm_client)
+    stored_run(rc, run, "autoresearch")  # train/holdout split and settings of the STORED run (ruling U)
     replay = _make_replay(run)
+    spent = spend_so_far(rc.run_dir)
+    remaining = run.settings.budget_usd - sum(spent.values())
+    if remaining <= 0:
+        raise OperationalError(f"LLM budget exhausted: ${sum(spent.values()):.2f} of ${run.settings.budget_usd:.2f} "
+                               "already spent on this run (backtest + control + autoresearch); raise budget_usd")
+    run.llm.budget_usd = remaining  # one hard cap across the run directory
+    print(f"autoresearch budget: ${remaining:.2f} remaining of ${run.settings.budget_usd:.2f}")
     scores = ScoreStore(rc.path(SCORES))
     try:
         null, _ = train_null(scores, run, replay.all_days)
@@ -806,8 +975,10 @@ def turnover_by_period(history: dict[date, dict], equity: pd.Series, periods: Pe
 
 
 def ablation_from_run(history: dict[date, dict], results: dict[date, dict[str, AgentResult]],
-                      store: PriceStore, specs: list[AgentSpec], limits: Limits) -> dict | None:
-    """CIO ablation (see ABLATION_NOTE); None if fewer than 2 comparable days."""
+                      store: PriceStore, specs: list[AgentSpec], limits: Limits,
+                      periods: Periods) -> dict[str, dict | None] | None:
+    """CIO ablation (see ABLATION_NOTE) per period name plus "all"; a period's entry is None
+    if it has fewer than 2 comparable days. None if there is no history at all."""
     from atlas.backtest.ablation import baseline_target_weights, cio_ablation
     if not history:
         return None
@@ -831,6 +1002,8 @@ def ablation_from_run(history: dict[date, dict], results: dict[date, dict[str, A
         if gross > limits.max_gross_pct > 0:
             cio_w = {t: w * limits.max_gross_pct / gross for t, w in cio_w.items()}
         base_w = baseline_target_weights(res, h["weights"], limits.max_positions, layers)
+        gross = sum(cio_w.values())  # gross-match: only selection/weighting may differ
+        base_w = {t: w * gross for t, w in base_w.items()}
         later = [d for d in cal if d > T]
         if not later:
             continue
@@ -844,10 +1017,17 @@ def ablation_from_run(history: dict[date, dict], results: dict[date, dict[str, A
         else:
             cio_r[T] = sum(w * rets[t] for t, w in cio_w.items())
             base_r[T] = sum(w * rets[t] for t, w in base_w.items())
-    try:
-        return cio_ablation(pd.Series(cio_r, dtype=float), pd.Series(base_r, dtype=float))
-    except ValueError:
-        return None
+    def one(keep) -> dict | None:
+        c = pd.Series({d: v for d, v in cio_r.items() if keep(d)}, dtype=float)
+        b = pd.Series({d: v for d, v in base_r.items() if keep(d)}, dtype=float)
+        try:
+            return cio_ablation(c, b)
+        except ValueError:
+            return None
+
+    out = {name: one(lambda d, lo=lo, hi=hi: lo <= d <= hi) for name, (lo, hi) in periods.items()}
+    out["all"] = one(lambda d: True)
+    return out
 
 
 def cmd_report(args, llm_client=None) -> int:
@@ -866,7 +1046,7 @@ def cmd_report(args, llm_client=None) -> int:
     specs = [AgentSpec(**a) for a in stored["agents"]]
     periods = resolve_periods(rc)
     ckpt = Checkpoint(run_dir / CHECKPOINT)
-    raw = ckpt.load()
+    raw = _load_checkpoint(ckpt)
     if not raw or not raw.get("last_completed_day"):
         raise OperationalError(f"no completed day in {run_dir}: nothing to report")
     run = Run(rc, settings, limits, specs, {}, periods, PriceStore(CacheOnlyPrices(), NoMacro(), rc.cache_dir), [])
@@ -890,17 +1070,19 @@ def cmd_report(args, llm_client=None) -> int:
             if line.strip():
                 edits.append(EditRecord(**json.loads(line)))
     failures = FailureLog(run_dir / FAILURES)
-    control_spent = json.loads((run_dir / CONTROL_STATE).read_text())["spent_usd"] if (run_dir / CONTROL_STATE).exists() else 0.0
+    spent = spend_so_far(run_dir)  # backtest + control + autoresearch: one total
     weights = WeightBook(run_dir / WEIGHTS).load()
     final_weights = {sp.name: weights.get(sp.name, W_INIT) for sp in specs if sp.kind in WEIGHTED_KINDS}
     history = read_day_history(run_dir / HISTORY_NAME, ckpt)
     turnover = turnover_by_period(history, result.equity, periods)
-    ablation = ablation_from_run(history, predlog_results(run_dir / PREDLOG), run.store, specs, limits)
+    by_period = ablation_from_run(history, predlog_results(run_dir / PREDLOG), run.store, specs, limits, periods)
+    ablation = by_period.get("holdout") if by_period else None
     path = build_report(result, scores, null, edits, ablation, None, failures.summary(),
-                        float(raw["spent_usd"]) + control_spent, run_dir / "report", settings=settings,
+                        sum(spent.values()), run_dir / "report", settings=settings,
+                        ablation_by_period=by_period,
                         holdout_edit_ics=None, final_weights=final_weights,
                         dropped_picks=failures.dropped_picks_summary(), turnover=turnover)
-    print(f"null distribution: {null_src}; CIO ablation: {'computed' if ablation else 'not provided'}; "
+    print(f"null distribution: {null_src}; CIO ablation: {'computed' if by_period else 'not provided'}; "
           f"turnover: {'computed' if turnover is not None else 'not provided'}")
     print(f"wrote {path}")
     return EXIT_OK

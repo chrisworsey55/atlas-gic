@@ -573,3 +573,29 @@ def test_below_warmup_agent_is_not_eligible(tmp_path):
     frame = pd.concat([skilled(names=("a1", "a2")), short], ignore_index=True)
     md = run(tmp_path, frame=frame)
     assert verdict_line(md) == NO and "2 eligible" in md
+
+
+def test_ablation_by_period_headlines_holdout_and_labels_pre_cutoff(tmp_path):
+    a = lambda c, b: {"cio_total": c, "baseline_total": b, "cio_beats_baseline": c > b}  # noqa: E731
+    by = {"train": a(0.02, 0.01), "validation": None, "holdout": a(-0.01, 0.03), "all": a(0.0, 0.05)}
+    md = build(tmp_path, ablation=by["holdout"], ablation_by_period=by).read_text()
+    sec = md.split("## CIO ablation")[1].split("## Failures")[0]
+    assert "Headline: holdout" in sec and "CIO total -1.00% vs baseline total 3.00%; CIO beat baseline: no" in sec
+    assert "- train [NOT EVIDENCE OF SKILL" in sec and "CIO total 2.00%" in sec
+    assert "- validation [NOT EVIDENCE OF SKILL" in sec and "not computable" in sec
+    assert "- holdout [holdout]" in sec
+    assert "- all periods [NOT EVIDENCE OF SKILL" in sec and "CIO total 0.00% vs baseline total 5.00%" in sec
+
+
+def test_ablation_by_period_without_holdout_says_so(tmp_path):
+    res = make_result()
+    res.periods = None  # whole run is one pre-cutoff-or-unknown period: no holdout
+    by = {"all": {"cio_total": 0.0, "baseline_total": 0.0, "cio_beats_baseline": False}}
+    sec = build(tmp_path, result=res, ablation=None, ablation_by_period=by).read_text() \
+        .split("## CIO ablation")[1].split("## Failures")[0]
+    assert "Headline: no holdout" in sec
+
+
+def test_single_ablation_dict_still_rendered_without_by_period(tmp_path):
+    sec = build(tmp_path).read_text().split("## CIO ablation")[1].split("## Failures")[0]
+    assert "CIO total 10.00% vs baseline total 5.00%; CIO beat baseline: yes." in sec

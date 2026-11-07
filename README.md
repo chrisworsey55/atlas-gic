@@ -233,7 +233,7 @@ them, and a missing key stops the command before any work (exit code 2).
 
 ```bash
 cp atlas/config/run.example.yaml my_run.yaml        # edit periods, budget, model, universe
-atlas backtest --config my_run.yaml --dry-run       # plumbing check: zero LLM calls
+atlas backtest --config my_run.yaml --dry-run       # plumbing check: zero LLM calls (state in <run_dir>/dry_run/)
 atlas backtest --config my_run.yaml                 # pass 1: real model, frozen weights
 atlas calibrate --config my_run.yaml                # null test on train picks -> calibration.json
 # pass 2: a NEW run_dir whose config sets `calibration: <pass-1 run_dir>/calibration.json`
@@ -251,6 +251,8 @@ atlas autoresearch --config my_run_pass2.yaml       # optional: prompt edits jud
   the report next to the real agents'.
 * `autoresearch` needs a clean git working tree, edits only `atlas/prompts/`, never pushes, and needs
   at least 40 train days. `anonymize: true` is refused for now (the prompt files name tickers).
+* A run directory remembers its validated config (`run_config.json`): re-running, calibrating or
+  researching it with a different config is refused. Unknown config keys are rejected.
 * Exit codes: 0 success, 1 operational failure (the message says how to fix it), 2 usage, config
   or key error.
 

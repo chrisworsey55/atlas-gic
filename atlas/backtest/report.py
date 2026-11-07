@@ -191,7 +191,11 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                  holdout_edit_ics: dict[str, float] | None = None,
                  final_weights: dict[str, float] | None = None,
                  dropped_picks: pd.DataFrame | None = None,
-                 turnover: dict[str, float] | None = None) -> Path:
+                 turnover: dict[str, float] | None = None,
+                 ablation_by_period: dict[str, dict | None] | None = None) -> Path:
+    """`ablation_by_period` (optional, period name -> ablation dict or None, plus "all") renders
+    the CIO ablation per period with the holdout as the headline; without it the single
+    `ablation` dict is shown as before."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cutoff = settings.model_cutoff if settings is not None else None
@@ -366,7 +370,9 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
 
     # ---- ablation
     md += ["## CIO ablation\n"]
-    if ablation is None:
+    if ablation_by_period is not None:
+        md += _ablation_by_period(ablation_by_period, ranges)
+    elif ablation is None:
         md.append("not run.\n")
     else:
         try:
@@ -406,6 +412,33 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     path = out_dir / "report.md"
     path.write_text("\n".join(md), encoding="utf-8")
     return path
+
+
+def _ablation_line(a: dict | None) -> str:
+    if a is None:
+        return "not computable (fewer than 2 comparable days)"
+    try:
+        beat = "yes" if a.get("cio_beats_baseline") else "no"
+        return (f"CIO total {_f(a.get('cio_total'), pct=True)} vs baseline total "
+                f"{_f(a.get('baseline_total'), pct=True)}; CIO beat baseline: {beat}")
+    except Exception:
+        return "n/a (ablation result unreadable)"
+
+
+def _ablation_by_period(by: dict, ranges) -> list[str]:
+    ho = next((r for r in ranges if r[4]), None)
+    if ho is None:
+        out = ["Headline: no holdout (no period after the model's training cutoff).\n"]
+    else:
+        out = [f"Headline: holdout ({HOLDOUT_NOTE}): {_ablation_line(by.get(ho[0]))}.\n"]
+    for name, _lo, _hi, pre, is_ho in ranges:
+        label = NOT_EVIDENCE if pre else ("holdout" if is_ho else "contaminated: straddles the model cutoff")
+        out.append(f"- {name} [{label}]: {_ablation_line(by.get(name))}")
+    if "all" in by:
+        clean = bool(ranges) and all(r[4] for r in ranges)
+        out.append(f"- all periods [{'holdout only' if clean else NOT_EVIDENCE}]: {_ablation_line(by['all'])}")
+    out.append("")
+    return out
 
 
 def _control_ic(stats) -> float | None:
