@@ -154,8 +154,8 @@ def _skill_setup(tmp_path, ctrl=-0.5, ic=0.5, boost=True, null="default"):
     else:  # holdout strategy clearly loses to SPY
         ho0 = res.periods.holdout[0]
         res.equity.loc[res.equity.index >= ho0] *= np.linspace(1, 0.4, int((res.equity.index >= ho0).sum()))
-    frame = pd.concat([picks("a1", ic_sign=ic, seed=1), picks("a2", ic_sign=ic, seed=2)],
-                      ignore_index=True)
+    frame = pd.concat([picks("a1", ic_sign=ic, seed=1), picks("a2", ic_sign=ic, seed=2),
+                       picks("a3", ic_sign=ic, seed=4)], ignore_index=True)
     return build(tmp_path, result=res, scores=make_scores(frame), control_ic=ctrl, null=null)
 
 
@@ -181,7 +181,8 @@ def test_possible_evidence_only_when_all_three_hold(tmp_path):
 def test_possible_evidence_withheld_without_holdout_excess(tmp_path):
     res = make_result()
     res.equity.loc[res.equity.index >= res.periods.holdout[0]] *= 0.5
-    frame = pd.concat([picks("a1", ic_sign=5.0, seed=1), picks("a2", ic_sign=5.0, seed=2)])
+    frame = pd.concat([picks("a1", ic_sign=5.0, seed=1), picks("a2", ic_sign=5.0, seed=2),
+                       picks("a3", ic_sign=5.0, seed=4)])
     v = verdict_of(build(tmp_path, result=res, scores=make_scores(frame), control_ic=-0.5).read_text())
     assert "Possible evidence of skill" not in v
 
@@ -270,3 +271,165 @@ def test_csv_hit_rate_uses_signed_excess_and_rank_ic_conviction_excess(tmp_path)
 def test_kept_edit_without_holdout_ic_says_not_computed(tmp_path):
     md = build(tmp_path).read_text()
     assert "holdout IC not computed" in md.split("## Autoresearch")[1].split("\n## ")[0]
+
+
+# ---- fix round 1: strict verdict rules and mutation-catching tests
+
+def winning(res, strat=3.0, spy=0.9):
+    ho0 = res.periods.holdout[0]
+    m = res.equity.index >= ho0
+    res.equity.loc[m] *= np.linspace(1, strat, int(m.sum()))
+    res.spy.loc[m] *= np.linspace(1, spy, int(m.sum()))
+    return res
+
+
+def skilled(names=("a1", "a2", "a3"), ic=5.0):
+    return pd.concat([picks(n, ic_sign=ic, seed=i + 1) for i, n in enumerate(names)],
+                     ignore_index=True)
+
+
+def verdict_line(md):
+    return verdict_of(md).split("**")[1]
+
+
+def run(tmp_path, res=None, frame=None, null="default", ctrl=-0.5, settings_on=True, **kw):
+    res = res if res is not None else winning(make_result())
+    frame = frame if frame is not None else skilled()
+    if not settings_on:
+        return build_report(res, make_scores(frame), make_null(), [], None, ctrl,
+                            pd.DataFrame(), 1.0, tmp_path).read_text()
+    return build(tmp_path, result=res, scores=make_scores(frame), control_ic=ctrl, null=null,
+                 **kw).read_text()
+
+
+def test_all_conditions_pass_gives_possible(tmp_path):
+    assert verdict_line(run(tmp_path)) == POSSIBLE_S
+    assert "PASS (a)" in run(tmp_path / "x")
+
+
+POSSIBLE_S = "Possible evidence of skill"
+
+
+def test_settings_none_is_safe_and_all_periods_contaminated(tmp_path):
+    md = run(tmp_path, settings_on=False)
+    assert verdict_line(md) == "No evidence of skill beyond the null"
+    assert "model cutoff unknown" in verdict_of(md)
+    perf = md.split("## Performance")[1].split("\n## ")[0]
+    for name in ("train", "validation", "holdout"):
+        seg = perf.split(f"### {name}")[1].split("###")[0]
+        assert NOT_EVIDENCE in seg
+    assert "only uncontaminated" not in perf
+
+
+def test_first_day_base_inside_report(tmp_path):
+    res = make_result()
+    d = list(res.equity.index)
+    ho0 = res.periods.holdout[0]
+    i = d.index(ho0)
+    vals = np.full(len(d), 100.0)
+    vals[i:] = 150.0  # all of the holdout's gain happens on its first day
+    res.equity = pd.Series(vals, index=d)
+    md = run(tmp_path, res=res)
+    ho = md.split("## Performance")[1].split("### holdout")[1].split("\n## ")[0]
+    assert "50.00%" in ho.split("Strategy")[1].split("\n")[0]  # 150/100-1 incl. base day
+
+
+def test_holdout_ic_drives_verdict_not_train_ic(tmp_path):
+    train = pd.concat([picks(n, ic_sign=5.0, seed=i + 1).assign(
+        date=lambda x: [date(2023, 11, 1) + timedelta(days=j) for j in range(len(x))])
+        for i, n in enumerate(("a1", "a2", "a3"))], ignore_index=True)
+    ho_noise = pd.concat([picks(n, seed=10 + i) for i, n in enumerate(("a1", "a2", "a3"))],
+                         ignore_index=True)
+    md = run(tmp_path, frame=pd.concat([train, ho_noise], ignore_index=True))
+    assert verdict_line(md) == "No evidence of skill beyond the null"
+    assert "FAIL (b)" in md
+
+
+def test_excess_is_versus_spy_not_zero(tmp_path):
+    res = make_result()
+    idx = res.equity.index
+    ho = idx >= res.periods.holdout[0]
+    e = np.full(len(idx), 100_000.0)
+    e[ho] = np.linspace(100_000, 101_000, int(ho.sum()))  # +1% in holdout
+    s = np.full(len(idx), 400.0)
+    s[ho] = np.linspace(400, 420, int(ho.sum()))  # +5%
+    res.equity, res.spy = pd.Series(e, index=idx), pd.Series(s, index=idx)
+    md = run(tmp_path, res=res)
+    assert verdict_line(md) == "No evidence of skill beyond the null"
+    assert "FAIL (d)" in md
+
+
+@pytest.mark.parametrize("ctrl", [None, float("nan")])
+def test_control_missing_or_nan_blocks_possible(tmp_path, ctrl):
+    md = run(tmp_path, ctrl=ctrl)
+    assert verdict_line(md) == "No evidence of skill beyond the null"
+    assert "FAIL (e)" in md
+
+
+def test_mean_shrunk_below_dead_zone_blocks_possible(tmp_path):
+    # ICs (1, 1, -1): median 1 clears the raw bar but the mean shrunk IC does not clear 0.5
+    frame = pd.concat([picks("a1", ic_sign=5.0, seed=1), picks("a2", ic_sign=5.0, seed=2),
+                       picks("a3", ic_sign=-5.0, seed=4)], ignore_index=True)
+    null = NullDistribution(np.linspace(-0.2, 0.2, 100), deviations=np.linspace(0, 0.5, 100),
+                            pair_diffs=np.linspace(0, 0.2, 100))
+    md = run(tmp_path, frame=frame, null=null, ctrl=-0.9)
+    assert verdict_line(md) == "No evidence of skill beyond the null"
+    assert "FAIL (c)" in md
+
+
+def test_one_eligible_agent_blocks_possible(tmp_path):
+    md = run(tmp_path, frame=skilled(names=("a1",)))
+    assert verdict_line(md) == "No evidence of skill beyond the null" and "FAIL (a)" in md
+
+
+def test_each_condition_failing_flips_the_verdict(tmp_path):
+    assert verdict_line(run(tmp_path / "ok")) == POSSIBLE_S
+    cases = {
+        "a": dict(frame=skilled(names=("a1", "a2"))),
+        "b": dict(frame=skilled(ic=0.0)),
+        "d": dict(res=winning(make_result(), strat=0.5, spy=1.0)),
+        "e": dict(ctrl=2.0),
+        "f": dict(null=None),
+        "g": dict(settings_on=False),
+    }
+    for k, kw in cases.items():
+        md = run(tmp_path / k, **kw)
+        assert verdict_line(md) == "No evidence of skill beyond the null", k
+        assert f"FAIL ({k})" in md, k
+    # (c): dead zone above any achievable mean shrunk IC
+    big = NullDistribution(np.linspace(-0.2, 0.2, 100), deviations=np.full(100, 5.0),
+                           pair_diffs=np.linspace(0, 0.2, 100))
+    md = run(tmp_path / "c", null=big)
+    assert verdict_line(md) == "No evidence of skill beyond the null" and "FAIL (c)" in md
+
+
+def test_control_section_one_definition(tmp_path):
+    frame = pd.concat([skilled(), picks("control", seed=9)], ignore_index=True)
+    md = run(tmp_path, frame=frame, ctrl=0.777)
+    sec = md.split("## Control agent")[1].split("\n## ")[0]
+    assert "score store" in sec and "0.777" not in sec and "Holdout only" in sec
+    sec2 = run(tmp_path / "o", ctrl=0.777).split("## Control agent")[1].split("\n## ")[0]
+    assert "0.777" in sec2 and "passed-in" in sec2
+
+
+def test_not_provided_markers_and_escaping(tmp_path):
+    md = run(tmp_path)
+    assert "not provided" in md.split("## Failures")[1].split("\n## ")[0]
+    assert "not provided" in md.split("## Agents")[1].split("\n## ")[0]
+    fails = pd.DataFrame({"agent": ["a|1"], "reason": ["x\ny"], "count": [1]})
+    p = build_report(make_result(), make_scores(), make_null(), [], None, None, fails, 1.0,
+                     tmp_path / "e", settings=settings(),
+                     dropped_picks=pd.DataFrame({"agent": ["a"], "reason": ["r"], "count": [3]}),
+                     turnover={"holdout": 1.5}, final_weights={"a1": 1.0})
+    t = p.read_text()
+    assert "a\\|1" in t and "x y" in t
+    assert "not provided" not in t.split("## Failures")[1].split("\n## ")[0]
+
+
+def test_nan_ic_agent_has_nan_shrunk(tmp_path):
+    f = picks("a1", n=40)
+    f2 = picks("flat", n=40)
+    f2["conviction"] = 0.5  # constant conviction -> NaN IC
+    build(tmp_path, scores=make_scores(pd.concat([f, f2], ignore_index=True)))
+    a = pd.read_csv(tmp_path / "agents.csv").set_index("agent")
+    assert math.isnan(a.loc["flat", "shrunk_ic"])

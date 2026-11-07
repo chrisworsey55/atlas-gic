@@ -117,13 +117,17 @@ def _f(x, pct=False, nd=3) -> str:
     return f"{x * 100:.2f}%" if pct else f"{x:.{nd}f}"
 
 
+def _cell(v) -> str:
+    return str(v).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
 def _table(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return "_none_\n"
     cols = list(df.columns)
     lines = ["| " + " | ".join(map(str, cols)) + " |", "|" + "---|" * len(cols)]
     for _, row in df.iterrows():
-        lines.append("| " + " | ".join(str(v) for v in row.tolist()) + " |")
+        lines.append("| " + " | ".join(_cell(v) for v in row.tolist()) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -135,14 +139,15 @@ def _period_ranges(result: BacktestResult, cutoff: date | None):
     if result.periods is not None:
         out = []
         for name, (lo, hi) in result.periods.items():
-            pre = cutoff is not None and hi <= cutoff
-            out.append((name, lo, hi, pre, name == "holdout" and (cutoff is None or lo > cutoff)))
+            pre = cutoff is None or hi <= cutoff  # unknown cutoff: assume contaminated
+            out.append((name, lo, hi, pre,
+                        cutoff is not None and name == "holdout" and lo > cutoff))
         return out
     eq = _norm(result.equity)
     if len(eq) == 0:
         return []
     lo, hi = eq.index[0], eq.index[-1]
-    return [("run", lo, hi, cutoff is not None and hi <= cutoff, False)]
+    return [("run", lo, hi, cutoff is None or hi <= cutoff, False)]
 
 
 def _agent_stats(frame: pd.DataFrame, k: float) -> pd.DataFrame:
@@ -157,8 +162,9 @@ def _agent_stats(frame: pd.DataFrame, k: float) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["agent", "n_scored", "hit_rate", "rank_ic"])
     if len(df):
         ics = df["rank_ic"].astype(float)
-        gm = float(ics.mean()) if ics.notna().any() else 0.0
-        df["shrunk_ic"] = [shrunk_ic(ic if math.isfinite(ic) else gm, n, gm, k)
+        real = _real(df, "rank_ic")
+        gm = float(real.mean()) if len(real) else 0.0
+        df["shrunk_ic"] = [shrunk_ic(ic, n, gm, k) if math.isfinite(ic) else float("nan")
                            for ic, n in zip(ics, df["n_scored"])]
     else:
         df["shrunk_ic"] = pd.Series(dtype=float)
@@ -211,8 +217,14 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
         ho_days = ho_metrics["n"] if ho_metrics else 0
 
     # ---- verdict
-    verdict, reasons = _verdict(result, null, ho, ho_days, ho_metrics, spy, ho_stats, stats,
-                                control_ic)
+    warmup = settings.warmup_picks if settings is not None else 0
+    ctl_all, ctl_ho = _control_ic(stats), _control_ic(ho_stats)
+    ctl_source = "score store"
+    if ctl_all is None and ctl_ho is None and control_ic is not None:
+        ctl_all = ctl_ho = control_ic  # override: the store has no control rows
+        ctl_source = "passed-in control_ic (no control rows in the score store)"
+    verdict, reasons = _verdict(null, cutoff, ho, ho_days, ho_metrics, spy, ho_stats, ctl_ho,
+                                warmup, k)
 
     md: list[str] = ["# Backtest report\n"]
     md += ["## Verdict\n", f"**{verdict}**\n"]
@@ -220,8 +232,9 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
 
     # ---- performance
     md += ["## Performance\n",
-           "All figures are net of costs (the equity curve already includes commissions and "
-           "slippage). Sharpe = mean/std (ddof=1) of daily returns x sqrt(252).\n"]
+           "Net-of-cost figures apply to the strategy (its equity curve already includes "
+           "commissions and slippage); SPY and the basket are buy-and-hold without trading "
+           "costs. Sharpe = mean/std (ddof=1) of daily returns x sqrt(252).\n"]
     if not ranges:
         md.append("no data\n")
     for name, lo, hi, pre, is_ho in ranges:
@@ -244,13 +257,13 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
             if m is None:
                 rows.append({"series": label, "days": 0, "total return": "no data",
                              "ann. vol": "no data", "Sharpe": "no data",
-                             "max drawdown": "no data", "turnover": "n/a"})
+                             "max drawdown": "no data", "turnover": "not provided" if turnover is None else "n/a"})
             else:
                 rows.append({"series": label, "days": m["n"],
                              "total return": _f(m["total_return"], pct=True),
                              "ann. vol": _f(m["vol"], pct=True), "Sharpe": _f(m["sharpe"], nd=2),
                              "max drawdown": _f(m["max_drawdown"], pct=True),
-                             "turnover": _f(tov, nd=2)})
+                             "turnover": ("not provided" if turnover is None else _f(tov, nd=2))})
         md += [_table(pd.DataFrame(rows))]
 
     # ---- agents
@@ -265,30 +278,40 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                       "hit_rate": float(s["hit_rate"].iloc[0]) if len(s) else float("nan"),
                       "rank_ic": float(s["rank_ic"].iloc[0]) if len(s) else float("nan"),
                       "shrunk_ic": float(s["shrunk_ic"].iloc[0]) if len(s) else float("nan"),
-                      "final_weight": (final_weights or {}).get(a, float("nan")),
+                      "final_weight": (final_weights.get(a, float("nan")) if final_weights is not None
+                                       else float("nan")),
                       "failures": int(fcount.get(a, 0))})
     adf = pd.DataFrame(arows, columns=["agent", "n_scored", "hit_rate", "rank_ic", "shrunk_ic",
                                        "final_weight", "failures"])
     adf.to_csv(out_dir / "agents.csv", index=False)
     md += ["## Agents\n",
+           "Control-agent rows are shown but excluded from every real-agent mean/median. "
            "Hit rate = share of picks with signed_excess > 0 (a successful short is a hit); "
            "rank IC = Spearman(conviction, excess); horizon 1 day.\n"]
     disp = adf.copy()
     for c in ("hit_rate", "rank_ic", "shrunk_ic", "final_weight"):
         disp[c] = [_f(x) for x in disp[c]]
+    if final_weights is None:
+        disp["final_weight"] = "not provided"
     md += [_table(disp)]
 
     # ---- control
     ic_real = _real(stats, "rank_ic")
+    ic_real_ho = _real(ho_stats, "rank_ic")
     md += ["## Control agent\n"]
-    if control_ic is None:
+    if ctl_all is None and ctl_ho is None:
         md.append("Control agent: not run.\n")
     else:
-        md.append(f"Control agent IC: {_f(control_ic)} (real agents: mean "
-                  f"{_f(float(ic_real.mean()) if len(ic_real) else None)}, median "
-                  f"{_f(float(ic_real.median()) if len(ic_real) else None)}). A control "
-                  "agent with no information should sit near zero; if it matches the real "
-                  "agents, their ICs are not skill.\n")
+        def _mm(x):
+            return (f"mean {_f(float(x.mean()))}, median {_f(float(x.median()))}"
+                    if len(x) else "mean n/a, median n/a")
+        md += [f"Source: {ctl_source}. Same definition and windows as the real agents "
+               "(rank IC of conviction vs excess, horizon 1 day).\n",
+               f"- All-period: control IC {_f(ctl_all)}; real agents {_mm(ic_real)}",
+               f"- Holdout only (used by the verdict): control IC {_f(ctl_ho)}; real agents "
+               f"{_mm(ic_real_ho)}",
+               "", "A control agent with no information should sit near zero; if it matches "
+               "the real agents, their ICs are not skill.\n"]
 
     # ---- autoresearch
     erows = []
@@ -338,7 +361,7 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
 
     # ---- failures
     md += ["## Failures\n", "Failed calls by agent and reason:\n", _table(failures),
-           "Dropped picks:\n", _table(dropped_picks if dropped_picks is not None else pd.DataFrame())]
+           "Dropped picks:\n", (_table(dropped_picks) if dropped_picks is not None else "not provided\n")]
 
     # ---- cost
     n_days = len(result.day_results) or len(eq)
@@ -367,41 +390,66 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     return path
 
 
-def _verdict(result, null, ho, ho_days, ho_metrics, spy, ho_stats, stats, control_ic):
-    reasons = []
-    if null is None:
-        return NO_EVIDENCE, ["The null was not calibrated, so no IC can be judged against it."]
-    try:
-        dz = null.dead_zone()
-    except ValueError:
-        return NO_EVIDENCE, ["The null has no dead zone, so no IC can be judged against it."]
-    if ho is None:
-        return NO_EVIDENCE, ["There is no holdout after the model's training cutoff."]
-    if ho_days < SHORT_HOLDOUT_DAYS:
-        return NO_EVIDENCE, [f"The holdout is too short ({ho_days} < {SHORT_HOLDOUT_DAYS} "
-                             "trading days) for reliable conclusions."]
-    spy_m = compute_metrics(spy, ho[1], ho[2], _prior(spy, ho[1]))
-    excess = (None if not ho_metrics or not spy_m or ho_metrics["total_return"] is None
-              or spy_m["total_return"] is None
-              else ho_metrics["total_return"] - spy_m["total_return"])
-    ics = _real(ho_stats, "rank_ic")
+def _control_ic(stats) -> float | None:
+    if stats is None or stats.empty:
+        return None
+    c = stats[stats["agent"] == CONTROL_AGENT]
+    if c.empty:
+        return None
+    v = float(c["rank_ic"].iloc[0])
+    return v if math.isfinite(v) else float("nan")
+
+
+def _verdict(null, cutoff, ho, ho_days, ho_metrics, spy, ho_stats, control_ic, warmup, k):
+    """Possible evidence needs every one of conditions (a)-(g); otherwise no evidence."""
+    dz = q95 = None
+    if null is not None:
+        try:
+            dz = null.dead_zone()
+            q95 = null.quantile(0.95)
+        except ValueError:
+            dz = q95 = None
+    elig = pd.DataFrame(columns=["rank_ic", "n_scored"])
+    if ho_stats is not None and len(ho_stats):
+        h = ho_stats[ho_stats["agent"] != CONTROL_AGENT]
+        elig = h[(h["n_scored"] >= warmup) & h["rank_ic"].astype(float).apply(math.isfinite)]
+    ics = elig["rank_ic"].astype(float)
     med = float(ics.median()) if len(ics) else None
-    sh = _real(ho_stats, "shrunk_ic")
-    mean_sh = float(sh.mean()) if len(sh) else None
-    c1 = excess is not None and excess > 0
-    c2 = med is not None and med > dz
-    c3 = (control_ic is not None and math.isfinite(control_ic) and med is not None
-          and control_ic < med)
-    reasons.append(f"Holdout excess return vs SPY: {_f(excess, pct=True)} "
-                   f"({'positive' if c1 else 'not positive'}).")
-    reasons.append(f"Median holdout agent IC {_f(med)} vs null dead zone {_f(dz)} "
-                   f"({'above' if c2 else 'inside'}); mean shrunk IC {_f(mean_sh)}.")
-    reasons.append(f"Control agent IC {_f(control_ic)} "
-                   f"({'below' if c3 else 'not below'} the real agents' median).")
-    if c1 and c2 and c3:
-        return POSSIBLE, reasons + ["All three bars cleared on a single holdout; this is "
-                                    "suggestive at most and needs replication."]
-    return NO_EVIDENCE, reasons
+    mean_sh = None
+    if len(ics):
+        gm = float(ics.mean())
+        mean_sh = float(np.mean([shrunk_ic(ic, int(n), gm, k)
+                                 for ic, n in zip(ics, elig["n_scored"])]))
+    excess = None
+    if ho is not None and ho_metrics:
+        spy_m = compute_metrics(spy, ho[1], ho[2], _prior(spy, ho[1]))
+        if (spy_m and ho_metrics["total_return"] is not None
+                and spy_m["total_return"] is not None):
+            excess = ho_metrics["total_return"] - spy_m["total_return"]
+    ctl_ok = control_ic is not None and math.isfinite(control_ic)
+    conds = [
+        ("(a) at least 3 eligible agents with holdout picks", len(ics) >= 3,
+         f"{len(ics)} eligible"),
+        ("(b) median raw holdout IC > null |IC| 95th percentile",
+         med is not None and q95 is not None and med > q95, f"median {_f(med) if med is not None else 'no data'} vs {_f(q95)}"),
+        ("(c) mean shrunk holdout IC > null dead zone",
+         mean_sh is not None and dz is not None and mean_sh > dz, f"mean {_f(mean_sh)} vs {_f(dz)}"),
+        ("(d) holdout excess return vs SPY > 0 over >= 60 trading days",
+         excess is not None and excess > 0 and ho_days >= SHORT_HOLDOUT_DAYS,
+         f"excess {_f(excess, pct=True)} over {ho_days} days"),
+        ("(e) control IC below the real agents' holdout median",
+         ctl_ok and med is not None and control_ic < med, f"control {_f(control_ic)}"),
+        ("(f) null calibrated", dz is not None, "calibrated" if dz is not None else "not calibrated"),
+        ("(g) model cutoff known and a holdout after it exists", cutoff is not None and ho is not None,
+         "known" if cutoff is not None and ho is not None else "model cutoff unknown or no holdout"),
+    ]
+    lines = [f"{'PASS' if ok else 'FAIL'} {name}: {detail}" for name, ok, detail in conds]
+    failing = [name.split(")")[0] + ")" for name, ok, _ in conds if not ok]
+    if not failing:
+        return POSSIBLE, ["Rule: a positive verdict needs all of conditions (a)-(g), on holdout-dated picks only."] \
+            + lines + ["All bars cleared on a single holdout; suggestive at most, needs replication."]
+    return NO_EVIDENCE, ["Rule: a positive verdict needs all of conditions (a)-(g), on "
+                         "holdout-dated picks only. Failing: " + ", ".join(failing) + "."] + lines
 
 
 def _plot(eq, spy, bsk, ranges, path: Path) -> None:
