@@ -59,9 +59,18 @@ the probe prompt. Its spend counts against the same hard cap.
 Anonymised runs are refused (ruling W): anonymised prompt variants do not exist yet and the
 real prompt files name tickers and ask for dates.
 
+A request the Anthropic API rejects (FatalApiError: HTTP 400/401/403/404/422, ...) is never
+retried and never reported as a transient pause: the command stops with ``error: Anthropic API
+rejected the request (HTTP ...)`` (exit 1, checkpoint intact). Before any LLM spend the backtest
+fetches the whole price range once and stops with ``error: no price data for: ...`` (exit 1)
+when a ticker it needs has no bar over the run. A model with no known price and no explicit
+``usd_per_mtok_input/output`` is refused (exit 2): the budget cap is an estimate from those
+prices. The urllib3 logger is pinned to WARNING (its DEBUG request lines would carry the FRED
+api_key).
+
 Exit codes: 0 success; 1 operational failure (paused run, refused resume, dirty repo, too
-little data, ...: the message says how to fix it); 2 usage/config/key errors. Expected errors
-print a message, never a stack trace.
+little data, rejected API request, ...: the message says how to fix it); 2 usage/config/key
+errors. Expected errors print a message, never a stack trace.
 """
 from __future__ import annotations
 

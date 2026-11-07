@@ -294,3 +294,32 @@ def test_report_total_counts_older_model_and_probe_spend_exactly_once(golden, tm
     assert cli(["report", "--run-dir", run]) == 0
     md = (run / "report" / "report.md").read_text()
     assert f"Total API cost: ${own + 10.0:.2f}" in md
+
+
+def test_probe_fatal_api_error_aborts_clearly_without_a_contamination_result(run, keys, capsys):  # noqa: F811
+    from atlas.engine.llm import FatalApiError
+    calls = []
+
+    def rejected(system, user):
+        calls.append(1)
+        raise FatalApiError(403, "permission_error", "this key cannot use the model")
+
+    assert cli(["probe", "--run-dir", run, "--samples", "4", "--yes"], rejected) == 1
+    text = "".join(capsys.readouterr())
+    assert "error: Anthropic API rejected the request (HTTP 403 permission_error)" in text
+    assert "Traceback" not in text and FAKE_ANTHROPIC not in text
+    assert len(calls) == 1 and not (run / "contamination.json").exists()
+
+
+def test_probe_passes_max_output_tokens(run, keys, monkeypatch):  # noqa: F811
+    import atlas.backtest.contamination as cont
+    seen = {}
+    real = cont.contamination_probe
+
+    def spy(*a, **k):
+        seen["max_tokens"] = k.get("max_tokens")
+        return real(*a, **k)
+
+    monkeypatch.setattr(cont, "contamination_probe", spy)
+    assert cli(["probe", "--run-dir", run, "--samples", "2", "--yes"], wrong) == 0
+    assert seen["max_tokens"] == 8192

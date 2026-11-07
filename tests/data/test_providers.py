@@ -162,6 +162,51 @@ def test_ibkr_provider_maps_bars_to_schema():
     assert set(ib.what) == {"TRADES", "ADJUSTED_LAST"}
 
 
+def _fake_ib_async(monkeypatch, fail=False):
+    import sys
+    import types
+    log = {}
+
+    class IB:
+        def connect(self, host, port, clientId, **kw):
+            log["connect"] = (host, port, clientId, kw)
+
+        def disconnect(self):
+            log["disconnected"] = log.get("disconnected", 0) + 1
+
+        def reqHistoricalData(self, contract, endDateTime, durationStr, **kw):
+            log.setdefault("durations", []).append(durationStr)
+            if fail:
+                raise RuntimeError("gateway error")
+            return [SimpleNamespace(date=date(2024, 1, 2), open=1, high=2, low=0.5, close=1.5, volume=3)]
+
+    mod = types.ModuleType("ib_async")
+    mod.IB = IB
+    mod.Stock = lambda t, ex, cur: t
+    monkeypatch.setitem(sys.modules, "ib_async", mod)
+    return log
+
+
+def test_ibkr_connects_read_only_and_always_disconnects(monkeypatch):
+    log = _fake_ib_async(monkeypatch)
+    p = IBKRProvider("h", 7, 3)
+    assert len(p.fetch(["AAA"], date(2024, 1, 2), date(2024, 1, 3))) == 1
+    assert log["connect"] == ("h", 7, 3, {"readonly": True}) and log["disconnected"] == 1
+    p.fetch(["AAA"], date(2024, 1, 2), date(2024, 1, 3))  # reconnects for the next request
+    assert log["disconnected"] == 2
+    bad = _fake_ib_async(monkeypatch, fail=True)
+    with pytest.raises(RuntimeError):
+        IBKRProvider("h", 7, 3).fetch(["AAA"], date(2024, 1, 2), date(2024, 1, 3))
+    assert bad["disconnected"] == 1  # even when the request fails
+
+
+def test_ibkr_durations_over_a_year_are_requested_in_years(monkeypatch):
+    log = _fake_ib_async(monkeypatch)
+    IBKRProvider("h", 7, 3).fetch(["AAA"], date(2022, 1, 1), date(2024, 1, 3))
+    IBKRProvider("h", 7, 3).fetch(["AAA"], date(2024, 1, 1), date(2024, 1, 3))
+    assert log["durations"][0] == "3 Y" and log["durations"][-1] == "3 D"
+
+
 @pytest.mark.live
 def test_yfinance_live():
     df = YFinanceProvider().fetch(["SPY"], date(2024, 1, 2), date(2024, 1, 10))

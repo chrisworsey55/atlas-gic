@@ -24,13 +24,18 @@ initial_cash: 100000
 anonymize: false               # true is refused: anonymised prompt variants do not exist yet
 
 # universe: [SPY, QQQ, XLF, JPM]   # optional: overrides settings.universe
-budget_usd: 150                # hard cap on LLM spend for this run (CachedLLM enforces it)
+budget_usd: 150                # hard cap on ESTIMATED LLM spend (tokens x per-model prices; also
+                               # set a spend limit on your Anthropic account)
 
 # Any Settings field (atlas/config/settings.yaml) can be overridden here, e.g. the model,
 # its documented training cutoff, or the cost confirmation ceiling.
 settings:
   model: claude-sonnet-5-5
-  model_cutoff: 2026-06-01
+  model_cutoff: 2026-06-01     # PLACEHOLDER: set the documented training-data cutoff of this model
+  # effort: low                # low | medium | high | xhigh | max (packaged default: low)
+  # max_output_tokens: 8192    # per agent call; thinking tokens count against it
+  # usd_per_mtok_input: 2.0    # only needed for a model not in atlas/config.py's price table
+  # usd_per_mtok_output: 10.0  #   (set both)
   confirm_cost_usd: 25         # ask before a run estimated above this (or pass --yes)
 
 # settings_file / limits_file / agents_file: alternative config files (default: packaged ones)

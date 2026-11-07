@@ -144,7 +144,7 @@ tests/                   # mirrors the package
 ### Task 6: Agent roster prompts and layer pipeline
 
 **Files:**
-- Create: `atlas/prompts/*.md` (12 agents + `control_date_only.md`), `atlas/engine/pipeline.py`
+- Create: `atlas/prompts/*.md` (12 agents + `control.md`), `atlas/engine/pipeline.py`
 - Test: `tests/engine/test_pipeline.py`
 
 **Interfaces:**

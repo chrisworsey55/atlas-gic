@@ -43,7 +43,21 @@ EXTRA_LIMITATIONS = [
     "Adjusted-price leakage: provider prices are adjusted as of today, so they embed later "
     "splits and dividends.",
     "Autoresearch pair-dropping caveat: " + PAIR_CAVEAT + ".",
+    "A positive verdict needs condition (e), a control IC below the real agents' holdout median; "
+    "it is only computed when the backtest ran with `atlas backtest --with-control`, so without it "
+    "the verdict cannot be positive.",
+    "The holdout IC of kept autoresearch edits is not computed (a known gap versus the spec): a "
+    "kept edit is judged on train days only until it is re-run on the holdout.",
 ]
+AUTORESEARCH_GAP = ("Kept edits show 'holdout IC not computed': this is a known gap versus the spec. "
+                    "The keep decision used train days only, and this report does not re-run the "
+                    "edited prompt on the holdout. To confirm a kept edit, run a backtest with the "
+                    "edited prompts in a new run_dir (the old checkpoint fingerprints the prompts) and "
+                    "read that run's holdout IC for the agent; until then treat the edit as unconfirmed.")
+NULL_AGENT_SETS = ("The null distribution is calibrated on the macro/sector/superinvestor agents' "
+                   "train picks, while the verdict's eligible agents also include the decision-layer "
+                   "agents (CRO/CIO/execution) that scored holdout picks; their ICs are compared with "
+                   "a null built from the other agents.")
 
 
 # ------------------------------------------------------------------------------ metrics
@@ -402,6 +416,9 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
             h = holdout_edit_ics.get(e.agent)
             line += (f"; holdout IC {_f(h)}" if h is not None else "; holdout IC not computed")
         md.append(line)
+    if any(e.decision == "kept" and holdout_edit_ics.get(e.agent) is None for e in edits):
+        md.append("")
+        md.append(AUTORESEARCH_GAP)
     md.append("")
 
     # ---- null
@@ -422,6 +439,9 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                f"- Null |IC| 95th percentile: {_try(lambda: null.quantile(0.95))}",
                f"- Number of shuffles: {n_shuf}"]
         md.append(f"- Calibration: {_meta_text(null_meta)}" + (f" (source: {null_source})" if null_source else ""))
+        md.append("")
+        md.append(NULL_AGENT_SETS + " Its permutation also ignores within-day clustering of picks, "
+                  "so the thresholds are anti-conservative when picks cluster by day.")
         md.append("")
     if autoresearch_null_meta:
         distinct = []

@@ -264,6 +264,48 @@ atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination p
   researching it with a different config is refused. Unknown config keys are rejected.
 * Exit codes: 0 success, 1 operational failure (the message says how to fix it), 2 usage, config
   or key error.
+* A request the Anthropic API rejects (HTTP 400/401/403/404, e.g. a wrong model name, key or
+  parameter) is not retried: the command stops with `error: Anthropic API rejected the request
+  (HTTP ...)`, exit 1, checkpoint intact. Rate limits, timeouts and 5xx errors stay transient
+  (retried, then the run pauses). `atlas/config/settings.yaml` sets `effort: low` and
+  `max_output_tokens: 8192` (thinking tokens count against it; a `truncated` failure means raise
+  it). One live smoke test checks the configured model: `pytest --live tests/engine/test_llm_live.py`.
+* `budget_usd` is an ESTIMATE: it counts tokens at per-model prices (a built-in table in
+  `atlas/config.py`, or `usd_per_mtok_input`/`usd_per_mtok_output` in the run config), not what
+  Anthropic bills. A model the table does not know is refused (exit 2) until both prices are set
+  (`older_usd_per_mtok_*` for the older-model check). Also set a spend limit on your Anthropic
+  account.
+* A positive verdict needs the control condition, which exists only with `atlas backtest
+  --with-control`: without it the report can never say "Possible evidence of skill".
+* `autoresearch` merges kept edits into whatever branch is checked out (it prints the branch name
+  first and refuses a detached HEAD): run it from a dedicated branch of a clean checkout.
+
+**Limitations** (also listed in every report)
+
+* `model_cutoff` in `atlas/config/settings.yaml` (2026-06-01) is a PLACEHOLDER GUESS and the
+  whole verdict rests on it: set it from the documented training-data cutoff of the exact model
+  you use. The CLI prints a warning while it is the shipped default.
+* Pricing is configured, not billed: the hard cap is an estimate (see `budget_usd` above).
+* No sampling settings are sent (current models reject `temperature`): replays are deterministic
+  only because identical inputs are served from the response cache; an uncached re-run may differ.
+* Single process only: fixed `.tmp` file names, no locks and a non-thread-safe price memo. Run
+  one process per run directory.
+* yfinance data can be stale, is adjusted as of today (adjusted-price leakage: later splits and
+  dividends are embedded) and may be throttled. The whole run range is fetched once up front and
+  a ticker with no data at all stops the run before any LLM spend, but a ticker missing on a
+  single day mid-run silently drops out of that day's snapshot.
+* The fixed universe of current constituents is survivorship-biased.
+* The contamination probe's chance rate is approximate (overstated by about 7/5).
+* Looking at the same holdout repeatedly (especially after autoresearch edits and a pass-2 run)
+  is multiple testing: each extra look weakens what a pass means.
+* The null test permutes convictions across all rows and ignores within-day clustering, so its
+  thresholds are anti-conservative when picks cluster by day. It is calibrated on the
+  macro/sector/superinvestor agents while the verdict's eligible agents also include the
+  decision layer.
+* Kept autoresearch edits are reported with "holdout IC not computed" (a known gap versus the
+  spec): confirm a kept edit with a new backtest in a new run directory before trusting it.
+* No live or paper trading exists (simulated broker only). The IBKR price provider is unverified
+  against a live gateway.
 
 A pre-cutoff backtest is a plumbing test, not evidence of skill. Only a holdout after the
 model's training cutoff can be, and the report's verdict stays "No evidence of skill beyond the

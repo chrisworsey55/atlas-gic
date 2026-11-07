@@ -599,3 +599,30 @@ def test_ablation_by_period_without_holdout_says_so(tmp_path):
 def test_single_ablation_dict_still_rendered_without_by_period(tmp_path):
     sec = build(tmp_path).read_text().split("## CIO ablation")[1].split("## Failures")[0]
     assert "CIO total 10.00% vs baseline total 5.00%; CIO beat baseline: yes." in sec
+
+
+# ---- final review fixes: disclosed limitations
+
+def _section(md, name):
+    return md.split(f"## {name}")[1].split("\n## ")[0]
+
+
+def test_kept_edit_holdout_ic_gap_is_explained_with_what_to_do(tmp_path):
+    sec = _section(build(tmp_path).read_text(), "Autoresearch")
+    assert "holdout IC not computed" in sec
+    assert "known gap" in sec and "new run_dir" in sec  # why, and how to confirm a kept edit
+
+
+def test_null_section_says_the_agent_sets_differ(tmp_path):
+    sec = _section(build(tmp_path).read_text(), "Null test")
+    assert "decision-layer" in sec and "macro/sector/superinvestor" in sec
+
+
+def test_limitations_disclose_every_accepted_gap(tmp_path):
+    lim = _section(build(tmp_path).read_text(), "Limitations")
+    for needle in ("PLACEHOLDER GUESS", "configured per-model prices", "response cache",
+                   "Single-process only", "yfinance data can be stale", "approximate (overstated by about 7/5)",
+                   "multiple testing", "within-day clustering", "survivorship", "Adjusted-price leakage",
+                   "No live or paper trading", "IBKR price provider is unverified",
+                   "--with-control", "holdout IC of kept autoresearch edits is not computed"):
+        assert needle in lim, needle
