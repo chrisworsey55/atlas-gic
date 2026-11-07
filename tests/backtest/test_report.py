@@ -433,3 +433,143 @@ def test_nan_ic_agent_has_nan_shrunk(tmp_path):
     build(tmp_path, scores=make_scores(pd.concat([f, f2], ignore_index=True)))
     a = pd.read_csv(tmp_path / "agents.csv").set_index("agent")
     assert math.isnan(a.loc["flat", "shrunk_ic"])
+
+
+# ---- fix round 2: exception safety and exact threshold pins
+import atlas.backtest.report as report_mod
+from atlas.backtest.report import _verdict
+from atlas.scoring.weights import shrunk_ic as _shrunk
+
+NO = "No evidence of skill beyond the null"
+
+
+def test_control_ic_string_does_not_crash(tmp_path):
+    md = run(tmp_path, ctrl="abc")
+    assert verdict_line(md) == NO
+
+
+def test_empty_ics_null_does_not_crash(tmp_path):
+    bad = NullDistribution(np.array([]), deviations=np.linspace(0, 0.1, 10),
+                           pair_diffs=np.linspace(0, 0.2, 10))
+    md = run(tmp_path, null=bad)
+    assert verdict_line(md) == NO
+    assert "## Null test" in md
+
+
+def test_helper_raising_yields_no_evidence_and_report_written(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("x")
+    monkeypatch.setattr(report_mod, "_control_ic", boom)
+    md = run(tmp_path)
+    assert verdict_line(md) == NO
+    assert "verdict computation failed: RuntimeError" in md
+    assert "## Control agent" in md
+
+
+class StubNull:
+    def __init__(self, q95, dz):
+        self._q, self._dz = q95, dz
+        self.ics = np.zeros(10)
+
+    def quantile(self, q):
+        return self._q
+
+    def dead_zone(self):
+        return self._dz
+
+
+K = 20.0
+HO = (date(2024, 2, 1), date(2024, 6, 1))
+
+
+def ho_frame(ics, n=100):
+    return pd.DataFrame({"agent": [f"a{i}" for i in range(len(ics))],
+                         "n_scored": [n] * len(ics), "rank_ic": ics})
+
+
+def spy_series():
+    d = days(HO[0] - timedelta(days=3), 10)
+    return pd.Series([100.0] * 4 + [110.0] * 6, index=d), d
+
+
+def call(q95=0.1, dz=0.1, ics=(0.5, 0.5, 0.5), ctrl=0.0, days_=60, excess_delta=1e-6, n=100):
+    spy, d = spy_series()
+    lo, hi = d[4], d[-1]
+    spy_ret = compute_metrics(spy, lo, hi, _prior(spy, lo))["total_return"]
+    hm = {"total_return": spy_ret + excess_delta}
+    v, reasons = _verdict(StubNull(q95, dz), CUTOFF, (None, lo, hi), days_, hm, spy,
+                          ho_frame(list(ics), n), ctrl, 5, K)
+    return v, "\n".join(reasons)
+
+
+from atlas.backtest.report import _prior  # noqa: E402
+
+
+def test_stub_all_pass():
+    assert call()[0] == POSSIBLE_S
+
+
+def test_b_median_equal_threshold_fails_above_passes():
+    assert call(q95=0.5)[0] == NO and "FAIL (b)" in call(q95=0.5)[1]
+    assert "PASS (b)" in call(q95=0.5 - 1e-9)[1]
+
+
+def test_c_mean_shrunk_equal_threshold_fails_above_passes():
+    ics = [0.5, 0.5, 0.5]
+    gm = float(np.mean(ics))
+    ms = float(np.mean([_shrunk(i, 100, gm, K) for i in ics]))
+    assert call(dz=ms)[0] == NO and "FAIL (c)" in call(dz=ms)[1]
+    assert "PASS (c)" in call(dz=ms - 1e-9)[1]
+
+
+def test_d_excess_zero_fails_positive_passes():
+    assert call(excess_delta=0.0)[0] == NO and "FAIL (d)" in call(excess_delta=0.0)[1]
+    assert "PASS (d)" in call(excess_delta=1e-9)[1]
+
+
+def test_d_length_boundary_59_vs_60():
+    assert call(days_=59)[0] == NO and "FAIL (d)" in call(days_=59)[1]
+    assert call(days_=60)[0] == POSSIBLE_S
+
+
+def test_e_control_equal_median_fails_below_passes():
+    assert call(ctrl=0.5)[0] == NO and "FAIL (e)" in call(ctrl=0.5)[1]
+    assert "PASS (e)" in call(ctrl=0.5 - 1e-9)[1]
+
+
+def test_verdict_follows_holdout_control_not_all_period(tmp_path):
+    def perfect(agent, sign, start, seed):
+        f = picks(agent, seed=seed)
+        f["excess"] = sign * f["conviction"] * 0.01
+        f["signed_excess"] = f["excess"]
+        f["date"] = [start + timedelta(days=j) for j in range(len(f))]
+        return f
+    ho_start = date(2024, 2, 1)
+    frame = pd.concat([perfect(n, 1, ho_start, i) for i, n in enumerate(("a1", "a2", "a3"))]
+                      + [perfect("control", -1, date(2023, 11, 1), 20),
+                         perfect("control", 1, ho_start, 21)], ignore_index=True)
+    md = run(tmp_path, frame=frame, ctrl=-0.9)
+    assert verdict_line(md) == NO and "FAIL (e)" in md
+
+
+def test_control_rows_not_counted_as_eligible_agents(tmp_path):
+    frame = pd.concat([skilled(names=("a1", "a2")), picks("control", ic_sign=5.0, seed=22)],
+                      ignore_index=True)
+    md = run(tmp_path, frame=frame)
+    assert verdict_line(md) == NO and "2 eligible" in md
+    # direct: a control-named row must not change count or median
+    h = ho_frame([0.5, 0.5, 0.5])
+    h.loc[len(h)] = [CONTROL_NAME, 100, 0.99]
+    v, r = _verdict(StubNull(0.1, 0.1), CUTOFF, (None, *HO), 60, None, pd.Series(dtype=float), h,
+                    0.0, 5, K)
+    assert "3 eligible" in "\n".join(r)
+
+
+CONTROL_NAME = "control"
+
+
+def test_below_warmup_agent_is_not_eligible(tmp_path):
+    short = picks("a3", ic_sign=5.0, seed=4).iloc[:3]  # 3 picks < warmup_picks=5
+    frame = pd.concat([skilled(names=("a1", "a2")), short], ignore_index=True)
+    md = run(tmp_path, frame=frame)
+    assert verdict_line(md) == NO and "2 eligible" in md

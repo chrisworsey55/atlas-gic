@@ -112,7 +112,11 @@ def _prior(series: pd.Series, lo: date) -> float | None:
 # ------------------------------------------------------------------------------ formatting
 
 def _f(x, pct=False, nd=3) -> str:
-    if x is None or (isinstance(x, float) and not math.isfinite(x)):
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not math.isfinite(x):
         return "n/a"
     return f"{x * 100:.2f}%" if pct else f"{x:.{nd}f}"
 
@@ -218,13 +222,20 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
 
     # ---- verdict
     warmup = settings.warmup_picks if settings is not None else 0
-    ctl_all, ctl_ho = _control_ic(stats), _control_ic(ho_stats)
+    ctl_all = ctl_ho = None
     ctl_source = "score store"
-    if ctl_all is None and ctl_ho is None and control_ic is not None:
-        ctl_all = ctl_ho = control_ic  # override: the store has no control rows
-        ctl_source = "passed-in control_ic (no control rows in the score store)"
-    verdict, reasons = _verdict(null, cutoff, ho, ho_days, ho_metrics, spy, ho_stats, ctl_ho,
-                                warmup, k)
+    verdict_error = None
+    try:
+        ctl_all, ctl_ho = _control_ic(stats), _control_ic(ho_stats)
+        if ctl_all is None and ctl_ho is None and control_ic is not None:
+            ctl_all = ctl_ho = control_ic  # override: the store has no control rows
+            ctl_source = "passed-in control_ic (no control rows in the score store)"
+        verdict, reasons = _verdict(null, cutoff, ho, ho_days, ho_metrics, spy, ho_stats,
+                                    ctl_ho, warmup, k)
+    except Exception as e:  # any failure degrades to the conservative verdict
+        verdict_error = type(e).__name__
+        verdict = NO_EVIDENCE
+        reasons = [f"verdict computation failed: {verdict_error}"]
 
     md: list[str] = ["# Backtest report\n"]
     md += ["## Verdict\n", f"**{verdict}**\n"]
@@ -299,7 +310,9 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     ic_real = _real(stats, "rank_ic")
     ic_real_ho = _real(ho_stats, "rank_ic")
     md += ["## Control agent\n"]
-    if ctl_all is None and ctl_ho is None:
+    if verdict_error is not None:
+        md.append(f"Control agent: n/a (verdict computation failed: {verdict_error}).\n")
+    elif ctl_all is None and ctl_ho is None:
         md.append("Control agent: not run.\n")
     else:
         def _mm(x):
@@ -338,26 +351,31 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     if null is None:
         md.append("not calibrated — weights were frozen.\n")
     else:
+        def _try(fn):
+            try:
+                return _f(fn())
+            except Exception:
+                return "n/a"
         try:
-            dz = _f(null.dead_zone())
-        except ValueError:
-            dz = "n/a"
-        try:
-            km = _f(null.keep_margin())
-        except ValueError:
-            km = "n/a"
-        md += [f"- Dead zone: {dz}", f"- Keep margin: {km}",
-               f"- Null |IC| 95th percentile: {_f(null.quantile(0.95))}",
-               f"- Number of shuffles: {len(null.ics)}", ""]
+            n_shuf = len(null.ics)
+        except Exception:
+            n_shuf = "n/a"
+        md += [f"- Dead zone: {_try(null.dead_zone)}", f"- Keep margin: {_try(null.keep_margin)}",
+               f"- Null |IC| 95th percentile: {_try(lambda: null.quantile(0.95))}",
+               f"- Number of shuffles: {n_shuf}", ""]
 
     # ---- ablation
     md += ["## CIO ablation\n"]
     if ablation is None:
         md.append("not run.\n")
     else:
-        beat = "yes" if ablation.get("cio_beats_baseline") else "no"
-        md.append(f"CIO total {_f(ablation.get('cio_total'), pct=True)} vs baseline total "
-                  f"{_f(ablation.get('baseline_total'), pct=True)}; CIO beat baseline: {beat}.\n")
+        try:
+            beat = "yes" if ablation.get("cio_beats_baseline") else "no"
+            md.append(f"CIO total {_f(ablation.get('cio_total'), pct=True)} vs baseline total "
+                      f"{_f(ablation.get('baseline_total'), pct=True)}; CIO beat baseline: "
+                      f"{beat}.\n")
+        except Exception:
+            md.append("n/a (ablation result unreadable).\n")
 
     # ---- failures
     md += ["## Failures\n", "Failed calls by agent and reason:\n", _table(failures),
