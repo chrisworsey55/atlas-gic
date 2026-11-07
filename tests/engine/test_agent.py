@@ -197,7 +197,7 @@ def test_budget_exceeded_propagates_and_failed_tokens_count(tmp_path):
     # worst case per call ~0.00411 (4096 max output tokens @ $1/Mtok); budget allows one, not two
     client, llm, log = setup(tmp_path, ["bad", good()], budget=0.00415)
     with pytest.raises(BudgetExceeded):
-        run(llm, log)
+        run(llm, log, max_tokens=4096)
     assert llm.spent_usd == pytest.approx(0.00015)  # the failed attempt's tokens still count
     assert client.calls == 1  # the retry was refused before being made
 
@@ -269,3 +269,35 @@ def test_asof_label_replaces_date_in_prompt_and_date_is_set_by_runner(tmp_path):
              asof_label="day 7")
     assert r.status == "ok" and r.output.date == date(2024, 3, 1)
     assert "2024" not in seen[0] and "day 7" in seen[0]
+
+
+def test_fatal_api_error_propagates_without_retry_or_failure_row(tmp_path):
+    from atlas.engine.llm import FatalApiError
+    client, llm, log = setup(tmp_path, [FatalApiError(400, "invalid_request_error", "bad param"), good()])
+    sleeps = []
+    with pytest.raises(FatalApiError):
+        run(llm, log, sleeps=sleeps)
+    assert client.calls == 1 and sleeps == []  # not retried, no backoff
+    assert rows(log).empty  # not recorded as a failed agent (it is not the agent's failure)
+    assert llm.spent_usd == 0
+
+
+def test_max_tokens_is_passed_through_and_truncation_names_the_setting(tmp_path):
+    seen = []
+
+    class C(Scripted):
+        def complete(self, system, user, max_tokens):
+            seen.append(max_tokens)
+            return super().complete(system, user, max_tokens)
+
+    client = C([LLMResponse("{", 10, 1234, "max_tokens"), LLMResponse("{", 10, 1234, "max_tokens")])
+    llm = CachedLLM(client, tmp_path / "c.db", "m", (1.0, 1.0), 100.0)
+    res = run(llm, FailureLog(tmp_path / "f.db"), max_tokens=1234)
+    assert seen == [1234, 1234]
+    assert res.failure.reason == FailureReason.TRUNCATED
+    assert "max_output_tokens" in res.failure.detail
+
+
+def test_default_max_tokens_leaves_room_for_thinking():
+    import atlas.engine.agent as agent_mod
+    assert agent_mod.MAX_TOKENS >= 8192

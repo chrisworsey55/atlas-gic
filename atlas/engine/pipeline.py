@@ -16,7 +16,7 @@ import pandas as pd
 
 from atlas.config import AgentSpec
 from atlas.data.store import Snapshot
-from atlas.engine.agent import run_agent
+from atlas.engine.agent import MAX_TOKENS, run_agent
 from atlas.engine.failures import FailureLog
 from atlas.engine.llm import CachedLLM
 from atlas.schemas import AgentResult
@@ -95,8 +95,9 @@ def _last_close(snap: Snapshot) -> dict[str, float]:
 
 class Pipeline:
     def __init__(self, specs: list[AgentSpec], prompts: dict[str, str], llm: CachedLLM,
-                 failures: FailureLog, universe, min_valid_agents: int):
+                 failures: FailureLog, universe, min_valid_agents: int, *, max_tokens: int = MAX_TOKENS):
         self.specs = {s.name: s for s in specs}
+        self.max_tokens = max_tokens  # per agent call (Settings.max_output_tokens in the CLI)
         self.prompts = prompts
         self.llm = llm
         self.failures = failures
@@ -158,7 +159,7 @@ class Pipeline:
         prompt = prompt_override if prompt_override is not None else self.prompts[name]
         inputs = self._inputs(spec, snapshot, weights, state, upstream)
         return run_agent(spec, prompt, inputs, asof, self.llm, self.failures, self.universe,
-                         asof_label=asof_label)
+                         asof_label=asof_label, max_tokens=self.max_tokens)
 
     # ---- the day ----
     def _run_layer(self, layer: int, asof, snapshot, weights, state, results, asof_label=None) -> None:

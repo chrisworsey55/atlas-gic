@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import sqlite3
 import threading
 from contextlib import closing
@@ -20,7 +21,43 @@ class Timeout(Exception):
 
 
 class ApiError(Exception):
-    pass
+    """Transient API failure (connection error, 408/409, 5xx/529): retried by run_agent."""
+
+
+class FatalApiError(Exception):
+    """The API rejected the request itself (HTTP 400/401/403/404/413/422, other non-retryable
+    4xx, an enforced account spend limit, missing credentials). Retrying cannot help, so this
+    is NOT an ``ApiError``: run_agent does not retry it or turn it into a failed agent; it
+    propagates and aborts the command. The message is sanitised (no keys, URLs or headers)."""
+
+    def __init__(self, status: int | None, kind: str, message: str):
+        self.status, self.kind, self.detail = status, kind, message
+        where = f"HTTP {status} {kind}" if status is not None else kind
+        super().__init__(f"Anthropic API rejected the request ({where}): {message}")
+
+
+_KEYLIKE = re.compile(r"sk-ant-[A-Za-z0-9_\-]+|(?i:bearer\s+\S+)"
+                      r"|(?i:(?:api[_-]?key|authorization|token)\s*[=:]\s*\S+)")
+_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+_TRANSIENT_STATUS = frozenset({408, 409, 429})
+
+
+def sanitise(text: str, limit: int = 300) -> str:
+    """API error text safe to print: key-like strings and URLs removed, one line, bounded."""
+    text = _KEYLIKE.sub("<redacted>", str(text))
+    text = _URL.sub("<url>", text)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _api_message(e) -> tuple[str, str]:
+    """(error type, message) from the SDK error body, never its raw repr (which embeds the
+    request); falls back to the exception class name."""
+    body = getattr(e, "body", None)
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict) and err.get("message"):
+        return str(err.get("type") or type(e).__name__), sanitise(err["message"])
+    return type(e).__name__, type(e).__name__
 
 
 class BudgetExceeded(Exception):
@@ -40,14 +77,26 @@ class LLMClient(Protocol):
 
 
 class AnthropicClient:
-    """Anthropic Messages API client. Temperature is fixed to 0. The API key is read by the
-    SDK from the environment and is never stored or logged here."""
+    """Anthropic Messages API client. The API key is read by the SDK from the environment
+    and is never stored or logged here.
 
-    TEMPERATURE = 0
+    No sampling parameter (temperature/top_p/top_k) is ever sent: current models reject them
+    with HTTP 400 and the API version this SDK sends rejects them on every model. Replays are
+    deterministic because identical inputs are served from the on-disk cache (CachedLLM), not
+    because of sampling settings. ``effort`` ("low".."max", Settings.effort) is sent as
+    ``output_config.effort`` only when set; thinking is left at the model's default (adaptive
+    on current models: its tokens count against ``max_tokens`` and are billed as output).
+    ``request_tag`` names the non-default request settings; CachedLLM puts it in the cache key
+    so a changed setting never replays responses made under another one."""
 
-    def __init__(self, model: str, sdk=None):
+    def __init__(self, model: str, sdk=None, *, effort: str | None = None):
         self.model = model
+        self.effort = effort
         self._sdk = sdk
+
+    @property
+    def request_tag(self) -> str:
+        return f"effort={self.effort}" if self.effort else ""
 
     def _client(self):
         if self._sdk is None:
@@ -59,22 +108,34 @@ class AnthropicClient:
     def complete(self, system: str, user: str, max_tokens: int) -> LLMResponse:
         import anthropic
 
+        extra = {"output_config": {"effort": self.effort}} if self.effort else {}
+        spend_limit = getattr(anthropic, "EnforcedSpendLimitReachedError", ())
         try:
             msg = self._client().messages.create(
                 model=self.model,
                 system=system,
                 messages=[{"role": "user", "content": user}],
                 max_tokens=max_tokens,
-                temperature=self.TEMPERATURE,
+                **extra,
             )
+        except spend_limit as e:  # a 429 subclass: the account's spend limit, not a rate limit
+            kind, text = _api_message(e)
+            raise FatalApiError(getattr(e, "status_code", None), kind, text) from None
         except anthropic.RateLimitError as e:
             raise RateLimited(type(e).__name__) from None
         except anthropic.APITimeoutError as e:
             raise Timeout(type(e).__name__) from None
         except anthropic.APIStatusError as e:
-            raise ApiError(f"{type(e).__name__} status={getattr(e, 'status_code', '?')}") from None
+            status = getattr(e, "status_code", None)
+            if isinstance(status, int) and 400 <= status < 500 and status not in _TRANSIENT_STATUS:
+                kind, text = _api_message(e)
+                raise FatalApiError(status, kind, text) from None
+            raise ApiError(f"{type(e).__name__} status={status if status is not None else '?'}") from None
         except anthropic.APIError as e:
             raise ApiError(type(e).__name__) from None
+        except anthropic.AnthropicError as e:  # e.g. no credentials configured: not transient
+            raise FatalApiError(None, type(e).__name__, "no usable Anthropic credentials or client "
+                                "configuration (is ANTHROPIC_API_KEY set?)") from None
         text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
         return LLMResponse(text, msg.usage.input_tokens, msg.usage.output_tokens, msg.stop_reason or "")
 
@@ -91,7 +152,9 @@ class StubClient:
 
 
 class CachedLLM:
-    """Raw-response cache keyed by sha256(model, system, user) plus spend budget.
+    """Raw-response cache keyed by sha256(model, system, user[, client.request_tag]) plus
+    spend budget. The client's ``request_tag`` (non-default request settings such as effort)
+    is part of the key only when non-empty, so existing keys are unchanged.
 
     A cache hit makes no client call and costs nothing. `bypass_cache=True` forces a live
     call and overwrites the entry, so retries never replay a cached bad response.
@@ -104,6 +167,7 @@ class CachedLLM:
         so the budget cap spans resumes."""
         self.client = client
         self.model = model
+        self.request_tag = str(getattr(client, "request_tag", "") or "")
         self.usd_per_mtok = usd_per_mtok
         self.budget_usd = budget_usd
         self._spent = 0.0
@@ -136,7 +200,7 @@ class CachedLLM:
 
     def _key(self, system: str, user: str) -> str:
         h = hashlib.sha256()
-        for part in (self.model, system, user):
+        for part in (self.model, system, user) + ((self.request_tag,) if self.request_tag else ()):
             h.update(part.encode("utf-8"))
             h.update(b"\x00")
         return h.hexdigest()

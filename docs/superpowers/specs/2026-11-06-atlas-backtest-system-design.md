@@ -140,7 +140,7 @@ Defaults are conservative guesses to be finalised before any paper or live stage
 
 - **Replay loop:** per trading day: snapshot, pipeline, risk layer, next-open fill via `SimBroker`, portfolio update, score matured picks.
 - **Periods (chronological):** train (autoresearch may edit), validation (threshold tuning), holdout (defined as dates after the configured model's training cutoff). With current models the holdout is short; reports say so.
-- **Determinism:** temperature 0; LLM calls cached by hash of model, prompt and inputs; a prompt edit invalidates only that agent's entries.
+- **Determinism:** LLM calls cached by hash of model, prompt and inputs; a prompt edit invalidates only that agent's entries. Replays are deterministic because identical inputs are served from the cache, not because of sampling settings: no `temperature` is sent (current models reject sampling parameters with HTTP 400).
 - **Cost control:** upfront cost estimate with confirmation above a ceiling; hard budget cap; `--dry-run` with a stub model.
 - **Resumability:** daily checkpoints.
 

@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from atlas.engine.llm import (
-    AnthropicClient, ApiError, BudgetExceeded, CachedLLM, LLMResponse, RateLimited, StubClient, Timeout,
+    AnthropicClient, ApiError, BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, RateLimited,
+    StubClient, Timeout,
 )
 
 
@@ -153,33 +154,56 @@ class FakeSDK:
         self.exc = exc
         self.messages = self
 
+    content = [SimpleNamespace(type="text", text="hi")]
+
     def create(self, **kw):
         self.kwargs = kw
         if self.exc:
             raise self.exc
         return SimpleNamespace(
-            content=[SimpleNamespace(type="text", text="hi")],
+            content=self.content,
             usage=SimpleNamespace(input_tokens=3, output_tokens=4),
             stop_reason="end_turn",
         )
 
 
-def test_anthropic_client_fixes_temperature_zero_and_maps_response():
+def test_anthropic_client_sends_no_sampling_params_and_maps_response():
     sdk = FakeSDK()
     r = AnthropicClient("claude-x", sdk=sdk).complete("sys", "usr", 321)
-    assert sdk.kwargs["temperature"] == 0
+    # current models reject temperature/top_p/top_k (HTTP 400): never sent
+    assert not {"temperature", "top_p", "top_k", "output_config", "thinking", "extra_body"} & set(sdk.kwargs)
     assert sdk.kwargs["model"] == "claude-x" and sdk.kwargs["max_tokens"] == 321
     assert sdk.kwargs["system"] == "sys"
     assert sdk.kwargs["messages"] == [{"role": "user", "content": "usr"}]
     assert (r.text, r.input_tokens, r.output_tokens, r.stop_reason) == ("hi", 3, 4, "end_turn")
 
 
-def test_anthropic_client_maps_errors():
-    import anthropic
+def test_anthropic_client_sends_effort_only_when_set():
+    sdk = FakeSDK()
+    c = AnthropicClient("claude-x", sdk=sdk, effort="low")
+    c.complete("s", "u", 10)
+    assert sdk.kwargs["output_config"] == {"effort": "low"}
+    assert "temperature" not in sdk.kwargs
+    assert c.request_tag == "effort=low" and AnthropicClient("claude-x", sdk=FakeSDK()).request_tag == ""
+
+
+def test_anthropic_client_ignores_thinking_blocks():
+    sdk = FakeSDK()
+    sdk.content = [SimpleNamespace(type="thinking", thinking=""), SimpleNamespace(type="text", text="{}")]
+    assert AnthropicClient("m", sdk=sdk).complete("s", "u", 10).text == "{}"
+
+
+def _httpx():
     try:
         import httpx
     except ModuleNotFoundError:  # anthropic 2.x vendors httpx2
         import httpx2 as httpx
+    return httpx
+
+
+def test_anthropic_client_maps_errors():
+    import anthropic
+    httpx = _httpx()
 
     req = httpx.Request("POST", "http://x")
     cases = [
@@ -187,10 +211,48 @@ def test_anthropic_client_maps_errors():
         (anthropic.APITimeoutError(request=req), Timeout),
         (anthropic.APIConnectionError(request=req), ApiError),
         (anthropic.InternalServerError("s", response=httpx.Response(500, request=req), body=None), ApiError),
+        (anthropic.APIStatusError("o", response=httpx.Response(529, request=req), body=None), ApiError),
+        (anthropic.APIStatusError("c", response=httpx.Response(409, request=req), body=None), ApiError),
     ]
     for exc, expected in cases:
         with pytest.raises(expected):
             AnthropicClient("m", sdk=FakeSDK(exc)).complete("s", "u", 10)
+
+
+@pytest.mark.parametrize("cls,status", [
+    ("BadRequestError", 400), ("AuthenticationError", 401), ("PermissionDeniedError", 403),
+    ("NotFoundError", 404), ("UnprocessableEntityError", 422),
+])
+def test_anthropic_client_4xx_is_fatal_and_sanitised(cls, status):
+    import anthropic
+    httpx = _httpx()
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages?key=sk-ant-api03-SECRETSECRET")
+    body = {"type": "error", "error": {"type": "invalid_request_error",
+                                       "message": "temperature: bad for sk-ant-api03-SECRETSECRET see "
+                                                  "https://evil.example/x?api_key=abc"}}
+    exc = getattr(anthropic, cls)("raw sk-ant-api03-SECRETSECRET", response=httpx.Response(status, request=req),
+                                  body=body)
+    with pytest.raises(FatalApiError) as ei:
+        AnthropicClient("m", sdk=FakeSDK(exc)).complete("s", "u", 10)
+    e = ei.value
+    assert not isinstance(e, ApiError)  # never retried as a transient api_error
+    assert e.status == status
+    text = str(e)
+    assert f"HTTP {status}" in text and "Anthropic API rejected the request" in text
+    assert "temperature: bad" in text
+    assert "SECRET" not in text and "evil.example" not in text and "api_key" not in text
+    assert e.__cause__ is None and e.__suppress_context__
+
+
+def test_cache_key_includes_client_request_tag(tmp_path):
+    class Tagged(CountingStub):
+        request_tag = "effort=low"
+
+    plain = CountingStub(lambda s, u: "a")
+    tagged = Tagged(lambda s, u: "b")
+    CachedLLM(plain, tmp_path / "c.db", "m", (1.0, 1.0), 10.0).call("s", "u")
+    r = CachedLLM(tagged, tmp_path / "c.db", "m", (1.0, 1.0), 10.0).call("s", "u")
+    assert tagged.calls == 1 and r.text == "b"  # a different request setting never replays
 
 
 def test_initial_spent_counts_toward_budget(tmp_path):

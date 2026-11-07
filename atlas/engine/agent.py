@@ -1,7 +1,9 @@
 """Run one agent: call the LLM, validate, retry per policy, log every failed attempt.
 
 Partial/invalid output is recorded in the FailureLog but never returned: a failed agent
-yields output=None.
+yields output=None. A ``FatalApiError`` (the API rejected the request: bad parameter, key,
+model name, ...) is not the agent's failure and retrying cannot fix it: it propagates
+unretried and unrecorded and aborts the run.
 """
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ from atlas.engine.failures import CALL_FAILURE, DROPPED_PICK, FailureLog
 from atlas.engine.llm import ApiError, CachedLLM, LLMResponse, RateLimited, Timeout
 from atlas.schemas import AgentOutput, AgentResult, FailureReason, FailureRecord
 
-MAX_TOKENS = 4096
+MAX_TOKENS = 8192  # default; the CLI passes Settings.max_output_tokens (thinking tokens count too)
 CONTENT_RETRIES = 1  # malformed_json / schema_invalid / truncated / empty_response
 TRANSIENT_MAX_ATTEMPTS = 4  # api_error / rate_limited / timeout, exponential backoff
 BACKOFF_BASE_S = 1.0
@@ -35,7 +37,8 @@ def _parse(spec: AgentSpec, asof: date, resp: LLMResponse, force_date: bool = Fa
     if resp.stop_reason == "refusal":
         raise _Fail(FailureReason.REFUSAL, "model refused")
     if resp.stop_reason == "max_tokens":
-        raise _Fail(FailureReason.TRUNCATED, "stop_reason=max_tokens")
+        raise _Fail(FailureReason.TRUNCATED, "stop_reason=max_tokens (the reply hit the output token "
+                    "limit; raise settings.max_output_tokens)")
     text = resp.text.strip()
     if not text:
         raise _Fail(FailureReason.EMPTY_RESPONSE, "empty response")
@@ -65,7 +68,7 @@ def _parse(spec: AgentSpec, asof: date, resp: LLMResponse, force_date: bool = Fa
 def run_agent(spec: AgentSpec, prompt: str, inputs: dict, asof: date, llm: CachedLLM,
               failures: FailureLog, universe: set[str], *,
               sleep: Callable[[float], None] = time.sleep,
-              asof_label: str | None = None) -> AgentResult:
+              asof_label: str | None = None, max_tokens: int = MAX_TOKENS) -> AgentResult:
     """`asof_label` (anonymised runs) replaces the date shown to the model; the output's
     date is then set to `asof` by this function rather than taken from the model."""
     shown = asof.isoformat() if asof_label is None else asof_label
@@ -86,7 +89,7 @@ def run_agent(spec: AgentSpec, prompt: str, inputs: dict, asof: date, llm: Cache
     while True:
         attempt += 1
         try:
-            resp, replayed = llm.call_with_meta(prompt, user, max_tokens=MAX_TOKENS, bypass_cache=bypass)
+            resp, replayed = llm.call_with_meta(prompt, user, max_tokens=max_tokens, bypass_cache=bypass)
         except (RateLimited, Timeout, ApiError) as e:
             reason = (FailureReason.RATE_LIMITED if isinstance(e, RateLimited)
                       else FailureReason.TIMEOUT if isinstance(e, Timeout) else FailureReason.API_ERROR)

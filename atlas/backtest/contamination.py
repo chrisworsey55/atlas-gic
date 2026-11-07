@@ -38,7 +38,7 @@ from atlas.engine.llm import ApiError, BudgetExceeded, CachedLLM, LLMResponse, R
 from atlas.schemas import FailureReason, FailureRecord
 
 PROBE_AGENT = "contamination_probe"
-MAX_TOKENS = 200
+MAX_TOKENS = 8192  # the reply is short, but thinking tokens (model default) count against it
 
 PROBE_SYSTEM = """# contamination_probe
 You are shown anonymised market data for one instrument: an opaque id, a sector label, daily
@@ -137,10 +137,12 @@ def _parse(resp: LLMResponse) -> tuple[date, str]:
 
 def contamination_probe(snapshots: list[tuple[Snapshot, date, str]], llm: CachedLLM,
                         tolerance_days: int, *, failures: FailureLog | None = None,
-                        sleep: Callable[[float], None] = time.sleep) -> ContaminationScore:
+                        sleep: Callable[[float], None] = time.sleep,
+                        max_tokens: int = MAX_TOKENS) -> ContaminationScore:
     """`snapshots` are (ANONYMISED snapshot, true date, true real ticker). Only the snapshot
-    is sent to the model; the date and ticker are used to score the reply. Temperature 0
-    (client) and caching (CachedLLM) as everywhere else; spend counts against `llm`'s budget
+    is sent to the model; the date and ticker are used to score the reply. No sampling
+    parameter is sent; caching (CachedLLM) as everywhere else makes a re-run replay the same
+    replies. A FatalApiError (request rejected) propagates. Spend counts against `llm`'s budget
     and BudgetExceeded stops the probe cleanly with the score so far."""
     n = date_hits = ticker_hits = any_hits = failed = 0
     outcomes: list[tuple[bool, bool, bool]] = []
@@ -159,7 +161,7 @@ def contamination_probe(snapshots: list[tuple[Snapshot, date, str]], llm: Cached
                                                       detail=detail, attempt=attempt, raw_response=raw))
 
                 try:
-                    resp, replayed = llm.call_with_meta(PROBE_SYSTEM, user, max_tokens=MAX_TOKENS)
+                    resp, replayed = llm.call_with_meta(PROBE_SYSTEM, user, max_tokens=max_tokens)
                 except (RateLimited, Timeout, ApiError) as e:
                     reason = (FailureReason.RATE_LIMITED if isinstance(e, RateLimited)
                               else FailureReason.TIMEOUT if isinstance(e, Timeout) else FailureReason.API_ERROR)

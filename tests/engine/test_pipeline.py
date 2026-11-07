@@ -258,3 +258,18 @@ def test_prompt_file_exists_for_every_agent():
         assert text.strip(), spec.name
         assert "JSON" in text and "picks" in text and "horizon_days" in text, spec.name
     assert not (root / "prompts" / "control_date_only.md").exists()
+
+
+def test_pipeline_passes_its_max_tokens_to_every_agent_call(tmp_path):
+    seen = set()
+
+    class C:
+        def complete(self, system, user, max_tokens):
+            seen.add(max_tokens)
+            name = system[len("PROMPT<"):-1]
+            return StubClient(lambda s, u: default_handler(name, json.loads(u))).complete(system, user, max_tokens)
+
+    llm = CachedLLM(C(), tmp_path / "c.db", "m", (0.0, 0.0), 1e9)
+    pipe = Pipeline(SPECS, PROMPTS, llm, FailureLog(tmp_path / "f.db"), UNIVERSE, 3, max_tokens=777)
+    pipe.run_day(ASOF, snapshot(), WEIGHTS, STATE)
+    assert seen == {777}
