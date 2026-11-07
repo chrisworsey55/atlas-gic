@@ -102,7 +102,7 @@ def test_probe_refuses_before_any_call_when_budget_already_spent(run, keys, caps
 def test_probe_spend_counts_for_a_later_backtest_resume_and_report_total(run, keys):  # noqa: F811
     assert cli(["probe", "--run-dir", run, "--samples", "4", "--yes"], wrong) == 0
     spent = spend_so_far(run)
-    assert set(spent) == {"backtest", "control", "autoresearch", "probe"} and spent["probe"] > 0
+    assert set(spent) == {"backtest", "control", "autoresearch", "probe", "older_model"} and spent["probe"] > 0
 
 
 def test_probe_never_prints_or_stores_the_key(run, monkeypatch, capsys):  # noqa: F811
@@ -161,6 +161,136 @@ def test_report_includes_the_contamination_section_after_a_probe_and_omits_it_be
     assert cli(["probe", "--run-dir", run, "--samples", "4", "--yes"], wrong) == 0
     assert cli(["report", "--run-dir", run]) == 0
     md = (run / "report" / "report.md").read_text()
-    assert "## Contamination probe (optional)" in md and "n = 4 probes" in md
+    assert "## Contamination probe (optional)" in md and "n = 4 probes" in md and "Chance level" in md
     # the section is the only difference in the verdict-bearing part
     assert md.split("## Verdict")[1].split("\n## ")[0].count("No evidence of skill") >= 1
+
+
+# ---------------------------------------------------------------------------- fix round 1
+
+def test_unique_sector_labels_are_never_sent_only_shared_ones():
+    from atlas.cli import probe_sector_labels
+    assert set(probe_sector_labels(["SPY", "SMH", "XLF", "XLE", "XLV", "AAA"]).values()) == {"Unclassified"}
+    lab = probe_sector_labels(["SMH", "XLF", "NVDA"])
+    assert lab == {"SMH": "Unclassified", "XLF": "Unclassified", "NVDA": "Unclassified"}
+    from atlas import cli as c
+    old = dict(c.PROBE_SECTORS)
+    try:
+        c.PROBE_SECTORS.update({"AAA": "Tech", "BBB": "Tech", "CCC": "Energy"})
+        assert c.probe_sector_labels(["AAA", "BBB", "CCC"]) == {"AAA": "Tech", "BBB": "Tech", "CCC": "Unclassified"}
+    finally:
+        c.PROBE_SECTORS.clear()
+        c.PROBE_SECTORS.update(old)
+
+
+def test_probe_cli_sends_only_unclassified_and_headlines_the_date_rate(run, keys, capsys):  # noqa: F811
+    seen = []
+
+    def spy(system, user):
+        seen.append(user)
+        return wrong(system, user)
+
+    assert cli(["probe", "--run-dir", run, "--samples", "5", "--yes"], spy) == 0
+    assert {json.loads(u)["instruments"][0]["sector"] for u in seen} == {"Unclassified"}
+    c = json.loads((run / "contamination.json").read_text())
+    assert c["date_rate"] == 0.0 and c["ticker_rate"] == 0.0
+    assert c["chance_date_rate"] == pytest.approx(11 / c["n_trading_days"]) and c["chance_ticker_rate"] == 1 / 8
+    out = capsys.readouterr().out
+    assert "date-hit rate 0.0%" in out and "about 27.5%" in out and "approximate" in out
+    assert "not evidence of date memory" in out and "trust results for those periods less" in out
+    assert sum(v["n"] for v in c["by_period"].values()) == c["n"]
+
+
+def test_probe_selection_avoids_thin_history_days(run, keys):  # noqa: F811
+    assert cli(["probe", "--run-dir", run, "--samples", "6", "--yes"], wrong) == 0
+    c = json.loads((run / "contamination.json").read_text())
+    # the price history starts 2024-01-01: earlier days have fewer than 20 bars
+    assert all(s["date"] >= "2024-01-26" for s in c["samples"])
+
+
+def test_probe_refuses_a_dry_run_directory(golden, tmp_path, keys, capsys):  # noqa: F811
+    conf = write_config(tmp_path / "r.yaml", tmp_path / "run", golden["repo"])
+    assert cli(["backtest", "--config", conf, "--dry-run"]) == 0
+    capsys.readouterr()
+    assert cli(["probe", "--run-dir", tmp_path / "run" / "dry_run", "--yes"], wrong) == 2
+    assert "dry run" in "".join(capsys.readouterr())
+    other = tmp_path / "copy"  # renamed, but the dry-run marker file gives it away
+    shutil.copytree(tmp_path / "run" / "dry_run", other)
+    (other / "dry_run_llm.db").write_bytes(b"")  # the marker the runner leaves in a dry-run dir
+    assert cli(["probe", "--run-dir", other, "--yes"], wrong) == 2
+
+
+@pytest.mark.parametrize("name", ["probe.json", "control.json", "run_config.json"])
+@pytest.mark.parametrize("content", ["{not json", "[]", '{"spent_usd": "x"}'])
+def test_corrupt_state_files_are_a_clear_exit_1_without_traceback(run, keys, capsys, name, content):  # noqa: F811
+    (run / name).write_text(content)
+    assert cli(["probe", "--run-dir", run, "--samples", "2", "--yes"], wrong) == 1
+    err = "".join(capsys.readouterr())
+    assert f"{name} is corrupt" in err and "Traceback" not in err
+    if name == "run_config.json":
+        assert cli(["report", "--run-dir", run]) == 1
+
+
+# --- the one hard cap, handed to every consumer (mutation-guarded)
+
+def _plant_spend(run: Path) -> dict:
+    """control 1.0, autoresearch 2.0, probe 3.0, older-model 4.0 on top of the backtest's own."""
+    (run / "control.json").write_text(json.dumps({"spent_usd": 1.0, "days": 0}))
+    row = {"agent": "a", "branch": "b", "n_days": 20, "old_ic": 0.0, "new_ic": 0.0, "diff": 0.0,
+           "keep_margin": 0.1, "decision": "rejected", "reason": "x", "commit_sha": None, "cost_usd": 2.0}
+    (run / "autoresearch_log.jsonl").write_text(json.dumps(row) + "\n")
+    (run / "probe.json").write_text(json.dumps({"spent_usd": 3.0}))
+    (run / "older_model" / "m").mkdir(parents=True)
+    (run / "older_model" / "m" / "checkpoint.json").write_text(json.dumps({"spent_usd": 4.0}))
+    return {"control": 1.0, "autoresearch": 2.0, "probe": 3.0, "older_model": 4.0}
+
+
+def test_spend_buckets_are_exact_and_each_counted_once(run):  # noqa: F811
+    own = spend_so_far(run)["backtest"]
+    planted = _plant_spend(run)
+    assert spend_so_far(run) == {"backtest": own, **planted}
+    assert sum(spend_so_far(run).values()) == pytest.approx(own + 10.0)
+
+
+def test_every_consumer_gets_the_budget_minus_everyone_elses_spend(golden, tmp_path, keys, monkeypatch):  # noqa: F811
+    import atlas.cli as c
+    run = tmp_path / "run"
+    shutil.copytree(golden["run_dir"], run)
+    own = spend_so_far(run)["backtest"]
+    _plant_spend(run)
+    budget = 100.0
+    conf = write_config(tmp_path / "c.yaml", run, golden["repo"], budget_usd=budget)
+    seen = {"resume": None, "ctor": []}
+    real_run, real_llm = c.run_backtest, c.CachedLLM
+
+    def spy_run(cfg, store, pipeline, *a, **k):
+        seen["resume"] = pipeline.llm.budget_usd
+        return real_run(cfg, store, pipeline, *a, **k)
+
+    class SpyLLM(real_llm):
+        def __init__(self, client, cache, model, pricing, budget_usd, **k):
+            seen["ctor"].append(budget_usd)
+            super().__init__(client, cache, model, pricing, budget_usd, **k)
+
+    monkeypatch.setattr(c, "run_backtest", spy_run)
+    monkeypatch.setattr(c, "CachedLLM", SpyLLM)
+    assert cli(["backtest", "--config", conf, "--yes", "--with-control"], wrong) in (0, 1)
+    # backtest resume: everything but its own spend is subtracted (control 1 + ar 2 + probe 3 + older 4)
+    assert seen["resume"] == pytest.approx(budget - 10.0)
+    # control pass: cap minus backtest, its own previous spend and the other three buckets
+    assert seen["ctor"][-1] == pytest.approx(budget - own - 1.0 - (2.0 + 3.0 + 4.0))
+    # probe: cap minus the whole run's spend, once
+    seen["ctor"].clear()
+    before = sum(spend_so_far(run).values())
+    assert cli(["probe", "--run-dir", run, "--samples", "2", "--yes"], wrong) == 0
+    assert seen["ctor"][-1] == pytest.approx(budget - before)
+
+
+def test_report_total_counts_older_model_and_probe_spend_exactly_once(golden, tmp_path, keys):  # noqa: F811
+    run = tmp_path / "run"
+    shutil.copytree(golden["run_dir"], run)
+    own = spend_so_far(run)["backtest"]
+    _plant_spend(run)
+    assert cli(["report", "--run-dir", run]) == 0
+    md = (run / "report" / "report.md").read_text()
+    assert f"Total API cost: ${own + 10.0:.2f}" in md

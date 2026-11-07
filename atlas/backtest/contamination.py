@@ -12,7 +12,10 @@ Scoring (per probe, all local):
 * date hit   = the guessed date is within ``tolerance_days`` (inclusive) of the true date;
 * ticker hit = the guessed symbol equals the true ticker (case and surrounding spaces ignored);
 * probe hit  = date hit OR ticker hit (counted once);
-* ``rate``   = probe hits / n, where n is the number of COMPLETED probes (a malformed, refused
+* ``date_rate`` / ``ticker_rate`` = date hits / n and ticker hits / n. The HEADLINE is
+  ``date_rate``: a sector label can identify a ticker without any memory of the period, so
+  ticker hits are reported separately and are not evidence of date memory;
+* ``rate``   = probe hits / n (the combined OR rate, kept for compatibility), where n is the number of COMPLETED probes (a malformed, refused
   or unreachable reply is a completed miss; a probe never started because the budget ran out
   is not counted). n = 0 gives rate 0.0 and ``empty`` True instead of NaN.
 
@@ -40,8 +43,7 @@ MAX_TOKENS = 200
 PROBE_SYSTEM = """# contamination_probe
 You are shown anonymised market data for one instrument: an opaque id, a sector label, daily
 bars [relative_day, open, high, low, close] with prices rebased to 100 at the first bar (the
-last bar is relative day 0, earlier bars are negative), and optional macro series
-[calendar_day_offset, value] with offsets counted back from the last bar.
+last bar is relative day 0, earlier bars are negative).
 
 Using only what you recognise about this data, guess (a) the calendar date of the last bar and
 (b) the real ticker symbol of the instrument. Always give your best guess.
@@ -62,10 +64,29 @@ class ContaminationScore:
     any_hits: int = 0          # probes with a date hit OR a ticker hit (rate = any_hits / n)
     failed: int = 0            # completed probes whose reply was unusable (counted as misses)
     budget_exhausted: bool = False  # stopped early by the hard budget cap
+    # per completed probe, in input order: (date_hit, ticker_hit, unusable_reply)
+    outcomes: tuple[tuple[bool, bool, bool], ...] = ()
 
     @property
     def empty(self) -> bool:
         return self.n == 0
+
+    @property
+    def date_rate(self) -> float:
+        return self.date_hits / self.n if self.n else 0.0
+
+    @property
+    def ticker_rate(self) -> float:
+        return self.ticker_hits / self.n if self.n else 0.0
+
+
+def chance_rates(tolerance_days: int, n_trading_days: int, universe_size: int) -> tuple[float, float]:
+    """Approximate hit rates of a random guesser: a date guess lands in the +-tolerance window
+    (2 * tolerance + 1 dates) of the true date with probability (2 * tolerance + 1) / trading
+    days in the run; a ticker guess with probability 1 / universe size. Both are rough."""
+    d = min(1.0, (2 * tolerance_days + 1) / n_trading_days) if n_trading_days > 0 else float("nan")
+    t = 1.0 / universe_size if universe_size > 0 else float("nan")
+    return d, t
 
 
 def _user_message(snap: Snapshot) -> str:
@@ -77,9 +98,7 @@ def _user_message(snap: Snapshot) -> str:
                  round(float(r.close), 4)] for r in g.itertuples()]
         sector = str(g["sector"].iloc[0]) if "sector" in g.columns else ""
         insts.append({"id": str(tid), "sector": sector, "bars": bars})
-    macro = {f"M{i + 1}": [[int(k), round(float(v), 4)] for k, v in s.items()]
-             for i, (_, s) in enumerate(sorted(snap.macro.items()))}  # real series ids are not sent
-    return json.dumps({"instruments": insts, "macro": macro}, sort_keys=True)
+    return json.dumps({"instruments": insts}, sort_keys=True)  # no macro series: levels can date a snapshot
 
 
 class _Bad(Exception):
@@ -124,6 +143,7 @@ def contamination_probe(snapshots: list[tuple[Snapshot, date, str]], llm: Cached
     (client) and caching (CachedLLM) as everywhere else; spend counts against `llm`'s budget
     and BudgetExceeded stops the probe cleanly with the score so far."""
     n = date_hits = ticker_hits = any_hits = failed = 0
+    outcomes: list[tuple[bool, bool, bool]] = []
     exhausted = False
     for snap, true_date, true_ticker in snapshots:
         user = _user_message(snap)
@@ -160,6 +180,7 @@ def contamination_probe(snapshots: list[tuple[Snapshot, date, str]], llm: Cached
         n += 1
         if outcome is None:
             failed += 1
+            outcomes.append((False, False, True))
             continue
         guess_date, guess_ticker = outcome
         d_hit = abs(guess_date - true_date) <= timedelta(days=tolerance_days)
@@ -167,6 +188,8 @@ def contamination_probe(snapshots: list[tuple[Snapshot, date, str]], llm: Cached
         date_hits += d_hit
         ticker_hits += t_hit
         any_hits += d_hit or t_hit
+        outcomes.append((d_hit, t_hit, False))
     rate = any_hits / n if n else 0.0
     return ContaminationScore(n=n, date_hits=date_hits, ticker_hits=ticker_hits, rate=rate,
-                              any_hits=any_hits, failed=failed, budget_exhausted=exhausted)
+                              any_hits=any_hits, failed=failed, budget_exhausted=exhausted,
+                              outcomes=tuple(outcomes))

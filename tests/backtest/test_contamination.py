@@ -246,8 +246,8 @@ def test_report_includes_contamination_section_only_when_score_given(tmp_path):
     with_ = _report(tmp_path / "b", contamination=sc)
     assert "\n## Contamination probe (optional)\n" in with_
     sec = with_.split("## Contamination probe (optional)")[1].split("\n## ")[0]
-    assert "35.00%" in sec and "20" in sec and "7 of 20" in sec
-    assert "trust results for those periods less" in sec
+    assert "Date-hit rate (headline): 30.00%" in sec and "6 of 20" in sec and "7 of 20" in sec
+    assert "trust results for those periods less" in sec and "well above chance" in sec
     assert "not a measure of skill" in sec.lower() or "not evidence of skill" in sec.lower()
 
 
@@ -255,7 +255,49 @@ def test_report_contamination_accepts_a_dict_and_shows_tolerance(tmp_path):
     md = _report(tmp_path, contamination={"n": 10, "date_hits": 1, "ticker_hits": 0, "rate": 0.1,
                                           "tolerance_days": 7})
     sec = md.split("## Contamination probe (optional)")[1].split("\n## ")[0]
-    assert "10.00%" in sec and "within 7 day" in sec
+    assert "Date-hit rate (headline): 10.00%" in sec and "within 7 day" in sec
+
+
+def test_report_headline_is_the_date_rate_and_ticker_hits_carry_the_sector_caveat(tmp_path):
+    # a sector->ticker stub: all ticker hits, wrong dates -> combined rate 100%, date rate 0%
+    d = {"n": 40, "date_hits": 0, "ticker_hits": 30, "any_hits": 30, "rate": 0.75, "tolerance_days": 5,
+         "chance_date_rate": 0.275, "chance_ticker_rate": 0.125}
+    sec = _report(tmp_path, contamination=d).split("## Contamination probe (optional)")[1].split("\n## ")[0]
+    assert "Date-hit rate (headline): 0.00%" in sec
+    assert "sector label may identify the ticker" in sec and "not evidence of date memory" in sec
+    assert "Combined date-or-ticker rate (not the headline): 75.00%" in sec
+    assert "Chance level" in sec and "27.50%" in sec and "12.50%" in sec and "approximate" in sec
+    assert "can identify these dates" not in sec
+
+
+def test_report_shows_per_period_date_rates_when_picks_span_periods(tmp_path):
+    d = {"n": 4, "date_hits": 1, "ticker_hits": 0, "rate": 0.25, "tolerance_days": 5,
+         "by_period": {"validation": {"n": 1, "date_hits": 1, "date_rate": 1.0},
+                       "holdout": {"n": 3, "date_hits": 0, "date_rate": 0.0}}}
+    sec = _report(tmp_path, contamination=d).split("## Contamination probe (optional)")[1].split("\n## ")[0]
+    assert "| validation | 1 | 1 | 100.00% |" in sec and "| holdout | 3 | 0 | 0.00% |" in sec
+
+
+def test_sector_to_ticker_stub_with_wrong_dates_gives_low_date_rate_and_chance_helper(tmp_path):
+    from atlas.backtest.contamination import chance_rates
+    by_sector = {v: k for k, v in SECTORS.items()}
+    llm = make_llm(tmp_path, lambda s, u: reply("1990-01-01",
+                   by_sector[json.loads(u)["instruments"][0]["sector"]]))
+    sc = contamination_probe(probes(), llm, tolerance_days=5)
+    assert sc.ticker_rate == 1.0 and sc.date_rate == 0.0 and sc.rate == 1.0
+    assert len(sc.outcomes) == 3 and all(o == (False, True, False) for o in sc.outcomes)
+    d, t = chance_rates(5, 110, 8)
+    assert d == pytest.approx(11 / 110) and t == 0.125
+    assert chance_rates(5, 0, 0)[0] != chance_rates(5, 0, 0)[0]  # NaN, never a crash
+
+
+def test_probe_prompt_carries_no_macro_series_at_all(tmp_path):
+    seen = []
+    llm = make_llm(tmp_path, lambda s, u: (seen.append(u), reply())[1])
+    contamination_probe(probes(ITEMS[:1]), llm, tolerance_days=5)
+    msg = json.loads(seen[0])
+    assert set(msg) == {"instruments"} and "VIX" not in seen[0] and "macro" not in seen[0].lower()
+    assert "20.0" not in seen[0].replace("100.0", "")  # the macro level (20.0/21.0) is not sent
 
 
 def test_report_contamination_empty_or_early_stop_is_stated_and_does_not_crash(tmp_path):

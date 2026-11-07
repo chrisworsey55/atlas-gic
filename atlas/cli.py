@@ -117,6 +117,7 @@ ANTHROPIC_KEY, FRED_KEY = "ANTHROPIC_API_KEY", "FRED_API_KEY"
 CHECKPOINT, PREDLOG, SCORES, FAILURES = "checkpoint.json", "prediction_log.jsonl", "scores.sqlite", "failures.sqlite"
 LLM_CACHE, WEIGHTS, RUN_CONFIG, CALIBRATION = "llm_cache.sqlite", "weights.json", "run_config.json", "calibration.json"
 CONTROL_STATE, AR_LOG, AR_FAILURES = "control.json", "autoresearch_log.jsonl", "autoresearch_failures.sqlite"
+OLDER_MODEL_DIR = "older_model"
 PROBE_STATE, CONTAMINATION, PROBE_FAILURES = "probe.json", "contamination.json", "probe_failures.sqlite"
 DRY_RUN_CACHE = "dry_run_llm.db"
 ABLATION_NOTE = ("CIO ablation: the decision layer's portfolio is the execution agent's stated long "
@@ -640,17 +641,37 @@ def _drop_torn_tail(path: Path) -> None:
     print(f"note: moved a truncated final line of {path} to {path.name}.torn", file=sys.stderr)
 
 
+def _read_spend(path: Path) -> float:
+    """spent_usd of a small spend file (control.json, probe.json); 0 if absent."""
+    if not path.exists():
+        return 0.0
+    try:
+        v = float(json.loads(path.read_text(encoding="utf-8"))["spent_usd"])
+    except (OSError, ValueError, KeyError, TypeError):
+        raise OperationalError(f"{path.name} is corrupt: {path}") from None
+    if not math.isfinite(v) or v < 0:
+        raise OperationalError(f"{path.name} is corrupt: {path}")
+    return v
+
+
 def spend_so_far(run_dir: Path) -> dict[str, float]:
-    """LLM spend recorded in a run directory: backtest (checkpoint), control, autoresearch and
-    the optional contamination probe."""
+    """LLM spend recorded in a run directory: backtest (checkpoint), control, autoresearch, the
+    optional contamination probe and the optional older-model checks (each counted once, in its
+    own bucket). One hard cap spans all of them."""
     run_dir = Path(run_dir)
     raw = _load_checkpoint(Checkpoint(run_dir / CHECKPOINT)) or {}
-    ctl, probe = run_dir / CONTROL_STATE, run_dir / PROBE_STATE
     ar_cost = sum((float(r.get("cost_usd") or 0.0) for r in read_ar_log(run_dir / AR_LOG)), 0.0)
+    older = sum((float((_load_checkpoint(Checkpoint(c)) or {}).get("spent_usd", 0.0))
+                 for c in sorted((run_dir / OLDER_MODEL_DIR).glob("*/" + CHECKPOINT))), 0.0)
     return {"backtest": float(raw.get("spent_usd", 0.0)),
-            "control": float(json.loads(ctl.read_text())["spent_usd"]) if ctl.exists() else 0.0,
+            "control": _read_spend(run_dir / CONTROL_STATE),
             "autoresearch": ar_cost,
-            "probe": float(json.loads(probe.read_text())["spent_usd"]) if probe.exists() else 0.0}
+            "probe": _read_spend(run_dir / PROBE_STATE),
+            "older_model": older}
+
+
+def _spent_by(spent: dict[str, float], *names: str) -> float:
+    return sum(spent[n] for n in names)
 
 
 # ============================================================================ backtest
@@ -704,12 +725,12 @@ def cmd_backtest(args, llm_client=None) -> int:
     fresh = stored is None and not checkpoint.path.exists()
     if not args.dry_run:  # one hard cap: control and autoresearch spend count against the backtest too
         other = spend_so_far(rc.run_dir)
-        run.llm.budget_usd = max(0.0, run.settings.budget_usd - other["control"] - other["autoresearch"]
-                                     - other["probe"])
+        run.llm.budget_usd = max(0.0, run.settings.budget_usd - _spent_by(
+            other, "control", "autoresearch", "probe", "older_model"))
         if sum(other.values()) >= run.settings.budget_usd and (lcd is None or lcd < max(run.trading_days())):
             raise OperationalError(
                 f"LLM budget exhausted: ${sum(other.values()):.2f} of ${run.settings.budget_usd:.2f} already "
-                "spent on this run (backtest + control + autoresearch + probe); raise budget_usd to continue")
+                "spent on this run (backtest + control + autoresearch + probe + older-model checks); raise budget_usd to continue")
     all_days = run.trading_days()
     todo = [d for d in all_days if lcd is None or d > lcd]
     n_agents = sum(1 for sp in run.specs if sp.kind != "control") + (1 if args.with_control else 0)
@@ -779,8 +800,8 @@ def run_control_pass(run: Run, scores: ScoreStore, result: BacktestResult, all_d
                         (0.0, 0.0), math.inf)
     else:
         other = spend_so_far(run.rc.run_dir)  # one hard cap across backtest, control, autoresearch
-        remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev - other["autoresearch"]
-                        - other["probe"])
+        remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev
+                        - _spent_by(other, "autoresearch", "probe", "older_model"))
         llm = CachedLLM(run.llm.client, run.rc.llm_cache_path, run.settings.model,
                         (run.settings.usd_per_mtok_input, run.settings.usd_per_mtok_output), remaining)
     last = max(result.equity.index)
@@ -1003,7 +1024,7 @@ def cmd_autoresearch(args, llm_client=None) -> int:
     remaining = run.settings.budget_usd - sum(spent.values())
     if remaining <= 0:
         raise OperationalError(f"LLM budget exhausted: ${sum(spent.values()):.2f} of ${run.settings.budget_usd:.2f} "
-                               "already spent on this run (backtest + control + autoresearch + probe); raise budget_usd")
+                               "already spent on this run (backtest + control + autoresearch + probe + older-model checks); raise budget_usd")
     run.llm.budget_usd = remaining  # one hard cap across the run directory
     print(f"autoresearch budget: ${remaining:.2f} remaining of ${run.settings.budget_usd:.2f}")
     scores = ScoreStore(rc.path(SCORES))
@@ -1135,12 +1156,15 @@ def load_stored_run(run_dir: Path, missing: type[Exception]) -> tuple[RunConfig,
     stored_path = run_dir / RUN_CONFIG
     if not stored_path.exists():
         raise missing(f"{run_dir} is not a run directory (no {RUN_CONFIG}); run `atlas backtest` first")
-    stored = json.loads(stored_path.read_text(encoding="utf-8"))
-    rc = RunConfig.model_validate(stored["run_config"]).model_copy(update={"run_dir": run_dir})
-    if rc.data.cache_dir is None:
-        rc = rc.model_copy(update={"data": rc.data.model_copy(update={"cache_dir": run_dir / "prices"})})
-    return (rc, Settings(**stored["settings"]), Limits(**stored["limits"]),
-            [AgentSpec(**a) for a in stored["agents"]], resolve_periods(rc))
+    try:
+        stored = json.loads(stored_path.read_text(encoding="utf-8"))
+        rc = RunConfig.model_validate(stored["run_config"]).model_copy(update={"run_dir": run_dir})
+        if rc.data.cache_dir is None:
+            rc = rc.model_copy(update={"data": rc.data.model_copy(update={"cache_dir": run_dir / "prices"})})
+        return (rc, Settings(**stored["settings"]), Limits(**stored["limits"]),
+                [AgentSpec(**a) for a in stored["agents"]], resolve_periods(rc))
+    except (OSError, ValueError, KeyError, TypeError, ValidationError, UsageError):
+        raise OperationalError(f"{RUN_CONFIG} is corrupt: {stored_path}") from None
 
 
 def cmd_report(args, llm_client=None) -> int:
@@ -1175,7 +1199,7 @@ def cmd_report(args, llm_client=None) -> int:
     edits = [EditRecord(**{k: v for k, v in r.items() if k in known}) for r in ar_records]
     ar_metas = [r.get("null_test") for r in ar_records]
     failures = FailureLog(run_dir / FAILURES)
-    spent = spend_so_far(run_dir)  # backtest + control + autoresearch + probe: one total
+    spent = spend_so_far(run_dir)  # backtest + control + autoresearch + probe + older model: one total
     weights = WeightBook(run_dir / WEIGHTS).load()
     final_weights = {sp.name: weights.get(sp.name, W_INIT) for sp in specs if sp.kind in WEIGHTED_KINDS}
     history = read_day_history(run_dir / HISTORY_NAME, ckpt)
@@ -1206,12 +1230,23 @@ def cmd_report(args, llm_client=None) -> int:
 
 PROBE_SEED = 17
 PROBE_DEFAULT_SAMPLES = 30
+PROBE_MIN_BARS = 20  # snapshots with less history than this are avoided (they dilute the rate)
 PROBE_SECTORS = {"SPY": "Broad market", "SMH": "Semiconductors", "XLF": "Financials", "XLE": "Energy",
                  "XLV": "Healthcare"}  # the example universe; anything else is "Unclassified"
+UNCLASSIFIED = "Unclassified"
+
+
+def probe_sector_labels(universe: list[str]) -> dict[str, str]:
+    """Sector label sent per ticker. A label held by only ONE instrument of the probed universe
+    would identify the ticker without any memory of the period, so it is replaced by
+    'Unclassified': only labels shared by at least two instruments are ever sent."""
+    raw = {t: PROBE_SECTORS.get(t, UNCLASSIFIED) for t in universe}
+    count = {lab: sum(1 for v in raw.values() if v == lab) for lab in set(raw.values())}
+    return {t: (lab if lab != UNCLASSIFIED and count[lab] >= 2 else UNCLASSIFIED) for t, lab in raw.items()}
 
 
 def probe_selection(days: list[date], universe: list[str], n: int, seed: int) -> list[tuple[date, str]]:
-    """n (day, ticker) pairs, deterministic in `seed`: days evenly spread over the run, tickers
+    """n (day, ticker) pairs, deterministic in `seed`: days evenly spread over `days`, tickers
     dealt from a seeded shuffle of the universe so every ticker is used before any repeats."""
     import random
     n = min(n, len(days))
@@ -1225,11 +1260,18 @@ def probe_selection(days: list[date], universe: list[str], n: int, seed: int) ->
     return [(days[i], order[k]) for k, i in enumerate(idx)]
 
 
+def _is_dry_run_dir(run_dir: Path) -> bool:
+    return run_dir.resolve().name == DRY_RUN_DIR or (run_dir / DRY_RUN_CACHE).exists()
+
+
 def cmd_probe(args, llm_client=None) -> int:
     """(optional) Contamination probe on anonymised snapshots of the stored run's days."""
-    from atlas.backtest.contamination import contamination_probe
+    from atlas.backtest.contamination import chance_rates, contamination_probe
     from atlas.backtest.runner import anonymize_snapshot
     run_dir = Path(args.run_dir)
+    if _is_dry_run_dir(run_dir):
+        raise UsageError(f"{run_dir} holds the state of a dry run (zero LLM calls, neutral stub): there "
+                         "is nothing to probe. Pass the real run directory.")
     rc, settings, limits, specs, periods = load_stored_run(run_dir, OperationalError)
     require_keys(rc, anthropic=llm_client is None, fred=False)
     run = Run(rc, settings, limits, specs, {}, periods, PriceStore(CacheOnlyPrices(), NoMacro(), rc.cache_dir), [])
@@ -1237,15 +1279,19 @@ def cmd_probe(args, llm_client=None) -> int:
     samples = args.samples
     if samples < 1:
         raise UsageError("--samples must be at least 1")
-    if samples > len(days):
-        print(f"note: only {len(days)} trading days in the run; probing {len(days)} samples instead of {samples}")
-        samples = len(days)
+    lookback = timedelta(days=rc.data.lookback_days)
+    rich = [d for d in days if len(run.store.trading_days(d - lookback, d)) >= PROBE_MIN_BARS]
+    pool = rich or days  # avoid thin-history days unless the run has nothing else
+    if samples > len(pool):
+        print(f"note: only {len(pool)} eligible trading days in the run; probing {len(pool)} samples "
+              f"instead of {samples}")
+        samples = len(pool)
     spent = spend_so_far(run_dir)
     remaining = settings.budget_usd - sum(spent.values())
     if remaining <= 0:
         raise OperationalError(f"LLM budget exhausted: ${sum(spent.values()):.2f} of ${settings.budget_usd:.2f} "
-                               "already spent on this run (backtest + control + autoresearch + probe); "
-                               "raise budget_usd")
+                               "already spent on this run (backtest + control + autoresearch + probe + "
+                               "older-model checks); raise budget_usd")
     est = samples * (settings.est_input_tokens_per_call * settings.usd_per_mtok_input
                      + 100 * settings.usd_per_mtok_output) / 1e6
     if est > settings.confirm_cost_usd and not _confirm(est, settings.confirm_cost_usd, args.yes):
@@ -1256,35 +1302,52 @@ def cmd_probe(args, llm_client=None) -> int:
         client = AnthropicClient(settings.model)
     llm = CachedLLM(client, rc.llm_cache_path, settings.model,
                     (settings.usd_per_mtok_input, settings.usd_per_mtok_output), remaining)
-    chosen = probe_selection(days, list(dict.fromkeys(settings.universe)), samples, PROBE_SEED)
+    universe = list(dict.fromkeys(settings.universe))
+    labels = probe_sector_labels(universe)
+    chosen = probe_selection(pool, universe, samples, PROBE_SEED)
     items = []
     for day, ticker in chosen:
         snap = run.store.snapshot(day, [ticker], rc.data.lookback_days)
-        anon, _ = anonymize_snapshot(snap, {ticker: PROBE_SECTORS.get(ticker, "Unclassified")})
+        anon, _ = anonymize_snapshot(snap, {ticker: labels[ticker]})
         items.append((anon, day, ticker))
     failures = FailureLog(run_dir / PROBE_FAILURES)
-    prev = json.loads((run_dir / PROBE_STATE).read_text())["spent_usd"] if (run_dir / PROBE_STATE).exists() else 0.0
+    prev = _read_spend(run_dir / PROBE_STATE)
     try:
         score = contamination_probe(items, llm, settings.tolerance_days, failures=failures)
     finally:
         _write_json(run_dir / PROBE_STATE, {"spent_usd": prev + llm.spent_usd})
+    chance_d, chance_t = chance_rates(settings.tolerance_days, len(days), len(universe))
+    by_period: dict[str, dict] = {}
+    for (_, day, _), (dh, th, bad) in zip(items, score.outcomes):
+        b = by_period.setdefault(periods.period_of(day), {"n": 0, "date_hits": 0, "ticker_hits": 0})
+        b["n"] += 1
+        b["date_hits"] += dh
+        b["ticker_hits"] += th
+    for b in by_period.values():
+        b["date_rate"] = b["date_hits"] / b["n"]
     out = {"n": score.n, "date_hits": score.date_hits, "ticker_hits": score.ticker_hits,
-           "any_hits": score.any_hits, "rate": score.rate, "failed": score.failed,
-           "budget_exhausted": score.budget_exhausted, "tolerance_days": settings.tolerance_days,
-           "seed": PROBE_SEED, "model": settings.model, "requested_samples": samples,
-           "spent_usd": prev + llm.spent_usd,
+           "any_hits": score.any_hits, "rate": score.rate, "date_rate": score.date_rate,
+           "ticker_rate": score.ticker_rate, "chance_date_rate": chance_d, "chance_ticker_rate": chance_t,
+           "n_trading_days": len(days), "universe_size": len(universe), "by_period": by_period,
+           "failed": score.failed, "budget_exhausted": score.budget_exhausted,
+           "tolerance_days": settings.tolerance_days, "seed": PROBE_SEED, "model": settings.model,
+           "requested_samples": samples, "spent_usd": prev + llm.spent_usd,
            "samples": [{"date": d.isoformat(), "ticker": t} for _, d, t in items[:score.n]]}
     _write_json(run_dir / CONTAMINATION, out)
     if score.empty:
-        print(f"contamination probe (optional): no probe completed"
+        print("contamination probe (optional): no probe completed"
               + (" (LLM budget exhausted)" if score.budget_exhausted else "") + f"; wrote {run_dir / CONTAMINATION}")
         return EXIT_OK
-    print(f"contamination probe (optional): the model ({settings.model}) recognised {score.any_hits} of "
-          f"{score.n} anonymised snapshots ({score.rate:.1%}; date within {settings.tolerance_days} days: "
-          f"{score.date_hits}, ticker: {score.ticker_hits}; seed {PROBE_SEED}; spend ${llm.spent_usd:.4f}). "
-          "A high rate means the model can identify these dates from price shape alone, so trust results "
-          "for those periods less; a low rate is not proof it has not seen them. It is not a measure of "
-          f"skill. Wrote {run_dir / CONTAMINATION}; `atlas report` will include it.")
+    per = "; ".join(f"{k} {v['date_hits']}/{v['n']}" for k, v in by_period.items()) if len(by_period) > 1 else ""
+    print(f"contamination probe (optional): the model ({settings.model}) placed {score.date_hits} of "
+          f"{score.n} anonymised snapshots within {settings.tolerance_days} days of the true date "
+          f"(date-hit rate {score.date_rate:.1%}; a random guesser would manage about {chance_d:.1%}, "
+          f"approximate)" + (f"; by period: {per}" if per else "") + f". Ticker hits {score.ticker_hits} of "
+          f"{score.n} (chance about {chance_t:.1%}; the sector label may identify the ticker, so ticker hits "
+          f"are not evidence of date memory). Seed {PROBE_SEED}; spend ${llm.spent_usd:.4f}. A high date-hit "
+          "rate, well above chance, means the model can place these snapshots in time, so trust results for "
+          "those periods less. It is not a measure of skill. "
+          f"Wrote {run_dir / CONTAMINATION}; `atlas report` will include it.")
     if score.budget_exhausted:
         print(f"note: stopped early: LLM budget exhausted after {score.n} of {samples} probes")
     if score.failed == score.n:

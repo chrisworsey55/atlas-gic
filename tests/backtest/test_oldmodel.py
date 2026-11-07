@@ -169,3 +169,95 @@ def test_older_model_budget_is_its_own_hard_cap(main_run):
         run_older_model_check(cfg, "m-budget", date(2024, 1, 12), setup, run_dir=main_run["run_dir"],
                               budget_usd=0.0)
     assert "budget" in str(ei.value).lower()
+
+
+# ---------------------------------------------------------------------------- fix round 1
+
+import dataclasses  # noqa: E402
+import shutil  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from atlas.backtest.oldmodel import _dirname, _window_periods  # noqa: E402
+from atlas.cli import spend_so_far  # noqa: E402
+
+
+@pytest.fixture
+def run_copy(main_run, tmp_path):
+    dest = tmp_path / "run"
+    shutil.copytree(main_run["run_dir"], dest, ignore=shutil.ignore_patterns("older_model"))
+    return dest
+
+
+def with_budget(cfg, usd):
+    return dataclasses.replace(cfg, settings=cfg.settings.model_copy(update={"budget_usd": usd}))
+
+
+def test_older_model_default_cap_is_what_remains_of_the_runs_hard_cap(main_run, run_copy):
+    cfg, setup = setup_for(main_run["conf"], StubClient(GoldenStub()))
+    own = spend_so_far(run_copy)["backtest"]
+    cfg = with_budget(cfg, own + 0.3)  # $0.30 left; the check needs about $1
+    with pytest.raises(OlderModelUnavailable) as ei:
+        run_older_model_check(cfg, "old", date(2024, 1, 12), setup, run_dir=run_copy)
+    assert "budget" in str(ei.value).lower()
+    total = sum(spend_so_far(run_copy).values())
+    assert total <= own + 0.3 + 1e-9 and spend_so_far(run_copy)["older_model"] > 0
+
+
+def test_older_model_refuses_when_nothing_remains(main_run, run_copy):
+    calls = []
+    cfg, setup = setup_for(main_run["conf"], StubClient(lambda s, u: calls.append(1)))
+    cfg = with_budget(cfg, spend_so_far(run_copy)["backtest"])
+    with pytest.raises(OlderModelUnavailable) as ei:
+        run_older_model_check(cfg, "old", date(2024, 1, 12), setup, run_dir=run_copy)
+    assert "exhausted" in str(ei.value) and not calls
+    assert not (run_copy / "older_model").exists()
+
+
+def test_older_model_spend_is_its_own_bucket_counted_once_in_the_report_total(main_run, run_copy):
+    from atlas.cli import main
+    cfg, setup = setup_for(main_run["conf"], StubClient(GoldenStub()))
+    own = spend_so_far(run_copy)["backtest"]
+    res = run_older_model_check(cfg, "old", date(2024, 1, 12), setup, run_dir=run_copy)
+    spent = spend_so_far(run_copy)
+    assert spent["older_model"] == pytest.approx(res.spent_usd) and spent["older_model"] > 0
+    assert main(["report", "--run-dir", str(run_copy)]) == 0
+    md = (run_copy / "report" / "report.md").read_text()
+    assert f"Total API cost: ${own + res.spent_usd:.2f}" in md
+
+
+def test_model_names_never_leave_older_model_and_never_collide(main_run, run_copy):
+    names = ["../evil", "a/b", "a_b", "..", ".", "x y"]
+    dirs = [_dirname(n) for n in names]
+    assert len(set(dirs)) == len(names)
+    for d in dirs:
+        assert d not in ("", ".", "..") and "/" not in d and "\\" not in d and not d.startswith(".")
+    assert _dirname("claude-3-opus_20240229.v1") == "claude-3-opus_20240229.v1"  # plain names stay readable
+    cfg, setup = setup_for(main_run["conf"], StubClient(GoldenStub()))
+    for name in ("../evil", "a/b", "a_b"):
+        res = run_older_model_check(cfg, name, date(2024, 2, 12), setup, run_dir=run_copy)
+        assert res is not None
+    kids = sorted(p.name for p in (run_copy / "older_model").iterdir())
+    assert len(kids) == 3 and all((run_copy / "older_model" / k / "checkpoint.json").exists() for k in kids)
+    assert sorted(p.name for p in run_copy.parent.iterdir()) == ["run"]  # nothing escaped to ../
+    assert not (run_copy / "evil").exists()
+
+
+def test_resplit_never_spans_dates_that_were_not_part_of_the_run():
+    def weekdays(lo, hi):
+        out, d = [], lo
+        while d <= hi:
+            if d.weekday() < 5:
+                out.append(d)
+            d = date.fromordinal(d.toordinal() + 1)
+        return out
+
+    store = SimpleNamespace(trading_days=weekdays)
+    per = Periods(train=(date(2024, 1, 1), date(2024, 1, 3)), validation=(date(2024, 1, 4), date(2024, 1, 10)),
+                  holdout=(date(2024, 2, 5), date(2024, 2, 9)))
+    new = _window_periods(per, date(2024, 1, 3), store)
+    own = set(weekdays(date(2024, 1, 4), date(2024, 1, 10))) | set(weekdays(date(2024, 2, 5), date(2024, 2, 9)))
+    covered = [d for _, (lo, hi) in new.items() for d in weekdays(lo, hi)]
+    assert set(covered) == own and len(covered) == len(own)  # no gap day (01-11..02-02), no overlap
+    # one surviving period is split in thirds
+    one = _window_periods(per, date(2024, 2, 1), store)
+    assert [d for _, (lo, hi) in one.items() for d in weekdays(lo, hi)] == weekdays(date(2024, 2, 5), date(2024, 2, 9))

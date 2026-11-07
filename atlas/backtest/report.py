@@ -199,10 +199,26 @@ def _contamination_section(c, settings: Settings | None) -> list[str]:
     if n <= 0:
         out.append("No probes completed (n = 0), so there is no contamination estimate.\n")
     else:
-        hits = f" ({int(any_hits)} of {n} probes)" if any_hits is not None else ""
-        out.append(f"Recognition rate: {_f(rate, pct=True)}{hits}; n = {n} probes; a date guess counts "
-                   f"as a hit within {tol} day(s) of the true date, a ticker guess as a hit when it "
-                   f"equals the true ticker (date hits {date_hits}, ticker hits {ticker_hits}).\n")
+        date_rate = float(d.get("date_rate", date_hits / n))
+        ticker_rate = float(d.get("ticker_rate", ticker_hits / n))
+        cd, ct = d.get("chance_date_rate"), d.get("chance_ticker_rate")
+        out.append(f"Date-hit rate (headline): {_f(date_rate, pct=True)} ({date_hits} of {n} probes; n = {n} "
+                   f"probes); a date guess is a hit within {tol} day(s) of the true date.\n")
+        out.append("Chance level for a random guesser (approximate): dates "
+                   + (_f(cd, pct=True) if cd is not None else "not provided")
+                   + f" ((2 x {tol} + 1) dates / trading days in the run), tickers "
+                   + (_f(ct, pct=True) if ct is not None else "not provided") + " (1 / universe size).\n")
+        out.append(f"Ticker hits: {ticker_hits} of {n} ({_f(ticker_rate, pct=True)}). The sector label may "
+                   "identify the ticker; ticker hits are not evidence of date memory.\n")
+        if any_hits is not None:
+            out.append(f"Combined date-or-ticker rate (not the headline): {_f(rate, pct=True)} "
+                       f"({int(any_hits)} of {n} probes).\n")
+        bp = d.get("by_period")
+        if isinstance(bp, dict) and len([v for v in bp.values() if v.get("n")]) > 1:
+            out.append("| period | n | date hits | date-hit rate |\n|---|---|---|---|")
+            out += [f"| {k} | {v.get('n')} | {v.get('date_hits')} | {_f(v.get('date_rate'), pct=True)} |"
+                    for k, v in bp.items()]
+            out.append("")
     if d.get("failed"):
         out.append(f"{int(d['failed'])} probe(s) got an unusable reply and count as misses "
                    "(see the failure log).\n")
@@ -210,10 +226,10 @@ def _contamination_section(c, settings: Settings | None) -> list[str]:
         out.append("The probe stopped early: the LLM budget was exhausted, so n is the number of "
                    "completed probes.\n")
     out.append("Interpretation: the model was shown anonymised price data (no dates, no tickers) and "
-               "asked to name the date and the ticker. A high rate means the model can identify these "
-               "dates, so trust results for those periods less. A low rate does not prove the model "
-               "has not seen the period. This probe is a data-quality check, not a measure of skill, "
-               "and it does not enter the verdict.\n")
+               "asked to name the date and the ticker. A high date-hit rate, well above chance, means the "
+               "model can place these snapshots in time, so trust results for those periods less. A low rate "
+               "does not prove the model has not seen the period. This probe is a data-quality check, not a "
+               "measure of skill, and it does not enter the verdict.\n")
     return out
 
 

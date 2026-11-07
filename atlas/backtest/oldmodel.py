@@ -13,6 +13,7 @@ score store, weights, failure log and LLM cache, so it never touches the main ru
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -72,11 +73,12 @@ def _window_periods(periods: Periods, older_cutoff: date, store: PriceStore) -> 
     """Periods covering only post-cutoff trading days. Each original period is clipped to start
     after the cutoff; if all three keep trading days the clipped periods are used as they are.
     If the cutoff swallowed a whole period, the post-cutoff trading days are split into three
-    contiguous parts (train, validation, holdout) because the runner needs all three; those
-    roles then only label thirds of the window. None if fewer than MIN_WINDOW_DAYS days."""
+    chronological chunks (train, validation, holdout) cut inside the surviving period(s), never
+    across a gap between periods, because the runner needs all three; those roles then only
+    label chunks of the window. None if fewer than MIN_WINDOW_DAYS days."""
     start = older_cutoff + timedelta(days=1)
     clipped, days = {}, []
-    for name, (lo, hi) in periods.items():
+    for name, (lo, hi) in periods.items():  # the run's own days only: gaps between periods stay out
         lo = max(lo, start)
         ds = store.trading_days(lo, hi) if lo <= hi else []
         clipped[name] = (lo, hi, ds)
@@ -86,13 +88,27 @@ def _window_periods(periods: Periods, older_cutoff: date, store: PriceStore) -> 
         return None
     if all(ds for _, _, ds in clipped.values()):
         return Periods(**{n: (lo, hi) for n, (lo, hi, _) in clipped.items()})
-    a, b = len(days) // 3, 2 * len(days) // 3
-    return Periods(train=(days[0], days[a - 1]), validation=(days[a], days[b - 1]),
-                   holdout=(days[b], days[-1]))
+    # a period's range must not span dates that were never part of the run (gaps between the
+    # original periods), so chunks are cut inside the surviving period(s), never across a gap
+    segs = [ds for _, _, ds in clipped.values() if ds]
+    if len(segs) == 1:
+        d, a, b = segs[0], len(segs[0]) // 3, 2 * len(segs[0]) // 3
+        chunks = [d[:a], d[a:b], d[b:]]
+    else:  # two surviving periods: split the longer one in half
+        i = max(range(2), key=lambda k: (len(segs[k]), -k))
+        h = len(segs[i]) // 2
+        parts = [segs[i][:h], segs[i][h:]]
+        chunks = parts + [segs[1]] if i == 0 else [segs[0]] + parts
+    return Periods(*[(c[0], c[-1]) for c in chunks])
 
 
 def _dirname(model: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "_", model).strip(".") or "model"
+    """A single safe path component for `model`. A name that needed any change gets a short
+    hash of the raw name, so 'a/b' and 'a_b' (or '../x') never collide or leave older_model/."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", model).strip(".")
+    if safe and safe == model:
+        return safe
+    return f"{safe or 'model'}-{hashlib.sha256(model.encode('utf-8')).hexdigest()[:8]}"
 
 
 def run_older_model_check(cfg: BacktestConfig, older_model: str, older_cutoff: date,
@@ -120,8 +136,20 @@ def run_older_model_check(cfg: BacktestConfig, older_model: str, older_cutoff: d
     settings = s.model_copy(update={"model": older_model, "model_cutoff": older_cutoff})
     ocfg = BacktestConfig(periods, settings, cfg.limits, False, cfg.dry_run)
     sub = Path(run_dir) / "older_model" / _dirname(older_model)
+    if budget_usd is None:
+        # the run's ONE hard cap: what remains after the backtest, control, autoresearch, probe and
+        # every other older-model check; this model's own earlier spend is restored by the runner
+        from atlas.cli import _load_checkpoint, spend_so_far
+        own = float((_load_checkpoint(Checkpoint(sub / "checkpoint.json")) or {}).get("spent_usd", 0.0))
+        spent = sum(spend_so_far(Path(run_dir)).values()) - own
+        cap = s.budget_usd - spent
+        if cap <= 0:
+            raise OlderModelUnavailable(
+                f"older-model check with {older_model} not run: LLM budget exhausted (${spent:.2f} of "
+                f"${s.budget_usd:.2f} already spent on this run); raise budget_usd")
+    else:
+        cap = budget_usd
     sub.mkdir(parents=True, exist_ok=True)
-    cap = s.budget_usd if budget_usd is None else budget_usd
     llm = CachedLLM(setup.client, sub / "llm_cache.sqlite", older_model,
                     (s.usd_per_mtok_input, s.usd_per_mtok_output), cap)
     failures = FailureLog(sub / "failures.sqlite")
