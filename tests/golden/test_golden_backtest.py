@@ -709,3 +709,92 @@ def test_ablation_uses_the_days_weights_gross_match_and_skips_skipped_days(tmp_p
     assert out["train"]["cio_total"] == pytest.approx(tot(cio), rel=1e-12)
     assert out["all"] == out["train"]
     assert out["validation"] is None and out["holdout"] is None
+
+
+# ---------------------------------------------------------------------------- fix round 2
+
+def test_backtest_resume_counts_control_and_autoresearch_spend_against_the_cap(golden, tmp_path, keys, capsys):
+    from atlas.cli import spend_so_far
+    conf = write_config(tmp_path / "a.yaml", tmp_path / "run", golden["repo"], periods=SHORT_PERIODS,
+                        budget_usd=0.2)
+    assert cli(["backtest", "--config", conf, "--yes"], GoldenStub()) == 1  # paused on the budget
+    assert "budget" in "".join(capsys.readouterr())
+    (tmp_path / "run" / "autoresearch_log.jsonl").write_text(json.dumps({"cost_usd": 0.2}) + "\n")
+    (tmp_path / "run" / "control.json").write_text(json.dumps({"spent_usd": 0.05, "days": 0}))
+    conf2 = write_config(tmp_path / "b.yaml", tmp_path / "run", golden["repo"], periods=SHORT_PERIODS,
+                         budget_usd=0.5)
+    assert cli(["backtest", "--config", conf2, "--yes"], GoldenStub()) in (0, 1)
+    total = sum(spend_so_far(tmp_path / "run").values())
+    assert total <= 0.5 + 1e-9
+    # an exhausted combined budget refuses to start, before any call
+    (tmp_path / "run" / "autoresearch_log.jsonl").write_text(json.dumps({"cost_usd": 0.6}) + "\n")
+    stub = GoldenStub()
+    assert cli(["backtest", "--config", conf2, "--yes"], stub) == 1
+    assert "budget exhausted" in "".join(capsys.readouterr()) and stub.calls == 0
+
+
+def test_unknown_key_that_looks_like_a_secret_is_not_echoed(golden, tmp_path, capsys):
+    canary = "sk-ant-api03-CANARYCANARYCANARY0123456789"
+    conf = write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"], settings={canary: 1})
+    assert cli(["backtest", "--config", conf, "--dry-run"]) == 2
+    text = "".join(capsys.readouterr())
+    assert "unknown key" in text and canary not in text and "CANARYCANARY" not in text
+    assert "settings.sk-ant-api03…" in text
+
+
+def test_truncated_final_autoresearch_log_line_is_tolerated_but_earlier_corruption_is_not(golden, tmp_path, capsys):
+    run_dir, conf = copy_run(golden, tmp_path)
+    good = {"agent": "sector_energy", "branch": None, "n_days": 0, "old_ic": None, "new_ic": None,
+            "diff": None, "keep_margin": None, "decision": "rejected", "reason": "x", "commit_sha": None,
+            "cost_usd": 0.5}
+    log = run_dir / "autoresearch_log.jsonl"
+    log.write_text(json.dumps(good) + "\n" + '{"agent": "sector_ene')
+    assert cli(["report", "--run-dir", run_dir]) == 0
+    text = "".join(capsys.readouterr())
+    assert "truncated final line 2" in text and "Traceback" not in text
+    assert "sector_energy: **rejected**" in (run_dir / "report" / "report.md").read_text()
+    log.write_text('{"agent": "sector_ene\n' + json.dumps(good) + "\n")
+    assert cli(["report", "--run-dir", run_dir]) == 1
+    text = "".join(capsys.readouterr())
+    assert f"autoresearch log is corrupt at line 1: {log}" in text and "Traceback" not in text
+
+
+def test_autoresearch_sets_a_torn_log_tail_aside_before_appending(golden, tmp_path, keys, monkeypatch):
+    import atlas.autoresearch.loop as loop_mod
+    run_dir, conf = copy_run(golden, tmp_path)
+    log = run_dir / "autoresearch_log.jsonl"
+    log.write_text('{"agent": "x", "cost_usd": 0.1}\n{"agent": "tor')
+    monkeypatch.setattr(loop_mod, "run_autoresearch", lambda *a, **k: [])
+    assert cli(["autoresearch", "--config", conf], GoldenStub()) == 0
+    assert log.read_text() == '{"agent": "x", "cost_usd": 0.1}\n'
+    assert (run_dir / "autoresearch_log.jsonl.torn").read_text() == '{"agent": "tor\n'
+
+
+def test_null_test_parameters_are_recorded_and_printed(golden, tmp_path, keys, monkeypatch):
+    import atlas.autoresearch.loop as loop_mod
+    run_dir, conf = copy_run(golden, tmp_path)
+    seen = {}
+
+    def fake_loop(cfg, *, null_test_meta=None, **kw):
+        seen["meta"] = null_test_meta
+        return []
+
+    monkeypatch.setattr(loop_mod, "run_autoresearch", fake_loop)
+    assert cli(["autoresearch", "--config", conf], GoldenStub()) == 0
+    meta = seen["meta"]
+    assert {k: meta[k] for k in ("seed", "n_shuffles", "window", "train_max_date")} == \
+        {"seed": 7, "n_shuffles": 200, "window": 20, "train_max_date": "2024-01-18"}
+    assert meta["keep_margin"] > 0
+    assert cli(["calibrate", "--config", conf]) == 0
+    cal = json.loads((run_dir / "calibration.json").read_text())
+    assert (cal["seed"], cal["n_shuffles"], cal["window"], cal["train_max_date"]) == (7, 200, 20, "2024-01-18")
+    rec = {"agent": "sector_energy", "branch": None, "n_days": 0, "old_ic": None, "new_ic": None, "diff": None,
+           "keep_margin": 0.6, "decision": "uncalibrated", "reason": "x", "commit_sha": None, "cost_usd": 0.0}
+    (run_dir / "autoresearch_log.jsonl").write_text(
+        json.dumps({**rec, "null_test": {**meta, "seed": 7}}) + "\n"
+        + json.dumps({**rec, "null_test": {**meta, "seed": 8}}) + "\n" + json.dumps(rec) + "\n")
+    assert cli(["report", "--run-dir", run_dir]) == 0
+    sec = (run_dir / "report" / "report.md").read_text().split("## Null test")[1].split("## CIO ablation")[0]
+    assert "- Calibration: seed 7, n_shuffles 200, window 20, train picks up to 2024-01-18" in sec
+    assert "seed 8" in sec and "parameters not recorded" in sec
+    assert "WARNING: autoresearch used 3 different null-test configurations" in sec

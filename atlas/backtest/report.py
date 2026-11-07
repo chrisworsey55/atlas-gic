@@ -192,7 +192,9 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                  final_weights: dict[str, float] | None = None,
                  dropped_picks: pd.DataFrame | None = None,
                  turnover: dict[str, float] | None = None,
-                 ablation_by_period: dict[str, dict | None] | None = None) -> Path:
+                 ablation_by_period: dict[str, dict | None] | None = None,
+                 null_meta: dict | None = None, null_source: str | None = None,
+                 autoresearch_null_meta: list[dict | None] | None = None) -> Path:
     """`ablation_by_period` (optional, period name -> ablation dict or None, plus "all") renders
     the CIO ablation per period with the holdout as the headline; without it the single
     `ablation` dict is shown as before."""
@@ -366,7 +368,20 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
             n_shuf = "n/a"
         md += [f"- Dead zone: {_try(null.dead_zone)}", f"- Keep margin: {_try(null.keep_margin)}",
                f"- Null |IC| 95th percentile: {_try(lambda: null.quantile(0.95))}",
-               f"- Number of shuffles: {n_shuf}", ""]
+               f"- Number of shuffles: {n_shuf}"]
+        md.append(f"- Calibration: {_meta_text(null_meta)}" + (f" (source: {null_source})" if null_source else ""))
+        md.append("")
+    if autoresearch_null_meta:
+        distinct = []
+        for m in autoresearch_null_meta:
+            if m not in distinct:
+                distinct.append(m)
+        md.append("Autoresearch keep margins were calibrated with: "
+                  + "; ".join(_meta_text(m, with_margin=True) for m in distinct) + ".")
+        if len([m for m in distinct if m is not None]) > 1:
+            md.append(f"**WARNING: autoresearch used {len(distinct)} different null-test configurations "
+                      "(seed shopping makes a lucky keep margin more likely).**")
+        md.append("")
 
     # ---- ablation
     md += ["## CIO ablation\n"]
@@ -412,6 +427,16 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     path = out_dir / "report.md"
     path.write_text("\n".join(md), encoding="utf-8")
     return path
+
+
+def _meta_text(m: dict | None, with_margin: bool = False) -> str:
+    if not m:
+        return "parameters not recorded"
+    out = (f"seed {m.get('seed')}, n_shuffles {m.get('n_shuffles')}, window {m.get('window')}, "
+           f"train picks up to {m.get('train_max_date')}")
+    if with_margin:
+        out += f", keep_margin {_f(m.get('keep_margin'))}"
+    return out
 
 
 def _ablation_line(a: dict | None) -> str:

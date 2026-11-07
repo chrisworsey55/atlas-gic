@@ -347,6 +347,9 @@ class EditRecord:
     reason: str
     commit_sha: str | None
     cost_usd: float
+    # how keep_margin was calibrated (seed, n_shuffles, window, train_max_date, ...): recorded so
+    # re-running with different null-test seeds until a lucky margin appears is visible
+    null_test: dict | None = None
 
 
 def _num(x: float | None) -> float | None:
@@ -410,7 +413,7 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
                      make_run_one_day: Callable[[str], RunOneDay], keep_margin: float | None,
                      run_dir: Path, horizon: int = 1,
                      failure_notes: Callable[[str], str] | None = None,
-                     n_replay_days: int = 60) -> list[EditRecord]:
+                     n_replay_days: int = 60, null_test_meta: dict | None = None) -> list[EditRecord]:
     """Run up to cfg.max_edits attempts; see the module docstring.
 
     `scores` is the backtest's ScoreStore (anything with ``picks_frame``): target selection
@@ -439,6 +442,8 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
     last: str | None = None
 
     def emit(rec: EditRecord) -> None:
+        if null_test_meta is not None:
+            rec.null_test = dict(null_test_meta)
         _append(log_path, rec)
         records.append(rec)
 

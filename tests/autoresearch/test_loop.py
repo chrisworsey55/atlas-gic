@@ -494,7 +494,8 @@ def test_log_line_written_per_attempt(tmp_path, prompt_repo):
     lines = log_lines(tmp_path)
     assert len(lines) == 2
     assert set(lines[0]) == {"agent", "branch", "n_days", "old_ic", "new_ic", "diff", "keep_margin",
-                             "decision", "reason", "commit_sha", "cost_usd"}
+                             "decision", "reason", "commit_sha", "cost_usd", "null_test"}
+    assert lines[0]["null_test"] is None  # optional: set when run_autoresearch gets null_test_meta
     assert lines[0]["agent"] == recs[0].agent and lines[0]["branch"] == "autoresearch/agent_a-0"
     assert lines[1]["branch"] == "autoresearch/agent_b-1"
     assert lines[0]["keep_margin"] == 10.0 and lines[0]["cost_usd"] > 0
@@ -800,3 +801,11 @@ def test_anonymised_replay_uses_label_and_opaque_tickers_and_hits_backtest_cache
         fn1(d, PROMPT_A + NEW_SUFFIX)
     assert len(live) == n_backtest + 3 and all(x[1].startswith("day ") for x in live)
     assert set(seen) <= set(real) and seen  # the scorer sees real tickers
+
+
+def test_null_test_meta_is_recorded_in_every_log_line(tmp_path, prompt_repo):
+    meta = {"seed": 3, "n_shuffles": 50, "window": 60, "train_max_date": "2024-03-01", "keep_margin": 10.0}
+    recs = run(tmp_path, prompt_repo, cfg=settings(max_edits=2), keep_margin=10.0, null_test_meta=meta)
+    lines = log_lines(tmp_path)
+    assert len(lines) == 2 and all(line["null_test"] == meta for line in lines)
+    assert all(r.null_test == meta for r in recs)

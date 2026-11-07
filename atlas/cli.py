@@ -62,6 +62,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -211,6 +212,18 @@ def _errors(e: ValidationError) -> str:
                      for err in e.errors())
 
 
+_NORMAL_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _safe_key(key) -> str:
+    """An unknown key as printable text: a long or key-like name (maybe a pasted secret) is
+    shown as its first 12 characters + '…' only."""
+    k = str(key)
+    if len(k) > 24 or k.startswith("sk-") or not _NORMAL_KEY.fullmatch(k):
+        return k[:12] + "…"
+    return k
+
+
 def _did_you_mean(key: str, valid) -> str:
     close = difflib.get_close_matches(str(key), sorted(valid), n=1, cutoff=0.6)
     return f" (did you mean {close[0]!r}?)" if close else ""
@@ -226,10 +239,10 @@ def _unknown_keys(raw, model: type[BaseModel], prefix: str = "") -> list[str]:
     for k, v in raw.items():
         name = f"{prefix}{k}"
         if k not in fields:
-            out.append(f"{name}{_did_you_mean(k, fields)}")
+            out.append(f"{prefix}{_safe_key(k)}{_did_you_mean(k, fields)}")
             continue
         if model is RunConfig and k == "settings" and isinstance(v, dict):
-            out += [f"settings.{sk}{_did_you_mean(sk, Settings.model_fields)}"
+            out += [f"settings.{_safe_key(sk)}{_did_you_mean(sk, Settings.model_fields)}"
                     for sk in v if sk not in Settings.model_fields]
             continue
         ann = fields[k].annotation
@@ -558,17 +571,70 @@ def stored_run(rc: RunConfig, run: Run, command: str) -> dict:
     return stored
 
 
+_WARNED_TORN: set[str] = set()
+
+
+def read_ar_log(path: Path) -> list[dict]:
+    """autoresearch_log.jsonl records. A malformed FINAL line (a crash mid-write) is ignored
+    with one warning; a malformed earlier line is corruption: OperationalError."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    last = max((i for i, ln in enumerate(lines) if ln.strip()), default=-1)
+    out = []
+    for i, ln in enumerate(lines):
+        if not ln.strip():
+            continue
+        try:
+            rec = json.loads(ln)
+            if not isinstance(rec, dict):
+                raise ValueError("not an object")
+        except ValueError:
+            if i == last:
+                if str(path) not in _WARNED_TORN:
+                    _WARNED_TORN.add(str(path))
+                    print(f"warning: ignoring a truncated final line {i + 1} of {path} (crash mid-write)",
+                          file=sys.stderr)
+                continue
+            raise OperationalError(f"autoresearch log is corrupt at line {i + 1}: {path}") from None
+        out.append(rec)
+    return out
+
+
+def _drop_torn_tail(path: Path) -> None:
+    """Before appending to the autoresearch log: set a truncated final line aside (to
+    <log>.torn) so the next record does not glue onto it and corrupt the log."""
+    path = Path(path)
+    if not path.exists():
+        return
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return
+    try:
+        json.loads(lines[-1])
+        if not lines[-1].endswith("\n"):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n")
+        return
+    except ValueError:
+        pass
+    with open(path.with_name(path.name + ".torn"), "a", encoding="utf-8") as f:
+        f.write(lines[-1].rstrip("\n") + "\n")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(lines[:-1]), encoding="utf-8")
+    os.replace(tmp, path)
+    print(f"note: moved a truncated final line of {path} to {path.name}.torn", file=sys.stderr)
+
+
 def spend_so_far(run_dir: Path) -> dict[str, float]:
     """LLM spend recorded in a run directory: backtest (checkpoint), control, autoresearch."""
     run_dir = Path(run_dir)
     raw = _load_checkpoint(Checkpoint(run_dir / CHECKPOINT)) or {}
     ctl = run_dir / CONTROL_STATE
-    ar = run_dir / AR_LOG
-    ar_cost = 0.0
-    if ar.exists():
-        for line in ar.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                ar_cost += float(json.loads(line).get("cost_usd") or 0.0)
+    ar_cost = sum((float(r.get("cost_usd") or 0.0) for r in read_ar_log(run_dir / AR_LOG)), 0.0)
     return {"backtest": float(raw.get("spent_usd", 0.0)),
             "control": float(json.loads(ctl.read_text())["spent_usd"]) if ctl.exists() else 0.0,
             "autoresearch": ar_cost}
@@ -623,6 +689,13 @@ def cmd_backtest(args, llm_client=None) -> int:
                 f"refusing to run. Restore the original config (recorded in {rc.path(RUN_CONFIG)}) to "
                 "resume, or use a new run_dir for the new configuration.")
     fresh = stored is None and not checkpoint.path.exists()
+    if not args.dry_run:  # one hard cap: control and autoresearch spend count against the backtest too
+        other = spend_so_far(rc.run_dir)
+        run.llm.budget_usd = max(0.0, run.settings.budget_usd - other["control"] - other["autoresearch"])
+        if sum(other.values()) >= run.settings.budget_usd and (lcd is None or lcd < max(run.trading_days())):
+            raise OperationalError(
+                f"LLM budget exhausted: ${sum(other.values()):.2f} of ${run.settings.budget_usd:.2f} already "
+                "spent on this run (backtest + control + autoresearch); raise budget_usd to continue")
     all_days = run.trading_days()
     todo = [d for d in all_days if lcd is None or d > lcd]
     n_agents = sum(1 for sp in run.specs if sp.kind != "control") + (1 if args.with_control else 0)
@@ -763,6 +836,15 @@ def cmd_calibrate(args, llm_client=None) -> int:
     print(f"wrote {rc.path(CALIBRATION)}. For pass 2 use a NEW run_dir with `calibration: "
           f"{rc.path(CALIBRATION)}` in its config.")
     return EXIT_OK
+
+
+NULL_META_KEYS = ("seed", "n_shuffles", "window", "train_max_date")
+
+
+def null_test_meta(rc: RunConfig, settings: Settings, safe_end: date | None) -> dict:
+    return {"seed": rc.null_test.seed, "n_shuffles": rc.null_test.n_shuffles,
+            "window": settings.rolling_ic_window,
+            "train_max_date": safe_end.isoformat() if safe_end else None}
 
 
 def null_from_calibration(cal: dict) -> NullDistribution:
@@ -919,6 +1001,8 @@ def cmd_autoresearch(args, llm_client=None) -> int:
         print(f"keep_margin: not calibrated ({type(e).__name__}: {e}); attempts will be recorded as "
               "'uncalibrated' and no edit can be kept")
     safe_end = last_safe_train_day(replay.all_days, run.periods, 1)
+    meta = {**null_test_meta(rc, run.settings, safe_end), "keep_margin": keep_margin}
+    _drop_torn_tail(rc.path(AR_LOG))
     rates, notes = train_failure_stats(run.failures, run.specs, run.periods, safe_end or run.periods.train[0],
                                        sorted(replay.history))
     try:
@@ -927,7 +1011,7 @@ def cmd_autoresearch(args, llm_client=None) -> int:
                                    failure_rates=rates, make_run_one_day=replay.run_one_day,
                                    keep_margin=keep_margin, run_dir=rc.run_dir, horizon=1,
                                    failure_notes=lambda a: notes.get(a, ""),
-                                   n_replay_days=rc.autoresearch.n_replay_days)
+                                   n_replay_days=rc.autoresearch.n_replay_days, null_test_meta=meta)
     except DirtyWorkingTree as e:
         raise OperationalError(f"autoresearch refused: {e}") from None
     except InsufficientReplayDays as e:
@@ -1053,22 +1137,24 @@ def cmd_report(args, llm_client=None) -> int:
     result = result_from_checkpoint(raw, periods)
     scores = ScoreStore(run_dir / SCORES)
 
-    null, null_src = None, "not calibrated"
+    null, null_src, null_meta = None, "not calibrated", None
     for p in (run_dir / CALIBRATION, rc.calibration):
         if p is not None and Path(p).exists():
-            null, null_src = null_from_calibration(json.loads(Path(p).read_text())), str(p)
+            cal = json.loads(Path(p).read_text())
+            null, null_src = null_from_calibration(cal), str(p)
+            null_meta = {k: cal.get(k) for k in NULL_META_KEYS}
             break
     if null is None:
         try:
-            null, _ = train_null(scores, run, _cached_days(run))
+            null, safe_end = train_null(scores, run, _cached_days(run))
             null_src = "computed from this run's train picks"
+            null_meta = null_test_meta(rc, settings, safe_end)
         except (ValueError, LeakageSuspected, OperationalError) as e:
             null_src = f"not computable ({type(e).__name__})"
-    edits = []
-    if (run_dir / AR_LOG).exists():
-        for line in (run_dir / AR_LOG).read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                edits.append(EditRecord(**json.loads(line)))
+    known = set(EditRecord.__dataclass_fields__)
+    ar_records = read_ar_log(run_dir / AR_LOG)
+    edits = [EditRecord(**{k: v for k, v in r.items() if k in known}) for r in ar_records]
+    ar_metas = [r.get("null_test") for r in ar_records]
     failures = FailureLog(run_dir / FAILURES)
     spent = spend_so_far(run_dir)  # backtest + control + autoresearch: one total
     weights = WeightBook(run_dir / WEIGHTS).load()
@@ -1079,7 +1165,8 @@ def cmd_report(args, llm_client=None) -> int:
     ablation = by_period.get("holdout") if by_period else None
     path = build_report(result, scores, null, edits, ablation, None, failures.summary(),
                         sum(spent.values()), run_dir / "report", settings=settings,
-                        ablation_by_period=by_period,
+                        ablation_by_period=by_period, null_meta=null_meta, null_source=null_src,
+                        autoresearch_null_meta=ar_metas,
                         holdout_edit_ics=None, final_weights=final_weights,
                         dropped_picks=failures.dropped_picks_summary(), turnover=turnover)
     print(f"null distribution: {null_src}; CIO ablation: {'computed' if by_period else 'not provided'}; "
