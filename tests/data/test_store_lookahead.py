@@ -200,3 +200,40 @@ def test_outcome_prices_excludes_bars_after_end(store):
     store.outcome_prices("AAA", date(2024, 1, 8), date(2024, 2, 20))  # widen the cache
     s = store.outcome_prices("AAA", date(2024, 1, 8), date(2024, 1, 10))
     assert max(s.index) == date(2024, 1, 10)
+
+
+# ---------------------------------------------------------------------------- prefetch (I4)
+
+def _days(lo, hi):
+    return [lo + timedelta(days=i) for i in range((hi - lo).days + 1)]
+
+
+def test_prefetch_is_one_provider_call_and_daily_snapshots_then_fetch_nothing(prov, store):
+    missing = store.prefetch(TICKERS, date(2023, 12, 1), date(2024, 2, 20))
+    assert missing == [] and len(prov.calls) == 1 and set(prov.calls[0][0]) == set(TICKERS)
+    for d in _days(date(2024, 1, 2), date(2024, 2, 20)):
+        store.snapshot(d, TICKERS, lookback_days=20)
+    assert len(prov.calls) == 1  # no daily re-download of a growing range
+    assert store.prefetch(TICKERS, date(2023, 12, 1), date(2024, 2, 20)) == [] and len(prov.calls) == 1
+
+
+def test_prefetch_does_not_change_any_snapshot(tmp_path):
+    a = PriceStore(FakePrices(), FakeMacro(), tmp_path / "a")
+    b = PriceStore(FakePrices(), FakeMacro(), tmp_path / "b")
+    b.prefetch(TICKERS, date(2023, 12, 1), date(2024, 3, 25))
+    for d in _days(date(2023, 12, 20), date(2024, 3, 25)):
+        sa, sb = a.snapshot(d, TICKERS, 20, ["X"]), b.snapshot(d, TICKERS, 20, ["X"])
+        pd.testing.assert_frame_equal(sa.prices, sb.prices, check_dtype=False)
+        assert sb.prices.empty or sb.prices["date"].max() <= d
+        assert sa.macro.keys() == sb.macro.keys()
+
+
+def test_prefetch_reports_tickers_with_no_bar_in_the_range(tmp_path):
+    class Partial(FakePrices):
+        def fetch(self, tickers, start, end):
+            df = super().fetch([t for t in tickers if t != "BBB"], start, end)
+            return df
+
+    s = PriceStore(Partial(), FakeMacro(), tmp_path / "c")
+    assert s.prefetch(["SPY", "BBB", "AAA"], date(2024, 1, 1), date(2024, 2, 20)) == ["BBB"]
+    assert s.prefetch(["SPY"], date(2025, 1, 1), date(2025, 2, 1)) == ["SPY"]  # no bar in that range

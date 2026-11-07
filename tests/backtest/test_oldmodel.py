@@ -261,3 +261,44 @@ def test_resplit_never_spans_dates_that_were_not_part_of_the_run():
     # one surviving period is split in thirds
     one = _window_periods(per, date(2024, 2, 1), store)
     assert [d for _, (lo, hi) in one.items() for d in weekdays(lo, hi)] == weekdays(date(2024, 2, 5), date(2024, 2, 9))
+
+
+def test_older_model_is_priced_with_its_own_table_entry_not_the_main_models(main_run, run_copy):
+    from atlas.engine.llm import LLMResponse
+    cfg, setup = setup_for(main_run["conf"], None)
+    # main model priced at $3/$15 explicitly; the older model is a known table entry ($1/$5)
+    cfg = dataclasses.replace(cfg, settings=cfg.settings.model_copy(
+        update={"older_usd_per_mtok_input": None, "older_usd_per_mtok_output": None}))
+
+    class Fixed:
+        def complete(self, system, user, max_tokens):
+            r = StubClient(GoldenStub()).complete(system, user, max_tokens)
+            return LLMResponse(r.text, 1_000, 100, r.stop_reason)
+
+    setup.client = Fixed()
+    res = run_older_model_check(cfg, "claude-haiku-4-5", date(2024, 2, 12), setup, run_dir=run_copy)
+    calls = sum(len(d.results) for d in res.day_results.values())
+    assert res.spent_usd == pytest.approx(calls * (1_000 * 1.0 + 100 * 5.0) / 1e6)
+
+
+def test_unknown_older_model_without_prices_is_refused_before_any_call(main_run, run_copy):
+    calls = []
+    cfg, setup = setup_for(main_run["conf"], StubClient(lambda s, u: calls.append(1)))
+    cfg = dataclasses.replace(cfg, settings=cfg.settings.model_copy(
+        update={"older_usd_per_mtok_input": None, "older_usd_per_mtok_output": None}))
+    with pytest.raises(OlderModelUnavailable) as ei:
+        run_older_model_check(cfg, "claude-old-unknown", date(2024, 1, 12), setup, run_dir=run_copy)
+    assert "older_usd_per_mtok_input" in str(ei.value) and not calls
+    assert not (run_copy / "older_model").exists()
+
+
+def test_older_model_fatal_api_error_is_a_clear_error(main_run, run_copy):
+    from atlas.engine.llm import FatalApiError
+
+    def rejected(system, user):
+        raise FatalApiError(404, "not_found_error", "model: claude-ghost")
+
+    cfg, setup = setup_for(main_run["conf"], StubClient(rejected))
+    with pytest.raises(OlderModelUnavailable) as ei:
+        run_older_model_check(cfg, "claude-ghost", date(2024, 1, 12), setup, run_dir=run_copy)
+    assert "HTTP 404" in str(ei.value) and "claude-ghost" in str(ei.value)

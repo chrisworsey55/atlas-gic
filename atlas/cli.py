@@ -89,15 +89,17 @@ from atlas.backtest.nulltest import LeakageSuspected, NullDistribution, null_tes
 from atlas.backtest.predlog import PredictionLog
 from atlas.backtest.runner import (
     BENCHMARK, DRY_RUN_RESPONSE, HISTORY_NAME, LIMITATIONS, WEIGHTED_KINDS, BacktestConfig,
-    BacktestResult, CostConfirmationRequired, Periods, ResumeRefused, RunPaused, _filter,
-    estimate_cost, read_day_history, run_backtest,
+    BacktestResult, CostConfirmationRequired, MissingPriceData, Periods, ResumeRefused, RunPaused, _filter,
+    estimate_cost, preflight_prices, read_day_history, required_tickers, run_backtest,
 )
-from atlas.config import AgentSpec, Limits, Settings, load_agents, load_limits
+from atlas.config import (
+    SHIPPED_MODEL_CUTOFF, AgentSpec, Limits, Settings, UnknownModelPrice, load_agents, load_limits,
+)
 from atlas.data.csv_provider import CacheOnlyPrices, CsvPriceProvider, NoMacro
 from atlas.data.fred_provider import FredFetchError
 from atlas.data.store import PriceStore
 from atlas.engine.failures import CALL_FAILURE, FailureLog
-from atlas.engine.llm import BudgetExceeded, CachedLLM, LLMResponse, StubClient
+from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, StubClient
 from atlas.engine.pipeline import Pipeline
 from atlas.portfolio.models import Portfolio
 from atlas.portfolio.simbroker import SimBroker
@@ -320,9 +322,29 @@ def resolve_settings(rc: RunConfig) -> Settings:
             raise UsageError("set either settings.dead_zone or calibration in the run config, not both")
         merged["dead_zone"] = float(read_calibration(rc.calibration)["dead_zone"])
     try:
-        return Settings(**merged)
+        settings = Settings(**merged)
     except ValidationError as e:
         raise UsageError(f"invalid settings: {_errors(e)}") from None
+    require_prices(settings)
+    if settings.model_cutoff == SHIPPED_MODEL_CUTOFF:
+        print(f"warning: settings.model_cutoff {SHIPPED_MODEL_CUTOFF} is the shipped placeholder, not the "
+              f"documented training-data cutoff of {settings.model}; the verdict rests on it. Set "
+              "settings.model_cutoff in the run config.", file=sys.stderr)
+    return settings
+
+
+def require_prices(settings: Settings) -> tuple[float, float]:
+    """The model's prices (per-model table or explicit); an unpriced model is a usage error
+    because the budget cap could not be enforced."""
+    try:
+        return settings.prices()
+    except UnknownModelPrice as e:
+        raise UsageError(str(e)) from None
+
+
+def anthropic_client(settings: Settings):
+    from atlas.engine.llm import AnthropicClient
+    return AnthropicClient(settings.model, effort=settings.effort)
 
 
 def resolve_periods(rc: RunConfig) -> Periods:
@@ -480,12 +502,12 @@ def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = No
             if dry_run:
                 client = _NoCalls()
             else:
-                from atlas.engine.llm import AnthropicClient
-                client = AnthropicClient(settings.model)
-        run.llm = CachedLLM(client, rc.llm_cache_path, settings.model,
-                            (settings.usd_per_mtok_input, settings.usd_per_mtok_output), settings.budget_usd)
+                client = anthropic_client(settings)
+        run.llm = CachedLLM(client, rc.llm_cache_path, settings.model, require_prices(settings),
+                            settings.budget_usd)
         run.failures = FailureLog(rc.path(failures_name))
-        run.pipeline = Pipeline(specs, prompts, run.llm, run.failures, run.universe, settings.min_valid_agents)
+        run.pipeline = Pipeline(specs, prompts, run.llm, run.failures, run.universe, settings.min_valid_agents,
+                                max_tokens=settings.max_output_tokens)
     return run
 
 
@@ -514,7 +536,8 @@ def _last_completed(checkpoint: Checkpoint) -> date | None:
 # directory (prefix match on the flattened key): where the directory is, how the null test /
 # autoresearch are run, the response-cache location, the spend cap and confirmation ceiling.
 ALLOWED_DRIFT = ("run_config.run_dir", "run_config.null_test", "run_config.autoresearch",
-                 "run_config.llm_cache", "settings.budget_usd", "settings.confirm_cost_usd", "macro_series")
+                 "run_config.llm_cache", "settings.budget_usd", "settings.confirm_cost_usd",
+                 "settings.max_output_tokens", "macro_series")
 
 
 def run_record(rc: RunConfig, run: Run) -> dict:
@@ -641,6 +664,14 @@ def _drop_torn_tail(path: Path) -> None:
     print(f"note: moved a truncated final line of {path} to {path.name}.torn", file=sys.stderr)
 
 
+def _read_json_file(path: Path):
+    """A small JSON state file; a corrupt one is an operational error naming the file."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise OperationalError(f"{Path(path).name} is corrupt: {path}") from None
+
+
 def _read_spend(path: Path) -> float:
     """spent_usd of a small spend file (control.json, probe.json); 0 if absent."""
     if not path.exists():
@@ -732,6 +763,11 @@ def cmd_backtest(args, llm_client=None) -> int:
                 f"LLM budget exhausted: ${sum(other.values()):.2f} of ${run.settings.budget_usd:.2f} already "
                 "spent on this run (backtest + control + autoresearch + probe + older-model checks); raise budget_usd to continue")
     all_days = run.trading_days()
+    try:  # the whole range once, before any spend; a ticker with no bar at all is an error
+        preflight_prices(run.store, required_tickers(run.universe, run.specs), all_days[0], all_days[-1],
+                         rc.data.lookback_days)
+    except MissingPriceData as e:
+        raise OperationalError(str(e)) from None
     todo = [d for d in all_days if lcd is None or d > lcd]
     n_agents = sum(1 for sp in run.specs if sp.kind != "control") + (1 if args.with_control else 0)
     est = estimate_cost(cfg, len(todo), n_agents)
@@ -766,6 +802,8 @@ def cmd_backtest(args, llm_client=None) -> int:
     except CostConfirmationRequired as e:  # belt and braces: the estimate is checked above
         print(f"{e} (use --yes)", file=sys.stderr)
         return EXIT_USAGE
+    except MissingPriceData as e:  # the runner's own preflight (library entry), same message
+        raise OperationalError(str(e)) from None
     if stored != record:  # resumed with only ALLOWED_DRIFT changes, or a pre-record checkpoint
         _write_json(rc.path(RUN_CONFIG), record)
     spent = result.spent_usd
@@ -803,14 +841,15 @@ def run_control_pass(run: Run, scores: ScoreStore, result: BacktestResult, all_d
         remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev
                         - _spent_by(other, "autoresearch", "probe", "older_model"))
         llm = CachedLLM(run.llm.client, run.rc.llm_cache_path, run.settings.model,
-                        (run.settings.usd_per_mtok_input, run.settings.usd_per_mtok_output), remaining)
+                        require_prices(run.settings), remaining)
     last = max(result.equity.index)
     days = [d for d in all_days if d <= last]
     done = 0
     try:
         for d in days:
             scores.record_picks(run_control_agent(d, run.universe, run.prompts[spec.name], llm,
-                                                  run.failures, spec=spec))
+                                                  run.failures, spec=spec,
+                                                  max_tokens=run.settings.max_output_tokens))
             done += 1
     finally:
         _write_json(state_path, {"spent_usd": prev + llm.spent_usd, "days": done})
@@ -1017,6 +1056,12 @@ def cmd_autoresearch(args, llm_client=None) -> int:
         raise UsageError(f"repo {rc.prompt_repo} is not usable as a git repository: {e}") from None
     except DirtyWorkingTree as e:
         raise OperationalError(f"autoresearch refused: {e} (in {rc.prompt_repo})") from None
+    try:
+        branch = GitOps(rc.prompt_repo).current_branch()
+    except GitError as e:  # detached HEAD
+        raise OperationalError(f"autoresearch refused: {e} (in {rc.prompt_repo})") from None
+    print(f"autoresearch: kept edits are merged into the checked-out branch '{branch}' of {rc.prompt_repo} "
+          "(run it from a dedicated branch of a clean checkout)")
     run = build_run(rc, fred_key=fred_key, llm_client=llm_client)
     stored_run(rc, run, "autoresearch")  # train/holdout split and settings of the STORED run (ruling U)
     replay = _make_replay(run)
@@ -1183,9 +1228,12 @@ def cmd_report(args, llm_client=None) -> int:
     null, null_src, null_meta = None, "not calibrated", None
     for p in (run_dir / CALIBRATION, rc.calibration):
         if p is not None and Path(p).exists():
-            cal = json.loads(Path(p).read_text())
-            null, null_src = null_from_calibration(cal), str(p)
-            null_meta = {k: cal.get(k) for k in NULL_META_KEYS}
+            cal = _read_json_file(Path(p))
+            try:
+                null, null_src = null_from_calibration(cal), str(p)
+                null_meta = {k: cal.get(k) for k in NULL_META_KEYS}
+            except (KeyError, TypeError, ValueError, AttributeError):
+                raise OperationalError(f"{Path(p).name} is corrupt: {p}") from None
             break
     if null is None:
         try:
@@ -1292,16 +1340,14 @@ def cmd_probe(args, llm_client=None) -> int:
         raise OperationalError(f"LLM budget exhausted: ${sum(spent.values()):.2f} of ${settings.budget_usd:.2f} "
                                "already spent on this run (backtest + control + autoresearch + probe + "
                                "older-model checks); raise budget_usd")
-    est = samples * (settings.est_input_tokens_per_call * settings.usd_per_mtok_input
-                     + 100 * settings.usd_per_mtok_output) / 1e6
+    p_in, p_out = require_prices(settings)
+    est = samples * (settings.est_input_tokens_per_call * p_in + 100 * p_out) / 1e6
     if est > settings.confirm_cost_usd and not _confirm(est, settings.confirm_cost_usd, args.yes):
         return EXIT_USAGE
     client = llm_client
     if client is None:
-        from atlas.engine.llm import AnthropicClient
-        client = AnthropicClient(settings.model)
-    llm = CachedLLM(client, rc.llm_cache_path, settings.model,
-                    (settings.usd_per_mtok_input, settings.usd_per_mtok_output), remaining)
+        client = anthropic_client(settings)
+    llm = CachedLLM(client, rc.llm_cache_path, settings.model, (p_in, p_out), remaining)
     universe = list(dict.fromkeys(settings.universe))
     labels = probe_sector_labels(universe)
     chosen = probe_selection(pool, universe, samples, PROBE_SEED)
@@ -1313,7 +1359,8 @@ def cmd_probe(args, llm_client=None) -> int:
     failures = FailureLog(run_dir / PROBE_FAILURES)
     prev = _read_spend(run_dir / PROBE_STATE)
     try:
-        score = contamination_probe(items, llm, settings.tolerance_days, failures=failures)
+        score = contamination_probe(items, llm, settings.tolerance_days, failures=failures,
+                                    max_tokens=settings.max_output_tokens)
     finally:
         _write_json(run_dir / PROBE_STATE, {"spent_usd": prev + llm.spent_usd})
     chance_d, chance_t = chance_rates(settings.tolerance_days, len(days), len(universe))
@@ -1401,13 +1448,19 @@ def main(argv: list[str] | None = None, *, llm_client=None) -> int:
         return int(e.code) if isinstance(e.code, int) else EXIT_USAGE
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    # urllib3 logs request lines at DEBUG, and the FRED request line carries api_key in its query
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
     try:
         return COMMANDS[args.command](args, llm_client=llm_client)
     except UsageError as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USAGE
-    except (OperationalError, ResumeRefused, FredFetchError) as e:
+    except (OperationalError, ResumeRefused, FredFetchError, MissingPriceData) as e:
         print(f"error: {e}", file=sys.stderr)
+        return EXIT_FAILED
+    except FatalApiError as e:  # never retried; the message is already sanitised
+        print(f"error: {e}. Nothing was retried and any checkpoint is intact: fix the cause (model name, "
+              "API key, settings such as effort) and re-run the same command.", file=sys.stderr)
         return EXIT_FAILED
 
 

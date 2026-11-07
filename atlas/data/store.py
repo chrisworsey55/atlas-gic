@@ -87,7 +87,10 @@ class PriceStore:
         if cov and cov[0] <= start and end <= cov[1]:
             return
         lo, hi = (min(start, cov[0]), max(end, cov[1])) if cov else (start, end)
-        new = self._prices.fetch([t], lo, hi)
+        self._merge(t, self._prices.fetch([t], lo, hi), lo, hi, cov)
+
+    def _merge(self, t: str, new: pd.DataFrame, lo: date, hi: date, cov: tuple[date, date] | None) -> None:
+        """Merge provider rows for t (requested range lo..hi) into its cache file."""
         new = new[new["ticker"] == t][PRICE_COLUMNS].copy() if len(new) else pd.DataFrame(columns=PRICE_COLUMNS)
         if new.empty:
             return  # empty/failed response: record no coverage, refetch next time
@@ -104,6 +107,30 @@ class PriceStore:
         self._frames.pop(t, None)
         self._adj.pop(t, None)  # never serve the pre-rewrite frame (mtime granularity)
         self._meta(t).write_text(json.dumps({"start": lo.isoformat(), "end": hi.isoformat()}))
+
+    def prefetch(self, tickers: Sequence[str], start: date, end: date) -> list[str]:
+        """Fill the cache for [start, end] for every ticker in ONE provider request (only the
+        tickers whose cache does not already cover the range), so a run does not re-download a
+        growing range every day. Returns the tickers that have NO bar at all in [start, end].
+
+        Safe for the no-lookahead rule: snapshot() only ever returns rows dated <= asof, and
+        forward data is already cached by scoring anyway."""
+        tickers = list(dict.fromkeys(tickers))
+        need = [t for t in tickers
+                if not ((cov := self._coverage(t)) and cov[0] <= start and end <= cov[1])]
+        if need:
+            covs = {t: self._coverage(t) for t in need}
+            lo = min([start] + [c[0] for c in covs.values() if c])
+            hi = max([end] + [c[1] for c in covs.values() if c])
+            new = self._prices.fetch(need, lo, hi)
+            for t in need:
+                self._merge(t, new, lo, hi, covs[t])
+        missing = []
+        for t in tickers:
+            df = self._parsed(t)
+            if df is None or not ((df["date"] >= start) & (df["date"] <= end)).any():
+                missing.append(t)
+        return missing
 
     # ---- as-of access ------------------------------------------------
     def snapshot(self, asof: date, tickers: list[str], lookback_days: int,

@@ -128,6 +128,7 @@ class CrashingCheckpoint(Checkpoint):
 def settings(**over):
     base = dict(universe=UNIVERSE, commission_per_share=0.005, commission_min=1.0, slippage_bps=SLIP_BPS,
                 min_valid_agents=8, rolling_ic_window=60, warmup_picks=3, budget_usd=1e9, model="m",
+                usd_per_mtok_input=3.0, usd_per_mtok_output=15.0,
                 model_cutoff=date(2023, 6, 1), dead_zone=0.0, confirm_cost_usd=1e9)
     base.update(over)
     return Settings(**base)
@@ -840,3 +841,73 @@ def test_day_history_survives_a_torn_line(tmp_path):
     h.write_text('{"day": "2024-01-0')  # crash mid-write of an earlier attempt
     env.run(history_path=h)
     assert sorted(read_day_history(h, env.checkpoint)) == WEEKDAYS[:3]
+
+
+# ---------------------------------------------------------------------------- final review fixes
+
+def test_fatal_api_error_propagates_is_not_a_pause_and_keeps_the_checkpoint(tmp_path):
+    from atlas.engine.llm import FatalApiError
+
+    def handler(name, u):
+        if u["asof"] == WEEKDAYS[2].isoformat():
+            raise FatalApiError(401, "authentication_error", "invalid x-api-key")
+        return default_handler(name, u)
+
+    env = Env(tmp_path, handler=handler, price=(1.0, 1.0))
+    with pytest.raises(FatalApiError):
+        env.run()
+    raw = env.checkpoint.load()
+    assert raw["last_completed_day"] == WEEKDAYS[1].isoformat()
+    assert raw["spent_usd"] == pytest.approx(env.llm.spent_usd) and raw["spent_usd"] > 0
+    assert env.predlog.head()[0] == 2  # nothing of the rejected day was logged
+
+
+class CountingPrices(FakePrices):
+    def __init__(self, gaps=(), drop=()):
+        super().__init__(gaps)
+        self.calls, self.drop = [], set(drop)
+
+    def fetch(self, tickers, start, end):
+        self.calls.append((tuple(tickers), start, end))
+        df = super().fetch([t for t in tickers if t not in self.drop], start, end)
+        return df
+
+
+def test_missing_ticker_fails_preflight_before_any_llm_call(tmp_path):
+    from atlas.backtest.runner import MissingPriceData
+    env = Env(tmp_path)
+    env.store = PriceStore(CountingPrices(drop={"XBB"}), FakeMacro(), tmp_path / "p2")
+    with pytest.raises(MissingPriceData) as ei:
+        env.run()
+    assert ei.value.tickers == ["XBB"] and "no price data for: XBB over" in str(ei.value)
+    assert env.calls == [] and not env.checkpoint.path.exists()
+
+
+def test_run_prefetches_the_whole_range_once_not_daily(tmp_path):
+    prov = CountingPrices()
+    env = Env(tmp_path, n_days=12)
+    env.store = PriceStore(prov, FakeMacro(), tmp_path / "p2")
+    env.broker._store = env.store
+    env.run()
+    multi = [i for i, c in enumerate(prov.calls) if len(c[0]) > 1]
+    assert len(multi) == 1 and set(prov.calls[multi[0]][0]) >= set(UNIVERSE)
+    # before it: the SPY calendar of each period; after it, only forward fetches past the run's
+    # last day (scoring / next-open fills at the tail), never a daily snapshot re-download
+    assert all(c[0] == ("SPY",) for c in prov.calls[:multi[0]])
+    last = WEEKDAYS[11]
+    assert all(end > last for _, _, end in prov.calls[multi[0] + 1:])
+
+
+def test_prefetch_leaves_the_run_identical(tmp_path):
+    a, b = Env(tmp_path / "a", n_days=9), Env(tmp_path / "b", n_days=9)
+    ra = a.run()
+    import atlas.backtest.runner as runner_mod
+    orig = runner_mod.preflight_prices
+    try:
+        runner_mod.preflight_prices = lambda *x, **k: None  # the pre-fix behaviour: no pre-fetch
+        rb = b.run()
+    finally:
+        runner_mod.preflight_prices = orig
+    pd.testing.assert_series_equal(ra.equity, rb.equity)
+    assert a.predlog.path.read_bytes() == b.predlog.path.read_bytes()
+    assert sorted(a.calls) == sorted(b.calls)  # identical inputs (snapshots) to every agent

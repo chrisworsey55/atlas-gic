@@ -11,6 +11,11 @@ universe: [SPY, SMH, XLF, XLE, XLV, AAA, BBB, CCC]
 budget_usd: 50
 settings:
   model: golden-stub-model
+  # an unknown model must be priced explicitly (the budget cap counts tokens at these prices)
+  usd_per_mtok_input: 3.0
+  usd_per_mtok_output: 15.0
+  older_usd_per_mtok_input: 3.0
+  older_usd_per_mtok_output: 15.0
   model_cutoff: 2024-01-31
   warmup_picks: 5
   rolling_ic_window: 20

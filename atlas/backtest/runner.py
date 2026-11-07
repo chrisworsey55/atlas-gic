@@ -37,7 +37,18 @@ fail or are not run; ``score_matured`` is idempotent; weights are restored from 
 checkpoint; and fills apply exactly once because the portfolio comes from the checkpoint.
 A log that cannot be reconciled with the checkpoint raises ``ResumeRefused``. A ``BudgetExceeded`` from the LLM layer also
 pauses: the checkpoint is re-saved with the spend and ``RunPaused`` (kind "budget") is
-raised from it.
+raised from it. A ``FatalApiError`` (the API rejected the request: HTTP 400/401/403/404, ...)
+is NOT a pause and NOT a transient failure: nothing of day T is committed, the last completed
+day's checkpoint is re-saved with the spend so far, and the error propagates unretried.
+
+Price data (I4): before the day loop (and before any LLM spend) the whole run range, plus the
+lookback, is fetched ONCE for the universe, SPY and the agents' benchmarks
+(``PriceStore.prefetch``), so days do not re-download a growing range; a ticker with no bar
+at all over the run raises ``MissingPriceData``. A ticker missing on a single day mid-run
+still simply drops out of that day's snapshot (known limitation).
+
+Determinism: replays are deterministic because identical inputs are served from the LLM
+response cache; no sampling parameter (temperature) is sent.
 
 ``BacktestResult.day_results`` only holds days executed by this invocation (a resumed run
 does not reconstruct earlier days' agent results; they are in the PredictionLog).
@@ -53,7 +64,7 @@ import os
 import tempfile
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -62,7 +73,7 @@ from atlas.backtest.checkpoint import Checkpoint, dump_date, load_date
 from atlas.backtest.predlog import PredictionLog
 from atlas.config import Limits, Settings
 from atlas.data.store import PriceStore, Snapshot
-from atlas.engine.llm import BudgetExceeded, CachedLLM, StubClient
+from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, StubClient
 from atlas.engine.pipeline import DayResult, Pipeline, _last_close, orders_from_targets
 from atlas.portfolio.models import Fill, Order, Portfolio
 from atlas.risk.layer import RiskLayer
@@ -80,6 +91,25 @@ WEIGHTED_KINDS = ("macro", "sector", "superinvestor")  # CIO/execution are score
 DRY_RUN_RESPONSE = json.dumps({"view": "neutral", "confidence": 0.0, "picks": []})
 
 LIMITATIONS = [
+    "model_cutoff: the shipped default (2026-06-01) is a PLACEHOLDER GUESS, and the whole verdict "
+    "rests on it (only days after it can be evidence). Set it from the documented training-data "
+    "cutoff of the exact model used.",
+    "Spend is an estimate: the budget cap counts tokens at configured per-model prices "
+    "(Settings.prices()), not Anthropic's bill (cache, platform and price changes are not "
+    "modelled); also set a spend limit on the Anthropic account.",
+    "No sampling settings are sent (current models reject temperature): determinism on replay "
+    "comes only from the response cache of identical inputs; an uncached re-run may differ.",
+    "Single-process only: fixed .tmp file names, no file locks and a non-thread-safe price memo; "
+    "run one process per run directory.",
+    "yfinance data can be stale, is adjusted as of today and may be throttled; a ticker missing "
+    "on a single day mid-run silently drops out of that day's snapshot.",
+    "The contamination probe's chance rate is approximate (overstated by about 7/5).",
+    "Looking at the same holdout repeatedly (especially after autoresearch edits and a pass-2 run) "
+    "is multiple testing: a pass on a re-used holdout is weaker evidence.",
+    "The null test permutes convictions across all rows and ignores within-day clustering, so its "
+    "thresholds are anti-conservative when picks cluster by day.",
+    "No live or paper trading exists: SimBroker only. The IBKR price provider is unverified "
+    "against a live gateway.",
     "Prices come from the provider adjusted as of today: adj_close and split-adjusted bars embed "
     "splits/dividends that happened after each simulated day (accepted data-level leak, ruling G); "
     "results are slightly optimistic.",
@@ -166,6 +196,32 @@ class ResumeRefused(RuntimeError):
     pass
 
 
+class MissingPriceData(RuntimeError):
+    """A ticker the run needs has no bar at all over the run range: fail before any spend."""
+
+    def __init__(self, tickers: list[str], lo: date, hi: date):
+        self.tickers, self.lo, self.hi = list(tickers), lo, hi
+        super().__init__(f"no price data for: {', '.join(tickers)} over {lo}..{hi} (check the ticker "
+                         "symbols and the price source; nothing was run)")
+
+
+def preflight_prices(store: PriceStore, tickers, first: date, last: date, lookback_days: int) -> None:
+    """Fetch [first - lookback, last] once for every ticker (one provider request), then raise
+    MissingPriceData for any ticker with no bar in [first, last]."""
+    tickers = list(dict.fromkeys(tickers))
+    store.prefetch(tickers, first - timedelta(days=int(lookback_days)), last)
+    missing = store.prefetch(tickers, first, last)  # covered now: no fetch, just the check
+    if missing:
+        raise MissingPriceData(missing, first, last)
+
+
+def required_tickers(universe, specs) -> list[str]:
+    """Universe, the SPY benchmark/calendar and every agent's benchmark."""
+    out = list(dict.fromkeys(universe))
+    out += [t for t in [BENCHMARK] + sorted({sp.benchmark for sp in specs if sp.benchmark}) if t not in out]
+    return out
+
+
 @dataclass
 class BacktestResult:
     equity: pd.Series
@@ -183,13 +239,13 @@ class BacktestResult:
 
 
 def estimate_cost(cfg: BacktestConfig, n_days: int, n_agents: int) -> float:
-    """Upper-level estimate from Settings pricing assumptions; 0 for a dry run. Ignores
+    """Upper-level estimate from Settings.prices() (per-model table or explicit prices); 0 for a dry run. Ignores
     cache hits and retries (cached days are free, retries cost extra)."""
     if cfg.dry_run:
         return 0.0
     s = cfg.settings
-    per_call = (s.est_input_tokens_per_call * s.usd_per_mtok_input
-                + s.est_output_tokens_per_call * s.usd_per_mtok_output) / 1e6
+    p_in, p_out = s.prices()  # UnknownModelPrice for an unpriced model
+    per_call = (s.est_input_tokens_per_call * p_in + s.est_output_tokens_per_call * p_out) / 1e6
     return float(n_days) * float(n_agents) * per_call
 
 
@@ -387,7 +443,7 @@ def _sha(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
-FINGERPRINT_SETTINGS = ("model", "dead_zone", "shrinkage_k", "warmup_picks", "rolling_ic_window",
+FINGERPRINT_SETTINGS = ("model", "effort", "dead_zone", "shrinkage_k", "warmup_picks", "rolling_ic_window",
                         "slippage_bps", "commission_per_share", "commission_min", "min_valid_agents")
 
 
@@ -433,6 +489,8 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
         if not ds:
             raise ValueError(f"{n} period {getattr(cfg.periods, n)} contains no trading days")
     all_days = sorted({d for ds in period_days.values() for d in ds})
+    preflight_prices(store, required_tickers(universe, pipeline.specs.values()), all_days[0], all_days[-1],
+                     lookback_days)
     if getattr(risk, "limits", None) != cfg.limits:
         raise ValueError("cfg.limits differ from the risk layer's limits; refusing to run")
     fingerprint = _fingerprint(cfg, pipeline, initial_cash, universe, universe_sectors,
@@ -538,6 +596,10 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                 day = active.run_day(T, pipe_in, weights, agent_state, asof_label=label)
             except BudgetExceeded as e:
                 raise pause(f"LLM budget exceeded: {e}", T, {}, "budget") from e
+            except FatalApiError:  # not a pause: commit nothing of T, keep the spend, propagate
+                committed.spent_usd = active_llm.spent_usd
+                checkpoint.save(committed.to_json())
+                raise
             failed = _pause_failed(active, day)
             if failed is not None:
                 raise pause(f"transient infrastructure failures decided the day ({day.skipped_reason})",

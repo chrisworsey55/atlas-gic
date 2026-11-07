@@ -28,7 +28,8 @@ from atlas.backtest.runner import (
 )
 from atlas.data.store import PriceStore
 from atlas.engine.failures import FailureLog
-from atlas.engine.llm import ApiError, BudgetExceeded, CachedLLM, LLMClient, RateLimited, Timeout
+from atlas.config import UnknownModelPrice
+from atlas.engine.llm import ApiError, BudgetExceeded, CachedLLM, FatalApiError, LLMClient, RateLimited, Timeout
 from atlas.engine.pipeline import Pipeline
 from atlas.scoring.store import ScoreStore
 from atlas.scoring.weights import WeightBook
@@ -133,7 +134,13 @@ def run_older_model_check(cfg: BacktestConfig, older_model: str, older_cutoff: d
         return None
 
     s = cfg.settings
-    settings = s.model_copy(update={"model": older_model, "model_cutoff": older_cutoff})
+    try:  # the OLDER model's own price (table entry or older_usd_per_mtok_*), never the main model's
+        older_prices = s.older_prices(older_model)
+    except UnknownModelPrice as e:
+        raise OlderModelUnavailable(f"older-model check with {older_model} not run: {e}") from None
+    settings = s.model_copy(update={"model": older_model, "model_cutoff": older_cutoff,
+                                    "usd_per_mtok_input": older_prices[0],
+                                    "usd_per_mtok_output": older_prices[1]})
     ocfg = BacktestConfig(periods, settings, cfg.limits, False, cfg.dry_run)
     sub = Path(run_dir) / "older_model" / _dirname(older_model)
     if budget_usd is None:
@@ -150,8 +157,7 @@ def run_older_model_check(cfg: BacktestConfig, older_model: str, older_cutoff: d
     else:
         cap = budget_usd
     sub.mkdir(parents=True, exist_ok=True)
-    llm = CachedLLM(setup.client, sub / "llm_cache.sqlite", older_model,
-                    (s.usd_per_mtok_input, s.usd_per_mtok_output), cap)
+    llm = CachedLLM(setup.client, sub / "llm_cache.sqlite", older_model, older_prices, cap)
     failures = FailureLog(sub / "failures.sqlite")
     pipeline = setup.make_pipeline(llm, failures)
     hint = (f"Check that '{older_model}' is a model name your API key can use "
@@ -174,6 +180,8 @@ def run_older_model_check(cfg: BacktestConfig, older_model: str, older_cutoff: d
             f"{hint}. The check can be resumed from {sub}") from None
     except (ApiError, RateLimited, Timeout) as e:
         raise OlderModelUnavailable(f"older model {older_model} is not reachable ({e}). {hint}") from None
+    except FatalApiError as e:
+        raise OlderModelUnavailable(f"older model {older_model}: {e}. {hint}") from None
     except BudgetExceeded as e:
         raise OlderModelUnavailable(f"older-model check with {older_model} stopped: LLM budget "
                                     f"exhausted ({e})") from None
