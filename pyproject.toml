@@ -18,6 +18,9 @@ dependencies = [
     "matplotlib",
 ]
 
+[project.scripts]
+atlas = "atlas.cli:main"
+
 [project.optional-dependencies]
 ibkr = ["ib_async"]
 dev = ["pytest", "hypothesis"]

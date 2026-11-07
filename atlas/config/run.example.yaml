@@ -1,0 +1,52 @@
+# Example run config for the `atlas` CLI. Copy it, edit it, then:
+#
+#   atlas backtest --config my_run.yaml --dry-run     # plumbing check: no keys, zero LLM calls
+#   atlas backtest --config my_run.yaml               # pass 1: real model, FROZEN weights
+#   atlas calibrate --config my_run.yaml              # null test -> <run_dir>/calibration.json
+#   atlas report --run-dir runs/pass1                 # report.md, equity.png, agents.csv, ...
+#
+# Pass 2 (adaptive weights): copy this file, set a NEW run_dir and
+# `calibration: runs/pass1/calibration.json`, and run `atlas backtest` again.
+#
+# Relative paths are relative to THIS file. Keys never go here: ANTHROPIC_API_KEY and
+# FRED_API_KEY are read from the environment only.
+
+run_dir: runs/pass1            # everything the run writes (checkpoint, logs, scores, report/)
+
+# Chronological, non-overlapping, inclusive. The holdout must start AFTER the model's
+# training cutoff (settings.model_cutoff); it is the only uncontaminated stretch.
+periods:
+  train:      {start: 2025-07-01, end: 2025-12-31}
+  validation: {start: 2026-01-02, end: 2026-05-29}
+  holdout:    {start: 2026-06-02, end: 2026-10-30}
+
+initial_cash: 100000
+anonymize: false               # true is refused: anonymised prompt variants do not exist yet
+
+# universe: [SPY, QQQ, XLF, JPM]   # optional: overrides settings.universe
+budget_usd: 150                # hard cap on LLM spend for this run (CachedLLM enforces it)
+
+# Any Settings field (atlas/config/settings.yaml) can be overridden here, e.g. the model,
+# its documented training cutoff, or the cost confirmation ceiling.
+settings:
+  model: claude-sonnet-5-5
+  model_cutoff: 2026-06-01
+  confirm_cost_usd: 25         # ask before a run estimated above this (or pass --yes)
+
+# settings_file / limits_file / agents_file: alternative config files (default: packaged ones)
+# calibration: runs/pass1/calibration.json   # pass 2: dead_zone from pass 1's null test
+# llm_cache: runs/pass1/llm_cache.sqlite     # share a response cache between runs
+# repo: .                                    # git checkout holding atlas/prompts/ (autoresearch edits it)
+
+data:
+  prices:
+    source: yfinance           # yfinance | csv (dir: one <TICKER>.csv each) | ibkr (host/port/client_id; needs IB Gateway)
+  macro:
+    source: fred               # fred (needs FRED_API_KEY; ALFRED real-time vintages) | none
+    series: [DGS10, DGS2, VIXCLS, DTWEXBGS]
+    publication_lag_days: {}
+  lookback_days: 60            # history shown to agents each day
+  # cache_dir: runs/prices     # price cache (default <run_dir>/prices)
+
+null_test: {n_shuffles: 200, seed: 0}   # used by calibrate, autoresearch and report
+autoresearch: {n_replay_days: 60}       # most recent train days replayed per edit (>= 40)

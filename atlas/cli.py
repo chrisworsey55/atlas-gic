@@ -1,0 +1,954 @@
+"""The ``atlas`` command line: backtest, calibrate, autoresearch, report.
+
+Commands (``atlas <command> --help`` for options)::
+
+    atlas backtest --config RUN.yaml [--dry-run] [--yes] [--with-control]
+    atlas calibrate --config RUN.yaml
+    atlas autoresearch --config RUN.yaml
+    atlas report --run-dir RUN_DIR
+
+The run config (documented by ``atlas/config/run.example.yaml``) names a run directory that
+holds everything a run writes::
+
+    checkpoint.json        runner commit point (resume state, equity, spend)
+    prediction_log.jsonl   hash-chained agent outputs, appended before scoring
+    scores.sqlite          picks and matured excess returns (ScoreStore)
+    failures.sqlite        failed LLM attempts and dropped picks of the backtest
+    llm_cache.sqlite       raw LLM response cache (dry runs use dry_run_llm.db)
+    weights.json           Darwinian weights after the last completed day
+    weights_history.jsonl  per day: weights and state given to the pipeline, the day's fills
+    run_config.json        the resolved run config, settings, limits and agents (for report)
+    calibration.json       null-test dead zone / keep margin (``atlas calibrate``)
+    control.json           spend of the optional date-only control agent (--with-control)
+    autoresearch_log.jsonl one line per autoresearch attempt
+    autoresearch_failures.sqlite  failures of autoresearch replay calls (kept separate)
+    prices/                price cache (unless data.cache_dir says otherwise)
+    report/                report.md, equity.png, agents.csv, autoresearch.csv
+
+Keys: ANTHROPIC_API_KEY and (for ``data.macro.source: fred``) FRED_API_KEY are read from the
+environment only. A missing key is a usage error (exit 2) raised before any work; key values
+are never printed, logged or written to the run directory. ``--dry-run`` needs no keys and
+makes zero LLM calls (the runner's built-in neutral stub) while exercising the full loop.
+
+Two-pass workflow (rulings O/T): with no calibrated dead zone the backtest runs with FROZEN
+weights (pass 1). ``atlas calibrate`` runs the null test on pass 1's train-period picks and
+writes ``calibration.json``. Pass 2 is a new run directory whose config sets
+``calibration: <pass-1 run_dir>/calibration.json``; it runs with adaptive weights. Resuming
+pass 1 with a calibration is refused (the checkpoint's fingerprint changes).
+
+Anonymised runs are refused (ruling W): anonymised prompt variants do not exist yet and the
+real prompt files name tickers and ask for dates.
+
+Exit codes: 0 success; 1 operational failure (paused run, refused resume, dirty repo, too
+little data, ...: the message says how to fix it); 2 usage/config/key errors. Expected errors
+print a message, never a stack trace.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import logging
+import math
+import os
+import sys
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Literal
+
+import numpy as np
+import pandas as pd
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from atlas.backtest.checkpoint import Checkpoint, load_date
+from atlas.backtest.nulltest import LeakageSuspected, NullDistribution, null_test
+from atlas.backtest.predlog import PredictionLog
+from atlas.backtest.runner import (
+    BENCHMARK, DRY_RUN_RESPONSE, HISTORY_NAME, LIMITATIONS, WEIGHTED_KINDS, BacktestConfig,
+    BacktestResult, CostConfirmationRequired, Periods, ResumeRefused, RunPaused, _filter,
+    estimate_cost, read_day_history, run_backtest,
+)
+from atlas.config import AgentSpec, Limits, Settings, load_agents, load_limits
+from atlas.data.csv_provider import CacheOnlyPrices, CsvPriceProvider, NoMacro
+from atlas.data.fred_provider import FredFetchError
+from atlas.data.store import PriceStore
+from atlas.engine.failures import CALL_FAILURE, FailureLog
+from atlas.engine.llm import BudgetExceeded, CachedLLM, LLMResponse, StubClient
+from atlas.engine.pipeline import Pipeline
+from atlas.portfolio.models import Portfolio
+from atlas.portfolio.simbroker import SimBroker
+from atlas.risk.layer import RiskLayer
+from atlas.schemas import AgentOutput, AgentResult
+from atlas.scoring.metrics import excess_return
+from atlas.scoring.store import ScoreStore, non_overlapping
+from atlas.scoring.weights import W_INIT, WeightBook
+
+log = logging.getLogger("atlas.cli")
+
+EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
+PKG = Path(__file__).resolve().parent
+DEFAULT_REPO = PKG.parent
+ANTHROPIC_KEY, FRED_KEY = "ANTHROPIC_API_KEY", "FRED_API_KEY"
+
+CHECKPOINT, PREDLOG, SCORES, FAILURES = "checkpoint.json", "prediction_log.jsonl", "scores.sqlite", "failures.sqlite"
+LLM_CACHE, WEIGHTS, RUN_CONFIG, CALIBRATION = "llm_cache.sqlite", "weights.json", "run_config.json", "calibration.json"
+CONTROL_STATE, AR_LOG, AR_FAILURES = "control.json", "autoresearch_log.jsonl", "autoresearch_failures.sqlite"
+DRY_RUN_CACHE = "dry_run_llm.db"
+ABLATION_NOTE = ("CIO ablation: the decision layer's portfolio is the execution agent's stated long "
+                 "target weights (scaled to max_gross_pct), the baseline is baseline_target_weights "
+                 "from the same day's valid layer 1-3 outputs and weights; both are held for one "
+                 "day (adjusted close to next adjusted close, no costs); skipped days are excluded.")
+
+
+class UsageError(Exception):
+    """Bad command line, config or missing key: exit 2."""
+
+
+class OperationalError(Exception):
+    """The command could not do its work (data missing, run not found, ...): exit 1."""
+
+
+# ============================================================================ run config
+
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class PeriodRange(_Strict):
+    start: date
+    end: date
+
+
+class PeriodsConfig(_Strict):
+    train: PeriodRange
+    validation: PeriodRange
+    holdout: PeriodRange
+
+
+class PricesConfig(_Strict):
+    source: Literal["yfinance", "csv", "ibkr"] = "yfinance"
+    dir: Path | None = None  # csv: one <TICKER>.csv per ticker
+    host: str = "127.0.0.1"  # ibkr: a running IB Gateway / TWS
+    port: int = 4002
+    client_id: int = 1
+
+
+class MacroConfig(_Strict):
+    source: Literal["fred", "none"] = "fred"
+    series: list[str] = Field(default_factory=list)
+    publication_lag_days: dict[str, int] = Field(default_factory=dict)
+
+
+class DataConfig(_Strict):
+    prices: PricesConfig = Field(default_factory=PricesConfig)
+    macro: MacroConfig = Field(default_factory=MacroConfig)
+    lookback_days: int = Field(60, gt=0)
+    cache_dir: Path | None = None  # default <run_dir>/prices
+
+
+class NullTestConfig(_Strict):
+    n_shuffles: int = Field(200, gt=0)
+    seed: int = 0
+
+
+class AutoresearchConfig(_Strict):
+    n_replay_days: int = 60
+
+
+class RunConfig(_Strict):
+    """A run: where it lives, its periods and what overrides the packaged config files."""
+    run_dir: Path
+    periods: PeriodsConfig
+    initial_cash: float = Field(100_000.0, gt=0)
+    anonymize: bool = False
+    universe: list[str] | None = None  # overrides settings.universe
+    budget_usd: float | None = Field(None, gt=0)  # overrides settings.budget_usd (hard cap)
+    settings: dict = Field(default_factory=dict)  # any other Settings field overrides
+    settings_file: Path | None = None
+    limits_file: Path | None = None
+    agents_file: Path | None = None
+    calibration: Path | None = None  # calibration.json of a pass-1 run: sets dead_zone
+    llm_cache: Path | None = None  # default <run_dir>/llm_cache.sqlite
+    repo: Path | None = None  # repository holding atlas/prompts/ (default: this checkout)
+    data: DataConfig = Field(default_factory=DataConfig)
+    null_test: NullTestConfig = Field(default_factory=NullTestConfig)
+    autoresearch: AutoresearchConfig = Field(default_factory=AutoresearchConfig)
+
+    def path(self, name: str) -> Path:
+        return self.run_dir / name
+
+    @property
+    def cache_dir(self) -> Path:
+        return self.data.cache_dir or self.run_dir / "prices"
+
+    @property
+    def llm_cache_path(self) -> Path:
+        return self.llm_cache or self.run_dir / LLM_CACHE
+
+    @property
+    def prompt_repo(self) -> Path:
+        return self.repo or DEFAULT_REPO
+
+
+def _errors(e: ValidationError) -> str:
+    return "; ".join(f"{'.'.join(str(p) for p in err['loc']) or '<root>'}: {err['msg']}"
+                     for err in e.errors())
+
+
+def load_run_config(path: str | Path) -> RunConfig:
+    """Parse and validate a run config; relative paths are relative to the config file."""
+    path = Path(path)
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise UsageError(f"run config {path} not found") from None
+    except (OSError, yaml.YAMLError) as e:
+        raise UsageError(f"cannot read run config {path}: {type(e).__name__}") from None
+    if not isinstance(raw, dict):
+        raise UsageError(f"run config {path} must be a YAML mapping")
+    try:
+        rc = RunConfig.model_validate(raw)
+    except ValidationError as e:
+        raise UsageError(f"invalid run config {path}: {_errors(e)}") from None
+    base = path.resolve().parent
+    rel = lambda p: None if p is None else (p if p.is_absolute() else base / p)  # noqa: E731
+    upd = {k: rel(getattr(rc, k)) for k in ("settings_file", "limits_file", "agents_file",
+                                             "calibration", "llm_cache", "repo")}
+    upd["run_dir"] = rel(rc.run_dir)
+    data = rc.data.model_copy(update={
+        "cache_dir": rel(rc.data.cache_dir),
+        "prices": rc.data.prices.model_copy(update={"dir": rel(rc.data.prices.dir)})})
+    return rc.model_copy(update={**upd, "data": data})
+
+
+def read_calibration(path: Path) -> dict:
+    try:
+        cal = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise UsageError(f"calibration file {path} not found (run `atlas calibrate` on the pass-1 run)") from None
+    except (OSError, ValueError) as e:
+        raise UsageError(f"cannot read calibration file {path}: {type(e).__name__}") from None
+    if not isinstance(cal, dict) or not isinstance(cal.get("dead_zone"), (int, float)):
+        raise UsageError(f"calibration file {path} has no numeric dead_zone")
+    return cal
+
+
+def resolve_settings(rc: RunConfig) -> Settings:
+    path = rc.settings_file or PKG / "config" / "settings.yaml"
+    try:
+        base = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        raise UsageError(f"cannot read settings file {path}: {type(e).__name__}") from None
+    merged = {**base, **rc.settings}
+    if rc.universe is not None:
+        merged["universe"] = list(rc.universe)
+    if rc.budget_usd is not None:
+        merged["budget_usd"] = rc.budget_usd
+    if rc.calibration is not None:
+        if "dead_zone" in rc.settings:
+            raise UsageError("set either settings.dead_zone or calibration in the run config, not both")
+        merged["dead_zone"] = float(read_calibration(rc.calibration)["dead_zone"])
+    try:
+        return Settings(**merged)
+    except ValidationError as e:
+        raise UsageError(f"invalid settings: {_errors(e)}") from None
+
+
+def resolve_periods(rc: RunConfig) -> Periods:
+    p = rc.periods
+    try:
+        return Periods(train=(p.train.start, p.train.end), validation=(p.validation.start, p.validation.end),
+                       holdout=(p.holdout.start, p.holdout.end))
+    except ValueError as e:
+        raise UsageError(f"invalid periods: {e}") from None
+
+
+def make_backtest_config(periods: Periods, settings: Settings, limits: Limits, anonymize: bool,
+                         dry_run: bool) -> BacktestConfig:
+    try:
+        return BacktestConfig(periods=periods, settings=settings, limits=limits, anonymize=anonymize,
+                              dry_run=dry_run)
+    except ValueError as e:
+        raise UsageError(
+            f"{e}. Fix: the holdout must lie entirely after the model's training cutoff; move "
+            "periods.holdout.start after settings.model_cutoff, or set settings.model_cutoff in the "
+            "run config to the documented cutoff of the model you use") from None
+
+
+def refuse_anonymize(rc: RunConfig, command: str) -> None:
+    if rc.anonymize:
+        raise UsageError(
+            f"`atlas {command}` refuses anonymize: true. Anonymised prompt variants do not exist yet: "
+            "the real prompt files name tickers and ask the model to echo dates, so an anonymised "
+            "run would not be anonymous. Set anonymize: false.")
+
+
+def require_keys(rc: RunConfig, *, anthropic: bool, fred: bool) -> str | None:
+    """Check the environment for the keys this command needs; returns the FRED key (or None)
+    for the provider. Never prints a value."""
+    names = []
+    if anthropic:
+        names.append(ANTHROPIC_KEY)
+    if fred and rc.data.macro.source == "fred":
+        names.append(FRED_KEY)
+    missing = [n for n in names if not os.environ.get(n, "").strip()]
+    if missing:
+        raise UsageError(
+            f"missing environment variable(s): {', '.join(missing)}. Export them in the shell that "
+            "runs atlas (keys are read from the environment only, never from config files)"
+            + (", or use --dry-run, which needs no keys" if ANTHROPIC_KEY in missing else "") + ".")
+    return os.environ.get(FRED_KEY) if rc.data.macro.source == "fred" else None
+
+
+# ============================================================================ components
+
+class _NoCalls:
+    """LLM client for dry runs: the runner swaps in its stub, so any call here is a bug."""
+
+    def complete(self, system: str, user: str, max_tokens: int) -> LLMResponse:
+        raise RuntimeError("dry run attempted a real LLM call")
+
+
+@dataclass
+class Run:
+    rc: RunConfig
+    settings: Settings
+    limits: Limits
+    specs: list[AgentSpec]
+    prompts: dict[str, str]
+    periods: Periods
+    store: PriceStore
+    macro_series: list[str]
+    llm: CachedLLM | None = None
+    failures: FailureLog | None = None
+    pipeline: Pipeline | None = None
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def universe(self) -> list[str]:
+        return list(dict.fromkeys(self.settings.universe))
+
+    def trading_days(self) -> list[date]:
+        days = []
+        for name, (lo, hi) in self.periods.items():
+            ds = self.store.trading_days(lo, hi)
+            if not ds:
+                raise UsageError(f"{name} period {lo}..{hi} contains no trading days in the price data")
+            days += ds
+        return sorted(set(days))
+
+    @property
+    def cost_frac(self) -> float:
+        return 2 * self.settings.slippage_bps / 1e4
+
+
+def load_specs(rc: RunConfig) -> list[AgentSpec]:
+    path = rc.agents_file or PKG / "config" / "agents.yaml"
+    try:
+        return load_agents(path)
+    except (OSError, yaml.YAMLError, KeyError, TypeError, ValidationError) as e:
+        raise UsageError(f"cannot load agents file {path}: {type(e).__name__}") from None
+
+
+def load_prompts(rc: RunConfig, specs: list[AgentSpec]) -> dict[str, str]:
+    out = {}
+    for sp in specs:
+        p = rc.prompt_repo / "atlas" / sp.prompt_file
+        try:
+            out[sp.name] = p.read_text(encoding="utf-8")
+        except OSError:
+            raise UsageError(f"prompt file for agent {sp.name} not found: {p}") from None
+    return out
+
+
+def _price_provider(rc: RunConfig, offline: bool):
+    if offline:
+        return CacheOnlyPrices()
+    src = rc.data.prices
+    if src.source == "csv":
+        if src.dir is None:
+            raise UsageError("data.prices.source csv needs data.prices.dir")
+        try:
+            return CsvPriceProvider(src.dir)
+        except FileNotFoundError as e:
+            raise UsageError(str(e)) from None
+    if src.source == "ibkr":
+        from atlas.data.ibkr_provider import IBKRProvider
+        return IBKRProvider(src.host, src.port, src.client_id)
+    from atlas.data.yf_provider import YFinanceProvider
+    return YFinanceProvider()
+
+
+def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = None,
+              llm_client=None, dry_run: bool = False, failures_name: str = FAILURES,
+              settings: Settings | None = None) -> Run:
+    """Assemble the components the commands share. `offline` serves prices from the cache
+    only and no macro data (report/calibrate)."""
+    settings = settings or resolve_settings(rc)
+    lim_path = rc.limits_file or PKG / "config" / "limits.yaml"
+    try:
+        limits = load_limits(lim_path)
+    except (OSError, yaml.YAMLError, TypeError, ValidationError) as e:
+        raise UsageError(f"cannot load limits file {lim_path}: {type(e).__name__}") from None
+    specs = load_specs(rc)
+    prompts = load_prompts(rc, specs)
+    periods = resolve_periods(rc)
+    notes = []
+    macro, series = NoMacro(), []
+    if not offline and rc.data.macro.source == "fred":
+        if fred_key:
+            from atlas.data.fred_provider import FredAlfredProvider
+            macro, series = FredAlfredProvider(fred_key, rc.data.macro.publication_lag_days), list(rc.data.macro.series)
+        else:
+            notes.append(f"dry run: {FRED_KEY} is not set, so the run uses no macro series")
+    store = PriceStore(_price_provider(rc, offline), macro, rc.cache_dir)
+    run = Run(rc, settings, limits, specs, prompts, periods, store, series, notes=notes)
+    if llm_client is not None or not offline:
+        client = llm_client
+        if client is None:
+            if dry_run:
+                client = _NoCalls()
+            else:
+                from atlas.engine.llm import AnthropicClient
+                client = AnthropicClient(settings.model)
+        run.llm = CachedLLM(client, rc.llm_cache_path, settings.model,
+                            (settings.usd_per_mtok_input, settings.usd_per_mtok_output), settings.budget_usd)
+        run.failures = FailureLog(rc.path(failures_name))
+        run.pipeline = Pipeline(specs, prompts, run.llm, run.failures, run.universe, settings.min_valid_agents)
+    return run
+
+
+def _write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, sort_keys=True, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _last_completed(checkpoint: Checkpoint) -> date | None:
+    try:
+        raw = checkpoint.load()
+    except ValueError as e:
+        raise OperationalError(str(e)) from None
+    return load_date(raw["last_completed_day"]) if raw and raw.get("last_completed_day") else None
+
+
+# ============================================================================ backtest
+
+def _confirm(estimate: float, ceiling: float, yes: bool) -> bool:
+    if yes:
+        return True
+    msg = (f"estimated LLM cost ${estimate:.2f} exceeds the confirmation ceiling ${ceiling:.2f} "
+           "(settings.confirm_cost_usd)")
+    if not sys.stdin.isatty():
+        print(f"{msg}. Not running: stdin is not a terminal, re-run with --yes to proceed.", file=sys.stderr)
+        return False
+    ans = input(f"{msg}. Proceed? [y/N] ")
+    if ans.strip().lower() in ("y", "yes"):
+        return True
+    print("Not confirmed; nothing was run. Re-run with --yes to skip this question.", file=sys.stderr)
+    return False
+
+
+def cmd_backtest(args, llm_client=None) -> int:
+    rc = load_run_config(args.config)
+    refuse_anonymize(rc, "backtest")
+    fred_key = require_keys(rc, anthropic=not args.dry_run, fred=not args.dry_run)
+    if args.dry_run:
+        fred_key = os.environ.get(FRED_KEY) or None
+    run = build_run(rc, fred_key=fred_key, llm_client=llm_client, dry_run=args.dry_run)
+    cfg = make_backtest_config(run.periods, run.settings, run.limits, False, args.dry_run)
+    control = [sp for sp in run.specs if sp.kind == "control"]
+    if args.with_control and not control:
+        raise UsageError("--with-control needs a control agent (kind: control) in the agents file")
+    for n in run.notes:
+        print(f"note: {n}")
+    if args.dry_run:
+        print("dry run: zero LLM calls (built-in neutral stub); no keys needed")
+    checkpoint = Checkpoint(rc.path(CHECKPOINT))
+    lcd = _last_completed(checkpoint)
+    all_days = run.trading_days()
+    todo = [d for d in all_days if lcd is None or d > lcd]
+    n_agents = sum(1 for sp in run.specs if sp.kind != "control") + (1 if args.with_control else 0)
+    est = estimate_cost(cfg, len(todo), n_agents)
+    confirmed = args.yes
+    if est > run.settings.confirm_cost_usd:
+        if not _confirm(est, run.settings.confirm_cost_usd, args.yes):
+            return EXIT_USAGE
+        confirmed = True
+    if lcd is not None:
+        print(f"resuming after {lcd} ({len(todo)} trading days left)")
+    _write_json(rc.path(RUN_CONFIG), {"run_config": rc.model_dump(mode="json"),
+                                      "settings": run.settings.model_dump(mode="json"),
+                                      "limits": run.limits.model_dump(mode="json"),
+                                      "agents": [sp.model_dump(mode="json") for sp in run.specs],
+                                      "macro_series": run.macro_series})
+    broker = SimBroker(run.store, run.settings.commission_per_share, run.settings.commission_min,
+                       run.settings.slippage_bps)
+    risk = RiskLayer(run.limits, run.settings.commission_per_share, run.settings.commission_min)
+    scores = ScoreStore(rc.path(SCORES))
+    try:
+        result = run_backtest(cfg, run.store, run.pipeline, broker, risk, scores, WeightBook(rc.path(WEIGHTS)),
+                              PredictionLog(rc.path(PREDLOG)), checkpoint, confirm=confirmed,
+                              initial_cash=rc.initial_cash, universe_sectors=None,
+                              lookback_days=rc.data.lookback_days, macro_series=run.macro_series,
+                              run_dir=rc.run_dir, history_path=rc.path(HISTORY_NAME))
+    except RunPaused as e:
+        print(f"{e}\nThe checkpoint is intact (it holds the last completed day); fix the cause if "
+              "needed and re-run the same command to resume.", file=sys.stderr)
+        if e.failed:
+            print("failed agents: " + ", ".join(f"{a} ({r})" for a, r in e.failed.items()), file=sys.stderr)
+        return EXIT_FAILED
+    except CostConfirmationRequired as e:  # belt and braces: the estimate is checked above
+        print(f"{e} (use --yes)", file=sys.stderr)
+        return EXIT_USAGE
+    spent = result.spent_usd
+    if args.with_control:
+        try:
+            spent += run_control_pass(run, scores, result, all_days, dry_run=args.dry_run)
+        except BudgetExceeded as e:
+            print(f"control agent stopped: LLM budget exceeded ({e}). The backtest itself is complete; "
+                  "raise budget_usd and re-run the same command to finish the control agent "
+                  "(completed days are cache hits).", file=sys.stderr)
+            return EXIT_FAILED
+    eq = result.equity
+    print(f"backtest complete: {len(eq)} trading days {eq.index[0]}..{eq.index[-1]}; final equity "
+          f"{eq.iloc[-1]:,.2f} (start {rc.initial_cash:,.2f}); {len(result.skipped)} skipped days; "
+          f"LLM spend ${spent:.2f}" + ("; HALTED: " + str(result.halt_reason) if result.halted else ""))
+    print(f"next: atlas report --run-dir {rc.run_dir}")
+    return EXIT_OK
+
+
+def run_control_pass(run: Run, scores: ScoreStore, result: BacktestResult, all_days: list[date], *,
+                     dry_run: bool) -> float:
+    """The date-only control agent on every completed day, recorded under agent 'control'
+    in the score store. It runs after the trading loop and only adds its own rows: the
+    portfolio, prediction log, weights (control is never a weighted agent) and checkpoint
+    are untouched. Idempotent: re-running replays the LLM cache. Returns its total spend."""
+    from atlas.backtest.control import run_control_agent
+    spec = next(sp for sp in run.specs if sp.kind == "control")
+    state_path = run.rc.path(CONTROL_STATE)
+    prev = json.loads(state_path.read_text())["spent_usd"] if state_path.exists() else 0.0
+    if dry_run:
+        llm = CachedLLM(StubClient(lambda _s, _u: DRY_RUN_RESPONSE), run.rc.path(DRY_RUN_CACHE), "dry-run",
+                        (0.0, 0.0), math.inf)
+    else:
+        remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev)
+        llm = CachedLLM(run.llm.client, run.rc.llm_cache_path, run.settings.model,
+                        (run.settings.usd_per_mtok_input, run.settings.usd_per_mtok_output), remaining)
+    last = max(result.equity.index)
+    days = [d for d in all_days if d <= last]
+    try:
+        for d in days:
+            scores.record_picks(run_control_agent(d, run.universe, run.prompts[spec.name], llm,
+                                                  run.failures, spec=spec))
+    finally:
+        _write_json(state_path, {"spent_usd": prev + llm.spent_usd, "days": len(days)})
+    scores.score_matured(last, run.store, run.specs, run.cost_frac)
+    return prev + llm.spent_usd
+
+
+# ============================================================================ null / calibrate
+
+def train_null(scores: ScoreStore, run: Run, all_days: list[date]) -> tuple[NullDistribution, date]:
+    """Null test on the non-overlapping 1-day TRAIN picks of the weighted agents (ruling T):
+    dated on or before the last train day whose scoring exit is still inside train, with
+    window=rolling_ic_window. Raises ValueError (too few agents) or LeakageSuspected."""
+    from atlas.autoresearch.loop import last_safe_train_day
+    safe_end = last_safe_train_day(all_days, run.periods, 1)
+    if safe_end is None:
+        raise ValueError("no train day has its 1-day scoring exit inside the train period")
+    weighted = {sp.name for sp in run.specs if sp.kind in WEIGHTED_KINDS}
+    df = scores.picks_frame(None, 1)
+    df = df[df["agent"].isin(weighted) & (df["date"] >= run.periods.train[0]) & (df["date"] <= safe_end)]
+    s = run.settings
+    nt = run.rc.null_test
+    null = null_test(non_overlapping(df, 1), nt.n_shuffles, nt.seed, k=s.shrinkage_k,
+                     warmup_picks=s.warmup_picks, window=s.rolling_ic_window)
+    return null, safe_end
+
+
+def _cached_days(run: Run) -> list[date]:
+    try:
+        return run.trading_days()
+    except UsageError as e:
+        raise OperationalError(f"{e}; has the backtest been run for this config?") from None
+
+
+def cmd_calibrate(args, llm_client=None) -> int:
+    rc = load_run_config(args.config)
+    run = build_run(rc, offline=True)
+    if not rc.path(SCORES).exists():
+        raise OperationalError(f"no stored run in {rc.run_dir}: run `atlas backtest --config {args.config}` first")
+    scores = ScoreStore(rc.path(SCORES))
+    try:
+        null, safe_end = train_null(scores, run, _cached_days(run))
+    except LeakageSuspected as e:
+        raise OperationalError(f"cannot calibrate: the null test suspects leakage ({e}); do not trust "
+                               "this run's scores") from None
+    except ValueError as e:
+        raise OperationalError(f"cannot calibrate: {e}. Run a longer train period.") from None
+    s = run.settings
+    cal = {"dead_zone": null.dead_zone(), "keep_margin": null.keep_margin(),
+           "n_shuffles": rc.null_test.n_shuffles, "seed": rc.null_test.seed, "window": s.rolling_ic_window,
+           "warmup_picks": s.warmup_picks, "shrinkage_k": s.shrinkage_k,
+           "train_max_date": safe_end.isoformat(), "mean_ic": float(np.mean(null.ics)),
+           "ics": null.ics.tolist(), "deviations": null.deviations.tolist(), "pair_diffs": null.pair_diffs.tolist()}
+    _write_json(rc.path(CALIBRATION), cal)
+    print(f"calibrated on train picks up to {safe_end}: dead_zone {cal['dead_zone']:.4f}, keep_margin "
+          f"{cal['keep_margin']:.4f} (null mean IC {cal['mean_ic']:+.4f}, {len(null.ics)} shuffled ICs)")
+    print(f"wrote {rc.path(CALIBRATION)}. For pass 2 use a NEW run_dir with `calibration: "
+          f"{rc.path(CALIBRATION)}` in its config.")
+    return EXIT_OK
+
+
+def null_from_calibration(cal: dict) -> NullDistribution:
+    return NullDistribution(np.asarray(cal["ics"], float), np.asarray(cal["deviations"], float),
+                            np.asarray(cal["pair_diffs"], float))
+
+
+# ============================================================================ replay (autoresearch)
+
+def predlog_results(path: Path) -> dict[date, dict[str, AgentResult]]:
+    """day -> agent -> AgentResult as logged (failed agents: output None)."""
+    pl = PredictionLog(path)
+    if not pl.verify():
+        raise OperationalError(f"prediction log {path} failed hash-chain verification")
+    out: dict[date, dict[str, AgentResult]] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        d = date.fromisoformat(rec["day"])
+        day = {}
+        for a in rec["agents"]:
+            out_ = AgentOutput.model_validate(a["output"]) if a["status"] == "ok" else None
+            day[a["agent"]] = AgentResult(agent=a["agent"], date=d, output=out_)
+        out[d] = day
+    return out
+
+
+@dataclass
+class Replay:
+    """Re-runs single agents on recorded days exactly as the backtest called them."""
+    run: Run
+    pipeline: Pipeline
+    all_days: list[date]
+    history: dict[date, dict]
+    results: dict[date, dict[str, AgentResult]]
+    _snaps: dict = field(default_factory=dict)
+
+    @property
+    def prompts(self) -> dict[str, str]:
+        return self.run.prompts
+
+    def context(self, day: date):
+        from atlas.autoresearch.loop import DayContext
+        h, res = self.history.get(day), self.results.get(day)
+        if h is None or res is None:
+            return None
+        if day not in self._snaps:
+            r = self.run
+            tickers = r.universe + ([BENCHMARK] if BENCHMARK not in r.universe else [])
+            snap = r.store.snapshot(day, tickers, r.rc.data.lookback_days, r.macro_series)
+            self._snaps[day] = _filter(snap, set(r.universe))
+        return DayContext(self._snaps[day], copy.deepcopy(h["weights"]), copy.deepcopy(h["state"]), dict(res))
+
+    def scorer(self, res: AgentResult, day: date) -> tuple[list[float], list[float]]:
+        """Horizon-1 (signed conviction, excess) pairs, as ScoreStore scores them."""
+        i = self.all_days.index(day)
+        if i + 1 >= len(self.all_days) or res.output is None:
+            return [], []
+        nxt = self.all_days[i + 1]
+        bench = self.run.pipeline.specs[res.agent].benchmark or BENCHMARK
+        rows = {}
+        for p in res.output.picks:
+            if p.direction == "none":
+                continue
+            sign = 1 if p.direction == "long" else -1
+            tp = self.run.store.outcome_prices(p.ticker, day, nxt).reindex([day, nxt])
+            bp = self.run.store.outcome_prices(bench, day, nxt).reindex([day, nxt])
+            ex = excess_return(tp, bp, 1, self.run.cost_frac, sign)
+            if ex == ex:
+                rows[p.ticker] = (sign * p.conviction, ex)
+        return [c for c, _ in rows.values()], [e for _, e in rows.values()]
+
+    def run_agent(self, name: str, day: date, prompt: str) -> AgentResult:
+        ctx = self.context(day)
+        if ctx is None:
+            raise KeyError(f"no recorded context for {day}")
+        return self.pipeline.run_single(name, day, ctx.snapshot, ctx.weights, ctx.state, ctx.upstream,
+                                        prompt_override=prompt)
+
+    def run_one_day(self, agent: str):
+        from atlas.autoresearch.loop import build_run_one_day
+        return build_run_one_day(self.pipeline, agent, self.context, self.scorer, horizon=1)
+
+
+def _make_replay(run: Run) -> Replay:
+    rc = run.rc
+    ckpt = Checkpoint(rc.path(CHECKPOINT))
+    if _last_completed(ckpt) is None:
+        raise OperationalError(f"no stored run in {rc.run_dir}: run `atlas backtest --config ...` first")
+    ar_failures = FailureLog(rc.path(AR_FAILURES))
+    pipe = Pipeline(run.specs, run.prompts, run.llm, ar_failures, run.universe, run.settings.min_valid_agents)
+    return Replay(run, pipe, run.trading_days(), read_day_history(rc.path(HISTORY_NAME), ckpt),
+                  predlog_results(rc.path(PREDLOG)))
+
+
+def build_replay(config: str | Path, *, llm_client=None, fred_key: str | None = None) -> Replay:
+    rc = load_run_config(config)
+    return _make_replay(build_run(rc, fred_key=fred_key, llm_client=llm_client))
+
+
+def train_failure_stats(failures: FailureLog, specs: list[AgentSpec], periods: Periods, safe_end: date,
+                        committed: list[date]) -> tuple[dict[str, float], dict[str, str]]:
+    """Per non-control agent: share of committed train days (<= safe_end) on which it had at
+    least one failed call (conservative: recovered retries count), and its failure reasons."""
+    days = [d for d in committed if periods.train[0] <= d <= safe_end]
+    df = failures.rows(CALL_FAILURE)
+    if len(df):
+        dd = [date.fromisoformat(x) for x in df["date"]]
+        df = df[[periods.train[0] <= d <= safe_end for d in dd]]
+    rates, notes = {}, {}
+    for sp in specs:
+        if sp.kind == "control":
+            continue
+        g = df[df["agent"] == sp.name] if len(df) else df
+        rates[sp.name] = (g["date"].nunique() / len(days)) if days and len(g) else 0.0
+        if len(g):
+            vc = g["reason"].value_counts()
+            notes[sp.name] = ", ".join(f"{r} x{n}" for r, n in sorted(vc.items(), key=lambda x: (-x[1], x[0])))
+    return rates, notes
+
+
+def cmd_autoresearch(args, llm_client=None) -> int:
+    from atlas.autoresearch.gitops import DirtyWorkingTree, GitError, GitOps
+    from atlas.autoresearch.loop import (
+        HoldoutViolation, InsufficientReplayDays, last_safe_train_day, run_autoresearch,
+    )
+    rc = load_run_config(args.config)
+    refuse_anonymize(rc, "autoresearch")
+    fred_key = require_keys(rc, anthropic=True, fred=True)
+    try:
+        GitOps(rc.prompt_repo).require_clean()
+    except GitError as e:
+        raise UsageError(f"repo {rc.prompt_repo} is not usable as a git repository: {e}") from None
+    except DirtyWorkingTree as e:
+        raise OperationalError(f"autoresearch refused: {e} (in {rc.prompt_repo})") from None
+    run = build_run(rc, fred_key=fred_key, llm_client=llm_client)
+    replay = _make_replay(run)
+    scores = ScoreStore(rc.path(SCORES))
+    try:
+        null, _ = train_null(scores, run, replay.all_days)
+        keep_margin = null.keep_margin()
+        print(f"keep_margin {keep_margin:.4f} (null test on train picks, window {run.settings.rolling_ic_window})")
+    except (ValueError, LeakageSuspected) as e:
+        keep_margin = None
+        print(f"keep_margin: not calibrated ({type(e).__name__}: {e}); attempts will be recorded as "
+              "'uncalibrated' and no edit can be kept")
+    safe_end = last_safe_train_day(replay.all_days, run.periods, 1)
+    rates, notes = train_failure_stats(run.failures, run.specs, run.periods, safe_end or run.periods.train[0],
+                                       sorted(replay.history))
+    try:
+        records = run_autoresearch(run.settings, repo=rc.prompt_repo, periods=run.periods,
+                                   trading_days=replay.all_days, specs=run.specs, llm=run.llm, scores=scores,
+                                   failure_rates=rates, make_run_one_day=replay.run_one_day,
+                                   keep_margin=keep_margin, run_dir=rc.run_dir, horizon=1,
+                                   failure_notes=lambda a: notes.get(a, ""),
+                                   n_replay_days=rc.autoresearch.n_replay_days)
+    except DirtyWorkingTree as e:
+        raise OperationalError(f"autoresearch refused: {e}") from None
+    except InsufficientReplayDays as e:
+        raise OperationalError(f"autoresearch cannot run: {e}. A paired replay needs a longer train "
+                               "period.") from None
+    except HoldoutViolation as e:
+        raise OperationalError(f"autoresearch stopped: {e}") from None
+    for r in records:
+        print(f"{r.agent}: {r.decision} ({r.reason})" + (f" commit {r.commit_sha}" if r.commit_sha else ""))
+    if not records:
+        print("autoresearch: no eligible agent to edit")
+    print(f"log: {rc.path(AR_LOG)}. Edits touch only atlas/prompts/ and are never pushed. A backtest "
+          "with edited prompts needs a new run_dir (the old checkpoint fingerprints the prompts).")
+    return EXIT_OK
+
+
+# ============================================================================ report
+
+def result_from_checkpoint(raw: dict, periods: Periods) -> BacktestResult:
+    ser = lambda m, name: pd.Series([m[k] for k in sorted(m)], index=[load_date(k) for k in sorted(m)],  # noqa: E731
+                                    name=name, dtype=float)
+    return BacktestResult(
+        equity=ser(raw["equity"], "equity"), spy=ser(raw["spy"], "spy"), basket=ser(raw["basket"], "basket"),
+        day_results={}, skipped={load_date(k): v for k, v in raw["skipped"].items()},
+        limitations=list(LIMITATIONS) + [ABLATION_NOTE],
+        risk_errors={load_date(k): v for k, v in raw["risk_errors"].items()},
+        halted=bool(raw["halted"]), halt_reason=raw["halt_reason"],
+        final_portfolio=Portfolio(cash=float(raw["portfolio"]["cash"]),
+                                  positions={t: int(n) for t, n in raw["portfolio"]["positions"].items()}),
+        spent_usd=float(raw["spent_usd"]), periods=periods)
+
+
+def turnover_by_period(history: dict[date, dict], equity: pd.Series, periods: Periods) -> dict[str, float] | None:
+    """Traded notional (fills booked to their decision day) / mean equity, per period."""
+    if not history:
+        return None
+    out = {}
+    for name, (lo, hi) in periods.items():
+        eq = equity[[lo <= d <= hi for d in equity.index]]
+        if not len(eq) or not float(eq.mean()) > 0:
+            continue
+        notional = sum(f["shares"] * f["price"] for d, h in history.items() if lo <= d <= hi for f in h["fills"])
+        out[name] = notional / float(eq.mean())
+    return out
+
+
+def ablation_from_run(history: dict[date, dict], results: dict[date, dict[str, AgentResult]],
+                      store: PriceStore, specs: list[AgentSpec], limits: Limits) -> dict | None:
+    """CIO ablation (see ABLATION_NOTE); None if fewer than 2 comparable days."""
+    from atlas.backtest.ablation import baseline_target_weights, cio_ablation
+    if not history:
+        return None
+    layers = {sp.name: sp.layer for sp in specs}
+    ex_names = [sp.name for sp in specs if sp.kind == "execution"]
+    days = sorted(history)
+    cal = store.trading_days(days[0], days[-1] + timedelta(days=14))
+    cio_r, base_r = {}, {}
+    for T in days:
+        h, res = history[T], results.get(T)
+        if h.get("skipped") or res is None or not ex_names or ex_names[0] not in res:
+            continue
+        ex = res[ex_names[0]]
+        if ex.status != "ok":
+            continue
+        cio_w = {}
+        for p in ex.output.picks:  # last pick per ticker wins, as in the pipeline
+            cio_w[p.ticker] = p.conviction if p.direction == "long" else 0.0
+        cio_w = {t: w for t, w in cio_w.items() if w > 0}
+        gross = sum(cio_w.values())
+        if gross > limits.max_gross_pct > 0:
+            cio_w = {t: w * limits.max_gross_pct / gross for t, w in cio_w.items()}
+        base_w = baseline_target_weights(res, h["weights"], limits.max_positions, layers)
+        later = [d for d in cal if d > T]
+        if not later:
+            continue
+        nxt = later[0]
+        rets = {}
+        for t in set(cio_w) | set(base_w):
+            s = store.outcome_prices(t, T, nxt).reindex([T, nxt])
+            if s.isna().any() or float(s.iloc[0]) == 0:
+                break
+            rets[t] = float(s.iloc[1]) / float(s.iloc[0]) - 1.0
+        else:
+            cio_r[T] = sum(w * rets[t] for t, w in cio_w.items())
+            base_r[T] = sum(w * rets[t] for t, w in base_w.items())
+    try:
+        return cio_ablation(pd.Series(cio_r, dtype=float), pd.Series(base_r, dtype=float))
+    except ValueError:
+        return None
+
+
+def cmd_report(args, llm_client=None) -> int:
+    from atlas.autoresearch.loop import EditRecord
+    from atlas.backtest.report import build_report
+    run_dir = Path(args.run_dir)
+    stored_path = run_dir / RUN_CONFIG
+    if not stored_path.exists():
+        raise UsageError(f"{run_dir} is not a run directory (no {RUN_CONFIG}); run `atlas backtest` first")
+    stored = json.loads(stored_path.read_text(encoding="utf-8"))
+    rc = RunConfig.model_validate(stored["run_config"]).model_copy(update={"run_dir": run_dir})
+    if rc.data.cache_dir is None:
+        rc = rc.model_copy(update={"data": rc.data.model_copy(update={"cache_dir": run_dir / "prices"})})
+    settings = Settings(**stored["settings"])
+    limits = Limits(**stored["limits"])
+    specs = [AgentSpec(**a) for a in stored["agents"]]
+    periods = resolve_periods(rc)
+    ckpt = Checkpoint(run_dir / CHECKPOINT)
+    raw = ckpt.load()
+    if not raw or not raw.get("last_completed_day"):
+        raise OperationalError(f"no completed day in {run_dir}: nothing to report")
+    run = Run(rc, settings, limits, specs, {}, periods, PriceStore(CacheOnlyPrices(), NoMacro(), rc.cache_dir), [])
+    result = result_from_checkpoint(raw, periods)
+    scores = ScoreStore(run_dir / SCORES)
+
+    null, null_src = None, "not calibrated"
+    for p in (run_dir / CALIBRATION, rc.calibration):
+        if p is not None and Path(p).exists():
+            null, null_src = null_from_calibration(json.loads(Path(p).read_text())), str(p)
+            break
+    if null is None:
+        try:
+            null, _ = train_null(scores, run, _cached_days(run))
+            null_src = "computed from this run's train picks"
+        except (ValueError, LeakageSuspected, OperationalError) as e:
+            null_src = f"not computable ({type(e).__name__})"
+    edits = []
+    if (run_dir / AR_LOG).exists():
+        for line in (run_dir / AR_LOG).read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                edits.append(EditRecord(**json.loads(line)))
+    failures = FailureLog(run_dir / FAILURES)
+    control_spent = json.loads((run_dir / CONTROL_STATE).read_text())["spent_usd"] if (run_dir / CONTROL_STATE).exists() else 0.0
+    weights = WeightBook(run_dir / WEIGHTS).load()
+    final_weights = {sp.name: weights.get(sp.name, W_INIT) for sp in specs if sp.kind in WEIGHTED_KINDS}
+    history = read_day_history(run_dir / HISTORY_NAME, ckpt)
+    turnover = turnover_by_period(history, result.equity, periods)
+    ablation = ablation_from_run(history, predlog_results(run_dir / PREDLOG), run.store, specs, limits)
+    path = build_report(result, scores, null, edits, ablation, None, failures.summary(),
+                        float(raw["spent_usd"]) + control_spent, run_dir / "report", settings=settings,
+                        holdout_edit_ics=None, final_weights=final_weights,
+                        dropped_picks=failures.dropped_picks_summary(), turnover=turnover)
+    print(f"null distribution: {null_src}; CIO ablation: {'computed' if ablation else 'not provided'}; "
+          f"turnover: {'computed' if turnover is not None else 'not provided'}")
+    print(f"wrote {path}")
+    return EXIT_OK
+
+
+# ============================================================================ entry point
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="atlas", description="ATLAS backtest system: multi-agent LLM "
+                                "trading research with honest, leakage-aware evaluation.")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{backtest,calibrate,autoresearch,report}")
+    b = sub.add_parser("backtest", help="run or resume a backtest over train, validation and holdout")
+    b.add_argument("--config", required=True, help="run config YAML (see atlas/config/run.example.yaml)")
+    b.add_argument("--dry-run", action="store_true", help="no keys, zero LLM calls: plumbing check")
+    b.add_argument("--yes", action="store_true", help="do not ask before spending above confirm_cost_usd")
+    b.add_argument("--with-control", action="store_true",
+                   help="also run the date-only control agent each day (one extra LLM call per day)")
+    c = sub.add_parser("calibrate", help="null test on the run's train picks -> calibration.json")
+    c.add_argument("--config", required=True)
+    a = sub.add_parser("autoresearch", help="targeted prompt edits judged by paired replay on train days")
+    a.add_argument("--config", required=True)
+    r = sub.add_parser("report", help="write report.md, equity.png, agents.csv, autoresearch.csv")
+    r.add_argument("--run-dir", required=True)
+    return p
+
+
+COMMANDS = {"backtest": cmd_backtest, "calibrate": cmd_calibrate, "autoresearch": cmd_autoresearch,
+            "report": cmd_report}
+
+
+def main(argv: list[str] | None = None, *, llm_client=None) -> int:
+    """`llm_client` replaces the Anthropic client (tests inject a StubClient)."""
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else EXIT_USAGE
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    try:
+        return COMMANDS[args.command](args, llm_client=llm_client)
+    except UsageError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    except (OperationalError, ResumeRefused, FredFetchError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_FAILED
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

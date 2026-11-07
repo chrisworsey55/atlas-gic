@@ -49,6 +49,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import tempfile
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -413,12 +414,14 @@ def _fingerprint(cfg: BacktestConfig, pipeline: Pipeline, initial_cash, universe
 def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, broker, risk: RiskLayer,
                  scores: ScoreStore, weightbook: WeightBook, predlog: PredictionLog,
                  checkpoint: Checkpoint, *, confirm: bool = False, initial_cash: float = 100_000.0, universe_sectors: dict[str, str] | None = None,
-                 lookback_days: int = 60, macro_series=(), run_dir: Path | None = None
-                 ) -> BacktestResult:
+                 lookback_days: int = 60, macro_series=(), run_dir: Path | None = None,
+                 history_path: Path | None = None) -> BacktestResult:
     """Run (or resume) the backtest over train, validation and holdout in date order.
 
     One continuous portfolio spans all three periods; use ``cfg.periods.period_of`` to split
-    the result per period. All LLM calls and spend accounting go through ONE object,
+    the result per period. ``history_path`` (optional) receives one JSON line per day (see
+    ``read_day_history``): the weights and state the pipeline was given and the day's fills.
+    All LLM calls and spend accounting go through ONE object,
     ``pipeline.llm``: its spend is restored from the checkpoint so the budget spans resumes. ``run_dir`` holds the dry-run stub cache (a temp dir if omitted).
     Raises CostConfirmationRequired, RunPaused, ResumeRefused (see module docstring).
     """
@@ -522,6 +525,8 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             pipe_snap = _filter(snap, set(universe))
             weights = weightbook.load()
             agent_state = {"cash": portfolio.cash, "positions": dict(portfolio.positions), "equity": equity_T}
+            state_seen = copy.deepcopy(agent_state)  # real tickers, as given before anonymisation
+            day_fills: list[Fill] = []
             label, back = None, {}
             if cfg.anonymize:
                 pipe_in, back = anonymize_snapshot(pipe_snap, sectors)
@@ -581,6 +586,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                     log.info("%s: broker dropped %s: %s", T, o, why)
                 for f in fills:
                     _apply_fill(portfolio, f, st.last_known)
+                day_fills = list(fills)
 
             # ---- (5) log before scoring, then score matured horizons (data <= T only)
             try:
@@ -611,6 +617,9 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             st.peak_equity = max(st.peak_equity, equity_T)
             st.prev_equity = equity_T
 
+            if history_path is not None:  # before the commit point; readers ignore uncommitted days
+                _append_history(Path(history_path), T, weights, state_seen, day_fills, day.skipped_reason)
+
             # ---- (8) commit point
             st.cash, st.positions = portfolio.cash, dict(portfolio.positions)
             st.weights = new_w
@@ -631,6 +640,45 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             risk_errors=dict(st.risk_errors), halted=st.halted, halt_reason=st.halt_reason,
             final_portfolio=Portfolio(cash=st.cash, positions=dict(st.positions)),
             spent_usd=st.spent_usd, periods=cfg.periods)
+
+
+HISTORY_NAME = "weights_history.jsonl"
+
+
+def _append_history(path: Path, day: date, weights: dict[str, float], state: dict, fills: list[Fill],
+                    skipped: str | None) -> None:
+    rec = {"day": dump_date(day), "weights": dict(sorted(weights.items())), "state": state,
+           "fills": [{"ticker": f.order.ticker, "side": f.order.side, "shares": f.order.shares,
+                      "date": dump_date(f.date), "price": f.price, "commission": f.commission}
+                     for f in fills],
+           "skipped": skipped}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torn = path.exists() and path.stat().st_size > 0 and not path.read_bytes().endswith(b"\n")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(("\n" if torn else "") + json.dumps(rec, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def read_day_history(path: Path, checkpoint: Checkpoint) -> dict[date, dict]:
+    """day -> {"weights", "state", "fills", "skipped"} for COMMITTED days only (on or before
+    the checkpoint's last completed day). A day re-run after a crash appears twice in the
+    file; the last line wins. A torn final line (crash mid-write) is ignored."""
+    path = Path(path)
+    raw = checkpoint.load()
+    lcd = load_date(raw["last_completed_day"]) if raw and raw.get("last_completed_day") else None
+    out: dict[date, dict] = {}
+    if lcd is None or not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        d = load_date(rec.pop("day"))
+        if d <= lcd:
+            out[d] = rec
+    return out
 
 
 def _apply_fill(portfolio: Portfolio, f: Fill, last_known: dict[str, float]) -> None:

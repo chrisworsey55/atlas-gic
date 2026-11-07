@@ -179,3 +179,17 @@ def test_fred_live():
 def test_ibkr_live():
     df = IBKRProvider("127.0.0.1", 4001, 99).fetch(["SPY"], date(2024, 1, 2), date(2024, 1, 10))
     assert list(df.columns) == PRICE_COLUMNS
+
+
+def test_csv_provider_reads_per_ticker_files_in_range(tmp_path):
+    from atlas.data.csv_provider import CsvPriceProvider
+    from atlas.data.provider import PRICE_COLUMNS
+    (tmp_path / "AAA.csv").write_text(
+        "date,open,high,low,close,adj_close,volume\n"
+        "2024-01-01,1,2,0.5,1.5,1.4,10\n2024-01-02,2,3,1.5,2.5,2.4,11\n2024-01-03,3,4,2.5,3.5,3.4,12\n")
+    df = CsvPriceProvider(tmp_path).fetch(["AAA", "ZZZ"], date(2024, 1, 2), date(2024, 1, 3))
+    assert list(df.columns) == PRICE_COLUMNS
+    assert list(df["date"]) == [date(2024, 1, 2), date(2024, 1, 3)]
+    assert set(df["ticker"]) == {"AAA"} and list(df["adj_close"]) == [2.4, 3.4]
+    with pytest.raises(FileNotFoundError):
+        CsvPriceProvider(tmp_path / "missing")

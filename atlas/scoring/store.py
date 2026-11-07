@@ -96,6 +96,7 @@ class ScoreStore:
                                 "FROM picks WHERE excess_1 IS NULL OR excess_5 IS NULL "
                                 "OR excess_10 IS NULL").fetchall()
         scored = 0
+        updates: list[tuple[int, float, str, str, str]] = []
         cal: dict[date, list[date]] = {}
         for agent, d, ticker, direction, *cur in pending:
             t = date.fromisoformat(d)
@@ -116,7 +117,10 @@ class ScoreStore:
                 ex = excess_return(tp, bp, h, cost_frac, 1 if direction == "long" else -1)
                 if ex != ex:  # NaN: missing data, leave NULL
                     continue
-                with self._conn() as c:
+                updates.append((h, ex, agent, d, ticker))
+        if updates:  # one transaction (idempotent: only NULL cells are ever filled)
+            with self._conn() as c:
+                for h, ex, agent, d, ticker in updates:
                     cur_ = c.execute(f"UPDATE picks SET excess_{h}=? WHERE agent=? AND date=? "
                                      f"AND ticker=? AND excess_{h} IS NULL", (ex, agent, d, ticker))
                     scored += cur_.rowcount

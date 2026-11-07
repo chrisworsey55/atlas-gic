@@ -172,3 +172,23 @@ def test_empty_response_records_no_coverage_and_refetches(tmp_path):
     prov.fail = True
     assert not st.snapshot(date(2024, 1, 19), ["AAA"], 5).prices.empty
     assert len(prov.calls) == n + 1
+
+
+def test_loaded_frames_are_memoised_and_invalidated_when_the_cache_file_changes(store, monkeypatch):
+    """Repeated as-of reads must not re-parse the CSV (the backtest's scoring loop reads the
+    same files thousands of times), but a refetch that rewrites the file must be seen."""
+    store.snapshot(date(2024, 1, 20), TICKERS, lookback_days=10)
+    reads = []
+    real = pd.read_csv
+    monkeypatch.setattr(pd, "read_csv", lambda *a, **k: reads.append(a) or real(*a, **k))
+    for _ in range(3):
+        store.outcome_prices("AAA", date(2024, 1, 15), date(2024, 1, 19))
+    assert reads == []
+    # extend coverage: the file is rewritten and the new rows must be visible
+    s = store.outcome_prices("AAA", date(2024, 1, 15), date(2024, 2, 9))
+    assert max(s.index) == date(2024, 2, 9)
+    # callers cannot corrupt the memoised frame
+    store._load("AAA").iloc[0:0]
+    df = store._load("AAA")
+    df.loc[df.index[0], "close"] = -1.0
+    assert store._load("AAA")["close"].iloc[0] != -1.0

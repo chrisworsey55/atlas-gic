@@ -1,0 +1,23 @@
+# Golden end-to-end run: 40 synthetic weekdays, stub model, no network, no keys needed for
+# --dry-run. Tests fill in run_dir, data.prices.dir and repo with absolute paths.
+run_dir: REPLACED_BY_TESTS
+periods:
+  train: {start: 2024-01-01, end: 2024-01-19}
+  validation: {start: 2024-01-22, end: 2024-02-02}
+  holdout: {start: 2024-02-05, end: 2024-02-23}
+initial_cash: 100000
+anonymize: false
+universe: [SPY, SMH, XLF, XLE, XLV, AAA, BBB, CCC]
+budget_usd: 50
+settings:
+  model: golden-stub-model
+  model_cutoff: 2024-01-31
+  warmup_picks: 5
+  rolling_ic_window: 20
+  min_valid_agents: 8
+  confirm_cost_usd: 25
+data:
+  prices: {source: csv, dir: prices}
+  macro: {source: none}
+  lookback_days: 30
+null_test: {n_shuffles: 200, seed: 7}

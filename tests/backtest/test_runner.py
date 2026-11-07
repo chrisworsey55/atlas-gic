@@ -790,3 +790,53 @@ def test_resume_leaves_no_stale_picks_for_layer4_agents_not_run_on_rerun(tmp_pat
     assert rows[(rows["date"] == DAY6) & rows["agent"].isin(["cro", "cio", "execution"])].empty
     ref_env = Env(tmp_path / "ref", phase2, n_days=10)
     _assert_same_run(env, res, ref_env, ref_env.run())
+
+
+# ---------------------------------------------------------------------------- day history
+
+def test_day_history_records_weights_state_and_fills_of_committed_days(tmp_path):
+    from atlas.backtest.runner import read_day_history
+    env = Env(tmp_path, n_days=6)
+    seen = []
+    real_run_day = env.pipeline.run_day
+
+    def spy_run_day(asof, snap, weights, state, **kw):
+        seen.append((asof, dict(weights), json.loads(json.dumps(state))))
+        return real_run_day(asof, snap, weights, state, **kw)
+
+    env.pipeline.run_day = spy_run_day
+    env.run(history_path=tmp_path / "weights_history.jsonl")
+    hist = read_day_history(tmp_path / "weights_history.jsonl", env.checkpoint)
+    assert sorted(hist) == WEEKDAYS[:6]
+    for asof, weights, state in seen:
+        assert hist[asof]["weights"] == weights
+        assert hist[asof]["state"] == state
+    for decision, _orders, fills, _dropped in env.broker.submits:
+        assert hist[decision]["fills"] == [
+            {"ticker": f.order.ticker, "side": f.order.side, "shares": f.order.shares,
+             "date": f.date.isoformat(), "price": f.price, "commission": f.commission} for f in fills]
+
+
+def test_day_history_after_crash_and_resume_equals_uninterrupted(tmp_path):
+    from atlas.backtest.runner import read_day_history
+    ref = Env(tmp_path / "ref", n_days=8)
+    ref.run(history_path=tmp_path / "ref" / "h.jsonl")
+    want = read_day_history(tmp_path / "ref" / "h.jsonl", ref.checkpoint)
+    root = tmp_path / "crash"
+    env = Env(root, n_days=8, checkpoint=CrashingCheckpoint(root / "cp.json", 5))
+    with pytest.raises(KeyboardInterrupt):
+        env.run(history_path=root / "h.jsonl")
+    # the crashed day's line is on disk but not committed: readers ignore it
+    assert WEEKDAYS[4] not in read_day_history(root / "h.jsonl", Checkpoint(root / "cp.json"))
+    env2 = Env(root, n_days=8, checkpoint=Checkpoint(root / "cp.json"))
+    env2.run(history_path=root / "h.jsonl")
+    assert read_day_history(root / "h.jsonl", env2.checkpoint) == want
+
+
+def test_day_history_survives_a_torn_line(tmp_path):
+    from atlas.backtest.runner import read_day_history
+    env = Env(tmp_path, n_days=3)
+    h = tmp_path / "h.jsonl"
+    h.write_text('{"day": "2024-01-0')  # crash mid-write of an earlier attempt
+    env.run(history_path=h)
+    assert sorted(read_day_history(h, env.checkpoint)) == WEEKDAYS[:3]

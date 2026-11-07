@@ -1,0 +1,22 @@
+{
+  "_doc": "Scripted stub responses for the golden backtest. For agent A on date D the stub seeds sha256('A|D') and picks n_picks tickers from A's list (rotating by the seed), direction long unless the seed bit says short (only if allow_short), conviction from conv_levels; the view cycles through views. Layer-4 'targets' agents emit long target weights from target_levels. Unknown agents (or a prompt edit that renames nothing) fall back to 'default'.",
+  "views": ["bullish", "neutral", "bearish"],
+  "conv_levels": [0.15, 0.3, 0.45, 0.6, 0.75, 0.9],
+  "target_levels": [0.08, 0.1, 0.12],
+  "agents": {
+    "macro_rates":                 {"tickers": ["SPY", "XLF", "XLV", "XLE"], "n_picks": 3, "allow_short": true},
+    "macro_volatility":            {"tickers": ["SPY", "SMH", "XLV", "BBB"], "n_picks": 3, "allow_short": true},
+    "macro_dollar_commodities":    {"tickers": ["XLE", "CCC", "SPY", "XLF"], "n_picks": 3, "allow_short": true},
+    "sector_semiconductors":       {"tickers": ["SMH", "AAA", "CCC", "SPY"], "n_picks": 3, "allow_short": true},
+    "sector_financials":           {"tickers": ["XLF", "BBB", "AAA", "SPY"], "n_picks": 3, "allow_short": true},
+    "sector_energy":               {"tickers": ["XLE", "CCC", "BBB", "SPY"], "n_picks": 3, "allow_short": true},
+    "sector_healthcare":           {"tickers": ["XLV", "AAA", "BBB", "SPY"], "n_picks": 3, "allow_short": true},
+    "superinvestor_druckenmiller": {"tickers": ["SMH", "XLE", "CCC", "AAA", "SPY"], "n_picks": 3, "allow_short": true},
+    "superinvestor_ackman":        {"tickers": ["BBB", "XLV", "XLF", "CCC", "AAA"], "n_picks": 3, "allow_short": true},
+    "cro":                         {"tickers": ["SMH", "CCC", "XLE"], "n_picks": 2, "allow_short": true},
+    "cio":                         {"tickers": ["AAA", "BBB", "CCC", "SMH", "XLF", "XLE", "XLV"], "n_picks": 4, "targets": true},
+    "execution":                   {"tickers": ["AAA", "BBB", "CCC", "SMH", "XLF", "XLE", "XLV"], "n_picks": 4, "targets": true},
+    "control":                     {"tickers": ["SPY", "AAA", "BBB", "CCC"], "n_picks": 3, "allow_short": true}
+  },
+  "default": {"tickers": ["SPY", "AAA", "BBB"], "n_picks": 2, "allow_short": true}
+}

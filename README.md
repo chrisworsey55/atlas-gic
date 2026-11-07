@@ -210,6 +210,57 @@ The trained prompts are the core IP. A competitor starting today is hundreds of 
 
 ---
 
+## Running the backtest system
+
+This repository also contains `atlas/`, a fresh, test-covered implementation of a 12-agent
+backtest harness (it is not the proprietary system described above: prompts are generic). It is
+built to be honest about what a backtest can show: point-in-time data, a hash-chained prediction
+log written before outcomes are scored, a null test, a date-only control agent and a report that
+labels pre-cutoff periods as not evidence of skill.
+
+**Prerequisites**
+
+* Python 3.11+, then `pip install -e ".[dev]"` (adds the `atlas` command; `python -m atlas` also works).
+* `ANTHROPIC_API_KEY` in the environment for real runs (`--dry-run` needs no key).
+* `FRED_API_KEY` in the environment when the run config uses `data.macro.source: fred`.
+* Optional: a running IB Gateway / TWS and `pip install -e ".[ibkr]"` for `data.prices.source: ibkr`
+  (the default price source is yfinance; `csv` reads local files).
+
+Keys are read from the environment only: never put them in a config file. The CLI never prints
+them, and a missing key stops the command before any work (exit code 2).
+
+**Workflow**
+
+```bash
+cp atlas/config/run.example.yaml my_run.yaml        # edit periods, budget, model, universe
+atlas backtest --config my_run.yaml --dry-run       # plumbing check: zero LLM calls
+atlas backtest --config my_run.yaml                 # pass 1: real model, frozen weights
+atlas calibrate --config my_run.yaml                # null test on train picks -> calibration.json
+# pass 2: a NEW run_dir whose config sets `calibration: <pass-1 run_dir>/calibration.json`
+atlas backtest --config my_run_pass2.yaml           # adaptive Darwinian weights
+atlas report --run-dir runs/pass2                   # report.md, equity.png, agents.csv, autoresearch.csv
+atlas autoresearch --config my_run_pass2.yaml       # optional: prompt edits judged on train days only
+```
+
+* Weights stay frozen until a dead zone is calibrated by the null test (pass 1). The calibrated
+  pass 2 must use a new run directory: a checkpoint refuses to resume with changed settings.
+* A run estimated above `confirm_cost_usd` asks for confirmation (or pass `--yes`); `budget_usd` is
+  a hard cap. A paused run (rate limits, budget) keeps its checkpoint: re-run the same command to
+  resume.
+* `--with-control` also runs the date-only control agent (one extra call per day); its IC appears in
+  the report next to the real agents'.
+* `autoresearch` needs a clean git working tree, edits only `atlas/prompts/`, never pushes, and needs
+  at least 40 train days. `anonymize: true` is refused for now (the prompt files name tickers).
+* Exit codes: 0 success, 1 operational failure (the message says how to fix it), 2 usage, config
+  or key error.
+
+A pre-cutoff backtest is a plumbing test, not evidence of skill. Only a holdout after the
+model's training cutoff can be, and the report's verdict stays "No evidence of skill beyond the
+null" unless that holdout clears every bar. Tests: `pytest -q` (the golden end-to-end suite in
+`tests/golden/` runs the CLI on a committed synthetic market with a scripted stub model).
+
+---
+
 ## Contact
 
 **Chris Worsey** — CEO & Technical Founder, General Intelligence Capital
