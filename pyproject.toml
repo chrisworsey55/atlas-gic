@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "pandas",
+    "numpy",
+    "scipy",
+    "pyyaml",
+    "anthropic",
+    "yfinance",
+    "requests",
+    "matplotlib",
+]
+
+[project.scripts]
+atlas = "atlas.cli:main"
+
+[project.optional-dependencies]
+ibkr = ["ib_async"]
+dev = ["pytest", "hypothesis"]
+
+[tool.setuptools.packages.find]
+include = ["atlas*"]
+
+[tool.setuptools.package-data]
+atlas = ["config/*.yaml", "prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: hits live external services; skipped by default (use --live)"]

@@ -210,6 +210,110 @@ The trained prompts are the core IP. A competitor starting today is hundreds of 
 
 ---
 
+## Running the backtest system
+
+This repository also contains `atlas/`, a fresh, test-covered implementation of a 12-agent
+backtest harness (it is not the proprietary system described above: prompts are generic). It is
+built to be honest about what a backtest can show: point-in-time data, a hash-chained prediction
+log written before outcomes are scored, a null test, a date-only control agent and a report that
+labels pre-cutoff periods as not evidence of skill.
+
+**Prerequisites**
+
+* Python 3.11+, then `pip install -e ".[dev]"` (adds the `atlas` command; `python -m atlas` also works).
+* `ANTHROPIC_API_KEY` in the environment for real runs (`--dry-run` needs no key).
+* `FRED_API_KEY` in the environment when the run config uses `data.macro.source: fred`.
+* Optional: a running IB Gateway / TWS and `pip install -e ".[ibkr]"` for `data.prices.source: ibkr`
+  (the default price source is yfinance; `csv` reads local files).
+
+Keys are read from the environment only: never put them in a config file. The CLI never prints
+them, and a missing key stops the command before any work (exit code 2).
+
+**Workflow**
+
+```bash
+cp atlas/config/run.example.yaml my_run.yaml        # edit periods, budget, model, universe
+atlas backtest --config my_run.yaml --dry-run       # plumbing check: zero LLM calls (state in <run_dir>/dry_run/)
+atlas backtest --config my_run.yaml                 # pass 1: real model, frozen weights
+atlas calibrate --config my_run.yaml                # null test on train picks -> calibration.json
+# pass 2: a NEW run_dir whose config sets `calibration: <pass-1 run_dir>/calibration.json`
+atlas backtest --config my_run_pass2.yaml           # adaptive Darwinian weights
+atlas report --run-dir runs/pass2                   # report.md, equity.png, agents.csv, autoresearch.csv
+atlas autoresearch --config my_run_pass2.yaml       # optional: prompt edits judged on train days only
+atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination probe -> contamination.json
+```
+
+* Weights stay frozen until a dead zone is calibrated by the null test (pass 1). The calibrated
+  pass 2 must use a new run directory: a checkpoint refuses to resume with changed settings.
+* A run estimated above `confirm_cost_usd` asks for confirmation (or pass `--yes`); `budget_usd` is
+  a hard cap. A paused run (rate limits, budget) keeps its checkpoint: re-run the same command to
+  resume.
+* `--with-control` also runs the date-only control agent (one extra call per day); its IC appears in
+  the report next to the real agents'.
+* `autoresearch` needs a clean git working tree, edits only `atlas/prompts/`, never pushes, and needs
+  at least 40 train days. `anonymize: true` is refused for now (the prompt files name tickers).
+* `probe` (optional) shows the model anonymised snapshots of the run's own days (opaque ids, rebased
+  prices, relative day index, sector labels; never a real ticker or date) and asks it to guess the
+  calendar date and real ticker. A high hit rate means the model can recognise those periods, so
+  trust their results less; it is not a measure of skill. Its spend counts against `budget_usd`,
+  and `atlas report` adds a "Contamination probe (optional)" section once `contamination.json`
+  exists. The older-model check (optional, `atlas.backtest.oldmodel.run_older_model_check`) reruns
+  only the window after an older model's cutoff in `<run_dir>/older_model/<model>/`; the model
+  name is yours to supply and availability is not checked.
+* A run directory remembers its validated config (`run_config.json`): re-running, calibrating or
+  researching it with a different config is refused. Unknown config keys are rejected.
+* Exit codes: 0 success, 1 operational failure (the message says how to fix it), 2 usage, config
+  or key error.
+* A request the Anthropic API rejects (HTTP 400/401/403/404, e.g. a wrong model name, key or
+  parameter) is not retried: the command stops with `error: Anthropic API rejected the request
+  (HTTP ...)`, exit 1, checkpoint intact. Rate limits, timeouts and 5xx errors stay transient
+  (retried, then the run pauses). `atlas/config/settings.yaml` sets `effort: low` and
+  `max_output_tokens: 8192` (thinking tokens count against it; a `truncated` failure means raise
+  it). One live smoke test checks the configured model: `pytest --live tests/engine/test_llm_live.py`.
+* `budget_usd` is an ESTIMATE: it counts tokens at per-model prices (a built-in table in
+  `atlas/config.py`, or `usd_per_mtok_input`/`usd_per_mtok_output` in the run config), not what
+  Anthropic bills. A model the table does not know is refused (exit 2) until both prices are set
+  (`older_usd_per_mtok_*` for the older-model check). Also set a spend limit on your Anthropic
+  account.
+* A positive verdict needs the control condition, which exists only with `atlas backtest
+  --with-control`: without it the report can never say "Possible evidence of skill".
+* `autoresearch` merges kept edits into whatever branch is checked out (it prints the branch name
+  first and refuses a detached HEAD): run it from a dedicated branch of a clean checkout.
+
+**Limitations** (also listed in every report)
+
+* `model_cutoff` in `atlas/config/settings.yaml` (2026-06-01) is a PLACEHOLDER GUESS and the
+  whole verdict rests on it: set it from the documented training-data cutoff of the exact model
+  you use. The CLI prints a warning while it is the shipped default.
+* Pricing is configured, not billed: the hard cap is an estimate (see `budget_usd` above).
+* No sampling settings are sent (current models reject `temperature`): replays are deterministic
+  only because identical inputs are served from the response cache; an uncached re-run may differ.
+* Single process only: fixed `.tmp` file names, no locks and a non-thread-safe price memo. Run
+  one process per run directory.
+* yfinance data can be stale, is adjusted as of today (adjusted-price leakage: later splits and
+  dividends are embedded) and may be throttled. The whole run range is fetched once up front and
+  a ticker with no data at all stops the run before any LLM spend, but a ticker missing on a
+  single day mid-run silently drops out of that day's snapshot.
+* The fixed universe of current constituents is survivorship-biased.
+* The contamination probe's chance rate is approximate (overstated by about 7/5).
+* Looking at the same holdout repeatedly (especially after autoresearch edits and a pass-2 run)
+  is multiple testing: each extra look weakens what a pass means.
+* The null test permutes convictions across all rows and ignores within-day clustering, so its
+  thresholds are anti-conservative when picks cluster by day. It is calibrated on the
+  macro/sector/superinvestor agents while the verdict's eligible agents also include the
+  decision layer.
+* Kept autoresearch edits are reported with "holdout IC not computed" (a known gap versus the
+  spec): confirm a kept edit with a new backtest in a new run directory before trusting it.
+* No live or paper trading exists (simulated broker only). The IBKR price provider is unverified
+  against a live gateway.
+
+A pre-cutoff backtest is a plumbing test, not evidence of skill. Only a holdout after the
+model's training cutoff can be, and the report's verdict stays "No evidence of skill beyond the
+null" unless that holdout clears every bar. Tests: `pytest -q` (the golden end-to-end suite in
+`tests/golden/` runs the CLI on a committed synthetic market with a scripted stub model).
+
+---
+
 ## Contact
 
 **Chris Worsey** — CEO & Technical Founder, General Intelligence Capital

@@ -1,0 +1,25 @@
+universe: [SPY, QQQ, IWM, SMH, XLF, XLE, XLV, AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, JPM, BAC, XOM, CVX, UNH, LLY, JNJ, V, WMT, COST]
+commission_per_share: 0.005
+commission_min: 1.0
+slippage_bps: 5
+min_valid_agents: 8
+rolling_ic_window: 60
+warmup_picks: 30
+budget_usd: 50
+model: claude-sonnet-5-5
+# PLACEHOLDER GUESS: the whole verdict rests on model_cutoff (the holdout must start after it).
+# Replace it with the documented training-data cutoff of the exact model you use.
+model_cutoff: 2026-06-01
+# request settings: effort low keeps thinking (and its billed output tokens) small; raise it
+# if agents need more reasoning. Thinking tokens count against max_output_tokens.
+effort: low
+max_output_tokens: 8192
+# usd_per_mtok_input / usd_per_mtok_output: unset = looked up by model (atlas/config.py);
+# set both for a model the table does not know. The budget cap is an estimate from these.
+shrinkage_k: 20.0
+dead_zone: null
+max_edits: 5
+max_failure_rate: 0.2
+confirm_cost_usd: 25.0
+older_model: null
+tolerance_days: 5
