@@ -82,14 +82,74 @@ def test_discard_restores_original_branch_byte_for_byte(prompt_repo):
     g.write_file(P_A, "changed\n")
     g.commit_file(P_A, "edit a")
     g.write_file(P_A, "changed again, uncommitted\n")  # mid-flight state
-    (prompt_repo / "atlas/prompts/new_untracked.md").write_text("junk")
+    g.write_file("atlas/prompts/new_by_gitops.md", "junk")  # created by GitOps, never committed
     g.discard_branch("autoresearch/agent_a-0")
     assert g.current_branch() == "main"
     assert git(prompt_repo, "rev-parse", "main") == base
     assert (prompt_repo / P_A).read_text() == PROMPT_A
-    assert not (prompt_repo / "atlas/prompts/new_untracked.md").exists()
+    assert not (prompt_repo / "atlas/prompts/new_by_gitops.md").exists()
     assert g.is_clean()
     assert not g.branch_exists("autoresearch/agent_a-0")
+
+
+def test_preexisting_untracked_prompt_file_refused_never_deleted(prompt_repo):
+    draft = prompt_repo / "atlas/prompts/my_draft.md"
+    draft.write_text("precious\n")
+    g = GitOps(prompt_repo)
+    with pytest.raises(DirtyWorkingTree):
+        g.create_branch("autoresearch/agent_a-0")
+    assert draft.read_text() == "precious\n"
+    assert g.current_branch() == "main" and not g.branch_exists("autoresearch/agent_a-0")
+
+
+def test_discard_never_deletes_files_it_did_not_write(prompt_repo):
+    g = GitOps(prompt_repo)
+    g.create_branch("autoresearch/agent_a-0")
+    g.write_file(P_A, "changed\n")
+    g.commit_file(P_A, "edit a")
+    draft = prompt_repo / "atlas/prompts/user_draft.md"
+    draft.write_text("precious\n")  # appears mid-attempt, not written by GitOps
+    g.discard_branch("autoresearch/agent_a-0")
+    assert draft.read_text() == "precious\n"
+    assert (prompt_repo / P_A).read_text() == PROMPT_A
+    assert g.current_branch() == "main"
+
+
+def test_commit_refuses_foreign_prompt_changes(prompt_repo):
+    g = GitOps(prompt_repo)
+    g.create_branch("autoresearch/agent_a-0")
+    g.write_file(P_A, "a2\n")
+    (prompt_repo / "atlas/prompts/agent_b.md").write_text("user edit\n")  # not via GitOps
+    with pytest.raises(DirtyWorkingTree):
+        g.commit_file(P_A, "edit a")
+    assert (prompt_repo / "atlas/prompts/agent_b.md").read_text() == "user edit\n"
+
+
+def test_user_hooks_are_not_executed(prompt_repo):
+    hook = prompt_repo / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\necho hacked > atlas/config/limits.yaml\ngit add atlas/config/limits.yaml\n")
+    hook.chmod(0o755)
+    g = GitOps(prompt_repo)
+    g.create_branch("autoresearch/agent_a-0")
+    g.write_file(P_A, "a2\n")
+    sha = g.commit_file(P_A, "edit a")
+    assert (prompt_repo / "atlas/config/limits.yaml").read_text() == "max_position_pct: 0.1\n"
+    assert git(prompt_repo, "show", "--name-only", "--format=", sha) == P_A
+    assert g.is_clean()
+
+
+def test_identity_fallback_when_unset(prompt_repo, monkeypatch, tmp_path):
+    git(prompt_repo, "config", "--unset", "user.name")
+    git(prompt_repo, "config", "--unset", "user.email")
+    monkeypatch.setenv("HOME", str(tmp_path))  # no global identity either
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for v in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.delenv(v, raising=False)
+    g = GitOps(prompt_repo)
+    g.create_branch("autoresearch/agent_a-0")
+    g.write_file(P_A, "a2\n")
+    sha = g.commit_file(P_A, "edit a")
+    assert git(prompt_repo, "show", "-s", "--format=%an", sha) == "atlas-autoresearch"
 
 
 def test_commit_only_commits_the_named_file(prompt_repo):

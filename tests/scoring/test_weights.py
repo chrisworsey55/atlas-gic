@@ -160,6 +160,16 @@ def test_collect_stats_rolling_window_keeps_most_recent():
     assert s.n_picks == 20 and s.ic > 0.9
 
 
+def test_collect_stats_max_date_excludes_later_picks_before_windowing():
+    d = frame("a", 50)
+    d.loc[d.index[30:], "excess"] = -d.loc[d.index[30:], "conviction"]  # later regime: negative IC
+    d["signed_excess"] = d["excess"]
+    cut = d["date"].iloc[29]
+    s = collect_stats(FakeScores(d), ["a"], asof_window=20, max_date=cut)[0]
+    assert s.n_picks == 20 and s.ic > 0.9  # the window ends at the cut, not at the last pick
+    assert collect_stats(FakeScores(d), ["a"], asof_window=20)[0].ic < -0.9
+
+
 def test_collect_stats_nan_when_undefined_and_no_picks():
     d = frame("a", 2)
     out = {s.agent: s for s in collect_stats(FakeScores(d), ["a", "ghost"], asof_window=60)}

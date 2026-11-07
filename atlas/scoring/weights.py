@@ -14,6 +14,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from atlas.scoring.metrics import rank_ic
@@ -80,13 +81,23 @@ class WeightBook:
         os.replace(tmp, self._path)
 
 
+def window_frame(scores: ScoreStore, agent: str, asof_window: int, horizon: int = 1,
+                 max_date: date | None = None):
+    """The scored, non-overlapping rows behind an agent's rolling IC (the last `asof_window`
+    rows). `max_date` drops picks dated after it BEFORE the window is taken."""
+    df = scores.picks_frame(agent, horizon)
+    df = df[df["scored"]]
+    if max_date is not None:
+        df = df[df["date"] <= max_date]
+    df = df.sort_values(["date", "ticker"], kind="stable")
+    df = non_overlapping(df, horizon).sort_values(["date", "ticker"], kind="stable")
+    return df.tail(asof_window)
+
+
 def collect_stats(scores: ScoreStore, agents: list[str], asof_window: int,
-                  horizon: int = 1) -> list[AgentStats]:
+                  horizon: int = 1, max_date: date | None = None) -> list[AgentStats]:
     out = []
     for agent in agents:
-        df = scores.picks_frame(agent, horizon)
-        df = df[df["scored"]].sort_values(["date", "ticker"], kind="stable")
-        df = non_overlapping(df, horizon).sort_values(["date", "ticker"], kind="stable")
-        df = df.tail(asof_window)
+        df = window_frame(scores, agent, asof_window, horizon, max_date)
         out.append(AgentStats(agent, len(df), rank_ic(df["conviction"], df["excess"])))
     return out
