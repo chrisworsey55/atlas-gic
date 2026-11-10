@@ -553,7 +553,8 @@ def test_report_errors_section_missing_empty_and_torn_log(golden, tmp_path):  # 
         md = (run_dir / "report" / "report.md").read_text()
         return md.split("## Errors")[1].split("\n## ")[0]
 
-    assert "not provided" in errors_section()
+    assert "no errors logged" in errors_section()  # a real run (checkpoint) whose log never got an event
+    assert "not provided" not in errors_section()
     log.write_text("")
     assert "no errors logged" in errors_section()
     good = ('{"ts_utc":"t","level":"error","kind":"agent_failure","day":null,"agent":"cro",'
@@ -561,3 +562,15 @@ def test_report_errors_section_missing_empty_and_torn_log(golden, tmp_path):  # 
     log.write_text("garbage\n" + good + "\n" + '{"torn":')  # bad middle line, torn tail
     s = errors_section()
     assert "agent_failure" in s and "hello" in s
+
+
+def test_unexpected_exception_stderr_line_escapes_control_and_bidi_characters(tmp_path, monkeypatch, capsys):
+    def explode(args, llm_client=None):
+        raise RuntimeError("bad \x1b[31mred\x1b[0m \u202eevil\u200b end\r\nnext")
+
+    monkeypatch.setitem(cli_mod.COMMANDS, "backtest", explode)
+    assert cli(["backtest", "--config", str(tmp_path / "x.yaml")]) == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1  # one line
+    assert "\x1b" not in err and "\u202e" not in err and "\u200b" not in err and "\r" not in err
+    assert "error: unexpected RuntimeError: bad " in err and "red" in err

@@ -39,6 +39,8 @@ DISCLAIMER = "This backtest is not evidence of future profitability."
 CONTROL_AGENT = "control"
 PAIR_CAVEAT = ("a prompt that abstains selectively inside a day can inflate paired IC; "
                "kept edits must be confirmed on the holdout")
+PAIR_CAVEAT_VALIDATED = ("a prompt that abstains selectively inside a day can inflate paired IC; "
+                         "kept edits also passed a validation replay but are still not confirmed on the holdout")
 EXTRA_LIMITATIONS = [
     "This backtest is a plumbing test: it checks that the machinery runs end to end.",
     "Pre-cutoff results are not evidence of skill (the model may have seen those dates).",
@@ -51,6 +53,16 @@ EXTRA_LIMITATIONS = [
     "The holdout IC of kept autoresearch edits is not computed (a known gap versus the spec): a "
     "kept edit is judged on train days only until it is re-run on the holdout.",
 ]
+GAP_LIMITATION_VALIDATED = (
+    "The holdout IC of kept autoresearch edits is not computed (a known gap versus the spec): a "
+    "kept edit was judged on train days and passed a validation replay, but is not holdout-confirmed "
+    "until it is re-run on the holdout.")
+AUTORESEARCH_GAP_VALIDATED = (
+    "Kept edits show 'holdout IC not computed': this is a known gap versus the spec. "
+    "The keep decision used train days and a validation replay (not the holdout), and this report does "
+    "not re-run the edited prompt on the holdout. To confirm a kept edit, run a backtest with the "
+    "edited prompts in a new run_dir (the old checkpoint fingerprints the prompts) and "
+    "read that run's holdout IC for the agent; until then treat the edit as not holdout-confirmed.")
 AUTORESEARCH_GAP = ("Kept edits show 'holdout IC not computed': this is a known gap versus the spec. "
                     "The keep decision used train days only, and this report does not re-run the "
                     "edited prompt on the holdout. To confirm a kept edit, run a backtest with the "
@@ -164,11 +176,33 @@ def _num_of(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _validation_confirmed(edits: list) -> bool:
+    """True when the log shows validation confirmation was on for at least one attempt."""
+    for e in edits:
+        c = _confirm_of(e)
+        if c is not None and (_num_of(c.get("n_days_requested")) or 0) > 0:
+            return True
+        g = getattr(e, "gates", None)
+        if isinstance(g, dict) and g.get("confirm_on_validation") is True:
+            return True
+    return False
+
+
+def _extra_limitations(validated: bool) -> list[str]:
+    out = list(EXTRA_LIMITATIONS)
+    if validated:
+        out = [x.replace(PAIR_CAVEAT, PAIR_CAVEAT_VALIDATED) for x in out]
+        out = [GAP_LIMITATION_VALIDATED if x.startswith("The holdout IC of kept") else x for x in out]
+    return out
+
+
 def _confirmation_section(edits: list) -> list[str]:
     """Validation confirmation of train wins: a count over the WHOLE log and one row per edit that
     has a `confirm` record (old logs without one simply have no rows)."""
     confs = [(e, _confirm_of(e)) for e in edits]
     ran = sum(1 for _, c in confs if c is not None and (_num_of(c.get("n_days_requested")) or 0) > 0)
+    if not edits:
+        return ["No autoresearch attempts are logged.\n"]
     out = [f"Validation confirmations run: {ran} (of {len(edits)} logged attempts, whole log).",
            "Validation is a repeatedly used sample: every confirmation replays the same most recent "
            "validation days, so each one partly spends them and a lucky edit becomes more likely the "
@@ -606,7 +640,7 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
         md.append(line)
     if any(e.decision == "kept" and holdout_edit_ics.get(e.agent) is None for e in edits):
         md.append("")
-        md.append(AUTORESEARCH_GAP)
+        md.append(AUTORESEARCH_GAP_VALIDATED if _validation_confirmed(edits) else AUTORESEARCH_GAP)
     md.append("")
     md += _confirmation_section(edits)
 
@@ -686,7 +720,7 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
 
     # ---- limitations
     md += ["## Limitations\n"]
-    md += [f"- {x}" for x in list(result.limitations) + EXTRA_LIMITATIONS]
+    md += [f"- {x}" for x in list(result.limitations) + _extra_limitations(_validation_confirmed(edits))]
     if mixed:
         md.append("- Mixed models: results cannot be attributed to the hub or the spokes (models: "
                   + ", ".join(_err_text(m, 200) for m in sorted(set(agent_models.values()))) + ").")

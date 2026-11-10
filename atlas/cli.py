@@ -1478,8 +1478,11 @@ def cmd_report(args, llm_client=None) -> int:
             raise OperationalError(f"{run_dir / CONTAMINATION} is corrupt; delete it or re-run "
                                    "`atlas probe`") from None
     errors_path = rc.path(ERRORS_NAME)
-    error_events = None  # missing log -> "not provided"; unreadable lines are skipped
-    if errors_path.is_file():
+    error_events = None  # unreadable log -> "not provided"; unreadable lines are skipped
+    if not errors_path.exists():
+        # errors.log appears with the first event: a real run (it has a checkpoint) without one is clean
+        error_events = [] if ckpt.path.exists() or (run_dir / PREDLOG).exists() else None
+    elif errors_path.is_file():
         try:
             error_events = read_events(errors_path, strict=False)
         except OSError:
@@ -1827,7 +1830,7 @@ def main(argv: list[str] | None = None, *, llm_client=None) -> int:
     except Exception as e:  # noqa: BLE001 - last resort: one line, never a traceback (Ctrl-C/exit pass)
         _record_known("unexpected_exception", e)
         where = f" (details: {ACTIVE_ERRORLOG.path})" if ACTIVE_ERRORLOG is not None and ACTIVE_ERRORLOG.path else ""
-        print(f"error: unexpected {type(e).__name__}: {sanitise(str(e))}{where}", file=sys.stderr)
+        print(f"error: unexpected {type(e).__name__}: {escape_controls(sanitise(str(e)))}{where}", file=sys.stderr)
         return EXIT_FAILED
 
 

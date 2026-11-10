@@ -9,10 +9,12 @@ import math
 import re
 import threading
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
+import atlas.backtest.runner as runner_mod
 import atlas.engine.agent as agent_mod
 from atlas.backtest.checkpoint import Checkpoint
 from atlas.backtest.predlog import PredictionLog
@@ -911,3 +913,70 @@ def test_prefetch_leaves_the_run_identical(tmp_path):
     pd.testing.assert_series_equal(ra.equity, rb.equity)
     assert a.predlog.path.read_bytes() == b.predlog.path.read_bytes()
     assert sorted(a.calls) == sorted(b.calls)  # identical inputs (snapshots) to every agent
+
+
+# ---------------------------------------------------------------------------- fingerprint compat
+
+def _old_fingerprint_fn():
+    """The ``_fingerprint`` of commit 9ce69b3 (before AgentSpec.model / spoke_model existed),
+    executed from its own source so the test cannot drift with the current implementation."""
+    import subprocess
+    src = subprocess.run(["git", "show", "9ce69b3:atlas/backtest/runner.py"], capture_output=True, text=True,
+                         cwd=Path(__file__).resolve().parents[2], check=True).stdout
+    start = src.index("def _sha(")
+    end = src.index("# ----", src.index("def _fingerprint("))
+    ns = {k: v for k, v in vars(runner_mod).items() if not k.startswith("__")}
+    exec(compile(src[start:end], "old_runner_fingerprint", "exec"), ns)
+    old = ns["_fingerprint"]
+
+    class _OldSpec:  # an AgentSpec as it was then: no ``model`` field
+        def __init__(self, sp):
+            self.sp = sp
+
+        def model_dump(self, **kw):
+            d = self.sp.model_dump(**kw)
+            d.pop("model")
+            return d
+
+    def wrapped(cfg, pipeline, *a):
+        shim = type("P", (), {"specs": {n: _OldSpec(sp) for n, sp in pipeline.specs.items()},
+                              "prompts": pipeline.prompts})()
+        return old(cfg, shim, *a)
+    return wrapped
+
+
+def test_fingerprint_is_identical_to_pre_hubspoke_algorithm(tmp_path):
+    env = Env(tmp_path, n_days=4)
+    args = (env.cfg, env.pipeline, INITIAL, list(UNIVERSE), SECTORS, 60, ())
+    assert runner_mod._fingerprint(*args) == _old_fingerprint_fn()(*args)
+
+
+def test_old_checkpoint_still_resumes_with_new_code(tmp_path, monkeypatch):
+    env = Env(tmp_path, n_days=4)
+    env.run()
+    # rewrite the checkpoint's fingerprint as the old algorithm produced it
+    monkeypatch.setattr(runner_mod, "_fingerprint", _old_fingerprint_fn())
+    env_old = Env(tmp_path, n_days=4)
+    cp = json.loads(env_old.checkpoint.path.read_text())
+    cp["fingerprint"] = runner_mod._fingerprint(env_old.cfg, env_old.pipeline, INITIAL, list(UNIVERSE),
+                                                SECTORS, 60, ())
+    env_old.checkpoint.path.write_text(json.dumps(cp))
+    monkeypatch.undo()
+    res = Env(tmp_path, n_days=4).run()  # must not raise ResumeRefused
+    assert res.skipped == {}
+
+
+def test_resume_refused_when_an_agent_model_changed(tmp_path):
+    def mutate(e):
+        specs = {n: sp.model_copy() for n, sp in e.pipeline.specs.items()}
+        specs["s2"] = specs["s2"].model_copy(update={"model": "other-model"})
+        e.pipeline.specs = specs
+    assert "agents" in _resume_with(tmp_path, mutate)
+
+
+def test_resume_refused_when_spoke_model_set(tmp_path):
+    def mutate(e):
+        e.settings = settings(spoke_model="spoke-m", spoke_usd_per_mtok_input=1.0, spoke_usd_per_mtok_output=2.0)
+        e.cfg = BacktestConfig(periods=e.cfg.periods, settings=e.settings, limits=e.cfg.limits,
+                               anonymize=False, dry_run=False)
+    assert "settings.spoke_model" in _resume_with(tmp_path, mutate)

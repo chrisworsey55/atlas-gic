@@ -494,6 +494,15 @@ FINGERPRINT_SETTINGS = ("model", "effort", "dead_zone", "shrinkage_k", "warmup_p
                         "slippage_bps", "commission_per_share", "commission_min", "min_valid_agents")
 
 
+def _spec_dump(sp) -> dict:
+    """Per-agent fingerprint input. ``model`` joined AgentSpec later; it is left out while unset so
+    checkpoints written before it existed (and single-model runs) hash exactly as before."""
+    d = sp.model_dump(mode="json")
+    if d.get("model") is None:
+        d.pop("model", None)
+    return d
+
+
 def _fingerprint(cfg: BacktestConfig, pipeline: Pipeline, initial_cash, universe, universe_sectors,
                  lookback_days, macro_series) -> dict:
     """Everything a resumed run must share with the run that wrote the checkpoint, as flat
@@ -504,9 +513,11 @@ def _fingerprint(cfg: BacktestConfig, pipeline: Pipeline, initial_cash, universe
           "universe": sorted(universe), "lookback_days": int(lookback_days),
           "macro_series": [str(m) for m in macro_series],
           "universe_sectors": dict(sorted(universe_sectors.items())) if universe_sectors else None,
-          "agents": _sha(sorted((sp.model_dump(mode="json") for sp in pipeline.specs.values()),
+          "agents": _sha(sorted((_spec_dump(sp) for sp in pipeline.specs.values()),
                                 key=lambda d: d["name"]))}
     fp.update({f"settings.{k}": getattr(s, k) for k in FINGERPRINT_SETTINGS})
+    if s.spoke_model:  # only when set, so checkpoints from before hub/spoke keep their fingerprint
+        fp["settings.spoke_model"] = s.spoke_model
     fp.update({f"limits.{k}": v for k, v in cfg.limits.model_dump().items()})
     fp.update({f"prompt.{n}": _sha(t) for n, t in sorted(pipeline.prompts.items())})
     return json.loads(json.dumps(fp))  # normalise to what a checkpoint round-trip yields

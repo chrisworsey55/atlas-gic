@@ -304,3 +304,39 @@ def test_report_gate_notes_for_old_and_on_logs(tmp_path):
     mixed = _ar(build(tmp_path / "m", edits=[_rec("a", "kept", None, gates={"confirm_on_validation": False}),
                                              _rec("b")]).read_text())
     assert "DISABLED for 1 logged attempts" in mixed and "Confirmation was off for every" not in mixed
+
+
+# ---------------------------------------------------------------------------- truthful wording
+
+def _limits(md):
+    return md.split("## Limitations")[1]
+
+
+def test_wording_with_validation_confirmation_says_validation_replay_not_train_only(tmp_path):
+    md = build(tmp_path, edits=[_rec("a")]).read_text()
+    assert "kept edits also passed a validation replay but are still not confirmed on the holdout" in md
+    assert "judged on train days and passed a validation replay" in _limits(md)
+    assert "kept edits must be confirmed on the holdout" not in md
+    assert "judged on train days only" not in md
+    assert "The keep decision used train days and a validation replay" in _ar(md)
+
+
+def test_wording_without_validation_confirmation_is_the_old_text(tmp_path):
+    md = build(tmp_path, edits=[_rec("a", confirm=None)]).read_text()
+    assert "kept edits must be confirmed on the holdout" in md
+    assert "judged on train days only until it is re-run on the holdout" in md
+    assert "The keep decision used train days only" in _ar(md)
+    off = build(tmp_path / "o", edits=[_rec("a", confirm=None, gates={"confirm_on_validation": False})]).read_text()
+    assert "judged on train days only" in off and "validation replay" not in _ar(off)
+
+
+def test_verdict_section_identical_for_old_and_new_wording(tmp_path):
+    v = lambda md: md.split("## Verdict")[1].split("\n## ")[0]  # noqa: E731
+    assert v(build(tmp_path / "a", edits=[_rec("a", confirm=None)]).read_text()) == \
+        v(build(tmp_path / "b", edits=[_rec("a")]).read_text())
+
+
+def test_no_attempts_logged_says_so(tmp_path):
+    s = _ar(build(tmp_path, edits=[]).read_text())
+    assert "No autoresearch attempts are logged." in s
+    assert "Validation confirmations run" not in s and "older log" not in s
