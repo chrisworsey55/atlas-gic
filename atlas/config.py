@@ -183,7 +183,12 @@ class Settings(BaseModel):
         if self.spoke_model and model == self.spoke_model:
             return model_prices(model, (self.spoke_usd_per_mtok_input, self.spoke_usd_per_mtok_output),
                                 fields=("spoke_usd_per_mtok_input", "spoke_usd_per_mtok_output"))
-        return model_prices(model)
+        if model in MODEL_PRICES_USD_PER_MTOK:
+            return MODEL_PRICES_USD_PER_MTOK[model]
+        raise UnknownModelPrice(
+            f"no price is known for the per-agent model '{model}': add it to MODEL_PRICES_USD_PER_MTOK "
+            f"(settings.usd_per_mtok_* price only settings.model). Known models: "
+            f"{', '.join(sorted(MODEL_PRICES_USD_PER_MTOK))}")
 
     def older_prices(self, model: str | None = None) -> tuple[float, float]:
         """Prices of the older model (`model` or `older_model`): its own explicit pair or table
