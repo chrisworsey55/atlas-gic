@@ -460,3 +460,62 @@ def test_edit_gate_applies_to_the_validation_result(tmp_path, prompt_repo):
     assert c["diff"] > c["margin"] and c["n_days"] >= 20
     assert c["reason"].startswith("gate:") and "failed on" in c["reason"]
     unchanged(prompt_repo, base)
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def test_validation_imputation_makes_dropping_the_worst_pick_unconfirmed(tmp_path, prompt_repo):
+    """On validation the new prompt is the old one minus the day's worst pick (lowest signed
+    conviction x excess), with no boost. Imputed, that is neutral (diff 0): unconfirmed. Without
+    imputation on the validation replay it would look like a +0.17 gain and be kept."""
+    tickers = [f"S{i}" for i in range(10)]
+
+    def ex(day, t):
+        return _u("sx", day, t) * 0.02
+
+    def make(agent):
+        def run_one(day, prompt):
+            exs = [ex(day, t) for t in tickers]
+            if not prompt.endswith(NEW_SUFFIX):
+                return DayPairs(list(tickers), [_u("sc", day, t) for t in tickers], exs)
+            if not in_val(day):  # a genuine train win: convictions track excess
+                return DayPairs(list(tickers), [e / 0.02 for e in exs], exs)
+            conv = [_u("sc", day, t) for t in tickers]
+            worst = min(range(len(tickers)), key=lambda i: conv[i] * exs[i])
+            keep = [i for i in range(len(tickers)) if i != worst]
+            return DayPairs([tickers[i] for i in keep], [conv[i] for i in keep], [exs[i] for i in keep])
+        run_one.horizon = 1
+        return run_one
+
+    cfg = settings(min_pair_ratio=0.85)
+    vd = validation_days(TRADING_DAYS, PERIODS, 1, 60)
+    plain = paired_replay("agent_a", PROMPT_A, PROMPT_A + NEW_SUFFIX, vd, make("agent_a"), impute=False, min_days=20)
+    assert edit_gate(plain, cfg, min_days=20) is None and plain.diff > 0.15  # would pass unimputed
+    base = git(prompt_repo, "rev-parse", "main")
+    recs = run(tmp_path, prompt_repo, make=make, keep_margin=0.1, cfg=cfg)
+    c = recs[0].confirm
+    assert recs[0].diff > 0.5  # train win
+    assert recs[0].decision == "unconfirmed" and c["passed"] is False
+    assert c["diff"] == pytest.approx(0.0, abs=1e-12)
+    unchanged(prompt_repo, base)
+
+
+def test_check_validation_only_honours_the_horizon():
+    # horizon 3: the last three validation days have their exit in the holdout
+    for d in VAL_TRADING[-3:]:
+        check_validation_only([VAL_TRADING[-4]], TRADING_DAYS, PERIODS, horizon=3)
+        if d != LAST_VAL_DAY:
+            check_validation_only([d], TRADING_DAYS, PERIODS, horizon=1)  # fine at horizon 1
+        with pytest.raises(HoldoutViolation):
+            check_validation_only([d], TRADING_DAYS, PERIODS, horizon=3)
+
+
+def test_zero_validation_diff_is_not_kept_even_with_zero_margin(tmp_path, prompt_repo):
+    # validation outputs are identical under both prompts: diff 0 is not > margin 0
+    base = git(prompt_repo, "rev-parse", "main")
+    recs = run(tmp_path, prompt_repo, make=split_run_one_day(val_skill=0.0), keep_margin=0.0)
+    c = recs[0].confirm
+    assert recs[0].diff > 0.5 and c["margin"] == 0.0
+    assert c["diff"] == pytest.approx(0.0, abs=1e-12)
+    assert recs[0].decision == "unconfirmed" and c["passed"] is False
+    unchanged(prompt_repo, base)

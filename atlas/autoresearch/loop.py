@@ -28,9 +28,10 @@ Per attempt (at most ``Settings.max_edits`` per call):
    ``min_days=confirm_min_days``) and the finite validation diff exceeds
    ``confirm_margin(keep_margin, rolling_ic_window, new_pairs)``. Otherwise the decision is
    ``unconfirmed`` (also when validation is too short: fail safe; no replay is run then).
-   Note: the gate already requires ``new_pairs >= rolling_ic_window``, so with the same gate
-   the sqrt factor of ``confirm_margin`` is 1 whenever the gate passes; it only matters if
-   the gate's pair floor is ever relaxed for validation.
+   Note: the gate already requires ``new_pairs >= rolling_ic_window``, so the sqrt factor of
+   ``confirm_margin`` is 1 whenever the gate passes (effective margin = keep_margin), and the
+   effective minimum validation length is about rolling_ic_window / picks_per_day comparable
+   days, which can exceed ``confirm_min_days`` (window 60 at 1-2 picks/day: 30-60 days).
    Kept => merged into the branch that was checked out; otherwise the branch is discarded
    and the original branch and prompt file stay byte-for-byte unchanged, including when
    evaluation or confirmation raises.
@@ -53,7 +54,9 @@ Each confirmation spends part of the validation set (the same most recent days e
 it is recorded: ``EditRecord.confirm`` holds the validation numbers (None when no confirmation
 was attempted; ``n_days_requested == 0`` when validation was too short and nothing was
 replayed). The number of confirmations run is the count of log lines with
-``confirm.n_days_requested > 0``; ``Settings.max_edits`` caps attempts and so confirmations.
+``confirm.n_days_requested > 0``; ``Settings.max_edits`` caps attempts and so confirmations
+PER CALL of run_autoresearch (per ``atlas autoresearch`` invocation), not per run directory:
+repeated invocations keep consuming the same validation days, so count them across the log.
 The validation replay's LLM calls go through the same ``CachedLLM`` (one budget) and are
 included in ``cost_usd``.
 
@@ -455,7 +458,12 @@ def validation_days(trading_days: Sequence[date], periods: Periods, horizon: int
 def confirm_margin(keep_margin: float, window: int, new_pairs: int) -> float:
     """The validation keep margin: ``keep_margin`` (calibrated on `window` pairs) scaled by
     sqrt(window / new_pairs) when the validation sample is smaller, never below keep_margin.
-    A heuristic: the null spread of an IC shrinks roughly with the square root of the sample."""
+    A heuristic: the null spread of an IC shrinks roughly with the square root of the sample.
+
+    Inert as used (a deliberate, stricter literal reading of the spec): the confirmation also
+    applies ``edit_gate``, which requires ``new_pairs >= rolling_ic_window``, so whenever the
+    gate passes the factor is 1 and the effective margin equals ``keep_margin``. The scaling
+    only takes effect if the gate's pair floor is ever relaxed for validation."""
     return keep_margin * max(1.0, math.sqrt(window / max(1, new_pairs)))
 
 
