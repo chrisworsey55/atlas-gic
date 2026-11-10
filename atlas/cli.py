@@ -6,7 +6,7 @@ Commands (``atlas <command> --help`` for options)::
     atlas calibrate --config RUN.yaml
     atlas autoresearch --config RUN.yaml
     atlas report --run-dir RUN_DIR
-    atlas probe --run-dir RUN_DIR [--samples N] [--yes]      (optional)
+    atlas probe --run-dir RUN_DIR [--samples N] [--model MODEL] [--yes]      (optional)
     atlas errors --run-dir RUN_DIR [--tail N] [--kind KIND]  (read-only; needs no keys)
 
 The run config (documented by ``atlas/config/run.example.yaml``) names a run directory that
@@ -63,7 +63,9 @@ spent_by_model, and the report then shows a model column and per-model cost.
 the run's own days (opaque ids, rebased prices, relative day index, sector labels) and records
 how often it succeeds; a high rate means the model can recognise those periods, so trust their
 results less. It is the only feature that builds anonymised snapshots and it sends them only to
-the probe prompt. Its spend counts against the same hard cap.
+the probe prompt. Its spend counts against the same hard cap. It probes EVERY model in use (hub,
+spoke, per-agent overrides) on the same snapshots; ``--model`` restricts it to one, and the report
+then warns that the others were not checked.
 
 Anonymised runs are refused (ruling W): anonymised prompt variants do not exist yet and the
 real prompt files name tickers and ask for dates.
@@ -824,10 +826,36 @@ def spend_so_far(run_dir: Path) -> dict[str, float]:
     return spent
 
 
+def read_probe_split(run_dir: Path, hub: str) -> dict[str, float]:
+    """Probe spend by model from probe.json: its ``by_model`` (any remainder of ``spent_usd`` that
+    by_model does not account for is Budget.UNATTRIBUTED); a probe.json written before per-model
+    probing has none and is all attributed to the hub. Always sums to the file's ``spent_usd``."""
+    path = Path(run_dir) / PROBE_STATE
+    total = _read_spend(path)
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if "by_model" not in raw:
+        return {hub: total} if total > 0 else {}
+    try:
+        split = {str(m): float(v) for m, v in raw["by_model"].items()}
+    except (AttributeError, TypeError, ValueError):
+        raise OperationalError(f"{PROBE_STATE} is corrupt: {path}") from None
+    if not all(math.isfinite(v) and v >= 0 for v in split.values()):
+        raise OperationalError(f"{PROBE_STATE} is corrupt: {path}")
+    rest = total - sum(split.values())
+    tol = 1e-9 * max(1.0, total)
+    if rest < -tol:
+        raise OperationalError(f"{PROBE_STATE} is corrupt: {path}")
+    if rest > tol:
+        split[Budget.UNATTRIBUTED] = split.get(Budget.UNATTRIBUTED, 0.0) + rest
+    return split
+
+
 def spend_by_model(run_dir: Path, settings: Settings, specs: list[AgentSpec]) -> dict[str, float]:
     """The run directory's spend (the same total as spend_so_far) split by model: the
     backtest from the checkpoint's spent_by_model, the control agent at its own model, the
-    probe at the hub model. Spend that cannot be split (autoresearch, older-model checks, a
+    probe from probe.json's by_model (a probe.json without it is all hub). Spend that cannot be split (autoresearch, older-model checks, a
     checkpoint written before per-model tracking) is Budget.UNATTRIBUTED."""
     run_dir = Path(run_dir)
     spent = spend_so_far(run_dir)
@@ -852,7 +880,8 @@ def spend_by_model(run_dir: Path, settings: Settings, specs: list[AgentSpec]) ->
         add(Budget.UNATTRIBUTED, spent["backtest"])
     control = next((sp for sp in specs if sp.kind == "control"), None)
     add(settings.agent_model(control) if control is not None else Budget.UNATTRIBUTED, spent["control"])
-    add(settings.model, spent["probe"])
+    for m, v in read_probe_split(run_dir, settings.model).items():  # per model; an old file is all hub
+        add(m, v)
     add(Budget.UNATTRIBUTED, spent["autoresearch"] + spent["older_model"])
     return out
 
@@ -1509,7 +1538,7 @@ def _is_dry_run_dir(run_dir: Path) -> bool:
 
 def cmd_probe(args, llm_client=None) -> int:
     """(optional) Contamination probe on anonymised snapshots of the stored run's days."""
-    from atlas.backtest.contamination import chance_rates, contamination_probe
+    from atlas.backtest.contamination import PROBE_AGENT, ContaminationScore, chance_rates, contamination_probe
     from atlas.backtest.runner import anonymize_snapshot
     run_dir = Path(args.run_dir)
     if _is_dry_run_dir(run_dir):
@@ -1529,22 +1558,33 @@ def cmd_probe(args, llm_client=None) -> int:
         print(f"note: only {len(pool)} eligible trading days in the run; probing {len(pool)} samples "
               f"instead of {samples}")
         samples = len(pool)
+    in_use = models_in_use(settings, specs)
+    want = getattr(args, "model", None)
+    if want is not None and want not in in_use:
+        raise UsageError(f"--model '{escape_controls(sanitise(str(want), 200))}' is not a model this run uses; "
+                         f"models in use: {', '.join(escape_controls(sanitise(m, 200)) for m in in_use)}")
+    probed = in_use if want is None else [want]
+    try:  # every selected model needs prices (the one cap could not be enforced otherwise)
+        prices = {m: settings.prices_for(m) for m in probed}
+    except UnknownModelPrice as e:
+        raise UsageError(str(e)) from None
     spent = spend_so_far(run_dir)
     remaining = settings.budget_usd - sum(spent.values())
     if remaining <= 0:
         raise OperationalError(f"LLM budget exhausted: ${sum(spent.values()):.2f} of ${settings.budget_usd:.2f} "
                                "already spent on this run (backtest + control + autoresearch + probe + "
                                "older-model checks); raise budget_usd")
-    p_in, p_out = require_prices(settings)
-    est = samples * (settings.est_input_tokens_per_call * p_in + 100 * p_out) / 1e6
+    multi = len(probed) > 1
+    est = sum(samples * (settings.est_input_tokens_per_call * prices[m][0] + 100 * prices[m][1]) / 1e6
+              for m in probed)  # all selected models, before any call
     if est > settings.confirm_cost_usd and not _confirm(est, settings.confirm_cost_usd, args.yes):
         return EXIT_USAGE
-    # the hub model only (its own prices); a private cap of what remains of the run's one cap
-    client = client_for(llm_client, settings, settings.model)
-    llm = CachedLLM(client, rc.llm_cache_path, settings.model, (p_in, p_out), remaining)
+    if multi:
+        print(f"probing {len(probed)} models on the same {samples} anonymised snapshots "
+              f"(estimated cost ${est:.2f}): " + ", ".join(escape_controls(sanitise(m, 200)) for m in probed))
     universe = list(dict.fromkeys(settings.universe))
     labels = probe_sector_labels(universe)
-    chosen = probe_selection(pool, universe, samples, PROBE_SEED)
+    chosen = probe_selection(pool, universe, samples, PROBE_SEED)  # once: every model sees these
     items = []
     for day, ticker in chosen:
         snap = run.store.snapshot(day, [ticker], rc.data.lookback_days)
@@ -1553,50 +1593,94 @@ def cmd_probe(args, llm_client=None) -> int:
     run.errors = open_error_log(run_dir / ERRORS_NAME)
     failures = FailureLog(run_dir / PROBE_FAILURES, error_log=run.errors)
     prev = _read_spend(run_dir / PROBE_STATE)
+    prev_by = read_probe_split(run_dir, settings.model)
+    # one private cap for all the probe's clients: what remains of the run's one cap (this probe's
+    # earlier spend is already subtracted in `remaining`, so this Budget starts from zero)
+    shared = Budget(remaining)
+    scores: dict[str, ContaminationScore] = {}
     try:
-        score = contamination_probe(items, llm, settings.tolerance_days, failures=failures,
-                                    max_tokens=settings.max_output_tokens)
+        for m in probed:
+            if any(sc.budget_exhausted for sc in scores.values()):
+                continue  # the cap is spent: later models are not started
+            llm = CachedLLM(client_for(llm_client, settings, m), rc.llm_cache_path, m, prices[m], remaining,
+                            budget=shared)
+            scores[m] = contamination_probe(items, llm, settings.tolerance_days, failures=failures,
+                                            max_tokens=settings.max_output_tokens,
+                                            agent=PROBE_AGENT if m == settings.model else f"{PROBE_AGENT}[{m}]")
     finally:
-        _write_json(run_dir / PROBE_STATE, {"spent_usd": prev + llm.spent_usd})
+        this_run = shared.spent_by_model()
+        new_by = dict(prev_by)
+        for m, v in this_run.items():
+            new_by[m] = new_by.get(m, 0.0) + v
+        _write_json(run_dir / PROBE_STATE, {"spent_usd": prev + shared.spent_usd, "by_model": new_by})
     chance_d, chance_t = chance_rates(settings.tolerance_days, len(days), len(universe))
-    by_period: dict[str, dict] = {}
-    for (_, day, _), (dh, th, bad) in zip(items, score.outcomes):
-        b = by_period.setdefault(periods.period_of(day), {"n": 0, "date_hits": 0, "ticker_hits": 0})
-        b["n"] += 1
-        b["date_hits"] += dh
-        b["ticker_hits"] += th
-    for b in by_period.values():
-        b["date_rate"] = b["date_hits"] / b["n"]
-    out = {"n": score.n, "date_hits": score.date_hits, "ticker_hits": score.ticker_hits,
-           "any_hits": score.any_hits, "rate": score.rate, "date_rate": score.date_rate,
-           "ticker_rate": score.ticker_rate, "chance_date_rate": chance_d, "chance_ticker_rate": chance_t,
-           "n_trading_days": len(days), "universe_size": len(universe), "by_period": by_period,
-           "failed": score.failed, "budget_exhausted": score.budget_exhausted,
-           "tolerance_days": settings.tolerance_days, "seed": PROBE_SEED, "model": settings.model,
-           "requested_samples": samples, "spent_usd": prev + llm.spent_usd,
-           "samples": [{"date": d.isoformat(), "ticker": t} for _, d, t in items[:score.n]]}
+
+    def entry(m: str) -> dict:
+        sc = scores.get(m)
+        spend = new_by.get(m, 0.0)
+        if sc is None:  # never started: an earlier model used up the cap
+            return {"n": 0, "date_hits": 0, "ticker_hits": 0, "any_hits": 0, "rate": 0.0, "date_rate": 0.0,
+                    "ticker_rate": 0.0, "failed": 0, "chance_date": chance_d, "chance_ticker": chance_t,
+                    "spend_usd": spend, "by_period": {}, "requested_samples": samples,
+                    "budget_exhausted": False, "incomplete": True, "skipped": True}
+        by_period: dict[str, dict] = {}
+        for (_, day, _), (dh, th, bad) in zip(items, sc.outcomes):
+            b = by_period.setdefault(periods.period_of(day), {"n": 0, "date_hits": 0, "ticker_hits": 0})
+            b["n"] += 1
+            b["date_hits"] += dh
+            b["ticker_hits"] += th
+        for b in by_period.values():
+            b["date_rate"] = b["date_hits"] / b["n"]
+        return {"n": sc.n, "date_hits": sc.date_hits, "ticker_hits": sc.ticker_hits, "any_hits": sc.any_hits,
+                "rate": sc.rate, "date_rate": sc.date_rate, "ticker_rate": sc.ticker_rate, "failed": sc.failed,
+                "chance_date": chance_d, "chance_ticker": chance_t, "spend_usd": spend, "by_period": by_period,
+                "requested_samples": samples, "budget_exhausted": sc.budget_exhausted,
+                "incomplete": sc.budget_exhausted or sc.n < samples, "skipped": False}
+
+    models_out = {m: entry(m) for m in probed}
+    head = probed[0]  # the hub, unless --model restricted the run: top-level fields are this model's
+    hs, he = scores[head], models_out[head]
+    out = {"n": hs.n, "date_hits": hs.date_hits, "ticker_hits": hs.ticker_hits,
+           "any_hits": hs.any_hits, "rate": hs.rate, "date_rate": hs.date_rate,
+           "ticker_rate": hs.ticker_rate, "chance_date_rate": chance_d, "chance_ticker_rate": chance_t,
+           "n_trading_days": len(days), "universe_size": len(universe), "by_period": he["by_period"],
+           "failed": hs.failed, "budget_exhausted": hs.budget_exhausted,
+           "tolerance_days": settings.tolerance_days, "seed": PROBE_SEED, "model": head,
+           "requested_samples": samples, "spent_usd": prev + shared.spent_usd,
+           "samples": [{"date": d.isoformat(), "ticker": t} for _, d, t in items[:hs.n]],
+           "models": models_out, "models_in_use": in_use, "probed_models": probed}
     _write_json(run_dir / CONTAMINATION, out)
-    if score.empty:
-        print("contamination probe (optional): no probe completed"
-              + (" (LLM budget exhausted)" if score.budget_exhausted else "") + f"; wrote {run_dir / CONTAMINATION}")
-        return EXIT_OK
-    per = "; ".join(f"{k} {v['date_hits']}/{v['n']}" for k, v in by_period.items()) if len(by_period) > 1 else ""
-    print(f"contamination probe (optional): the model ({settings.model}) placed {score.date_hits} of "
-          f"{score.n} anonymised snapshots within {settings.tolerance_days} days of the true date "
-          f"(date-hit rate {score.date_rate:.1%}; a random guesser would manage about {chance_d:.1%}, "
-          f"approximate)" + (f"; by period: {per}" if per else "") + f". Ticker hits {score.ticker_hits} of "
-          f"{score.n} (chance about {chance_t:.1%}; the sector label may identify the ticker, so ticker hits "
-          f"are not evidence of date memory). Seed {PROBE_SEED}; spend ${llm.spent_usd:.4f}. A high date-hit "
-          "rate, well above chance, means the model can place these snapshots in time, so trust results for "
-          "those periods less. It is not a measure of skill. "
-          f"Wrote {run_dir / CONTAMINATION}; `atlas report` will include it.")
-    if score.budget_exhausted:
-        print(f"note: stopped early: LLM budget exhausted after {score.n} of {samples} probes")
-    if score.failed == score.n:
-        print(f"error: all {score.n} probe replies were unusable (see {run_dir / PROBE_FAILURES}); is "
-              f"'{settings.model}' reachable and returning JSON?", file=sys.stderr)
-        return EXIT_FAILED
-    return EXIT_OK
+    esc = lambda x: escape_controls(sanitise(str(x), 200))  # noqa: E731
+    rc_out = EXIT_OK
+    for m in probed:
+        sc = scores.get(m)
+        who = f" for {esc(m)}" if multi else ""
+        if sc is None:
+            print(f"note: {esc(m)} was not probed: the LLM budget was exhausted by an earlier model")
+            continue
+        spend = this_run.get(m, 0.0)
+        if sc.empty:
+            print("contamination probe (optional): no probe completed" + who
+                  + (" (LLM budget exhausted)" if sc.budget_exhausted else "") + f"; wrote {run_dir / CONTAMINATION}")
+            continue
+        by_period = models_out[m]["by_period"]
+        per = "; ".join(f"{k} {v['date_hits']}/{v['n']}" for k, v in by_period.items()) if len(by_period) > 1 else ""
+        print(f"contamination probe (optional): the model ({esc(m)}) placed {sc.date_hits} of "
+              f"{sc.n} anonymised snapshots within {settings.tolerance_days} days of the true date "
+              f"(date-hit rate {sc.date_rate:.1%}; a random guesser would manage about {chance_d:.1%}, "
+              f"approximate)" + (f"; by period: {per}" if per else "") + f". Ticker hits {sc.ticker_hits} of "
+              f"{sc.n} (chance about {chance_t:.1%}; the sector label may identify the ticker, so ticker hits "
+              f"are not evidence of date memory). Seed {PROBE_SEED}; spend ${spend:.4f}. A high date-hit "
+              "rate, well above chance, means the model can place these snapshots in time, so trust results for "
+              "those periods less. It is not a measure of skill. "
+              f"Wrote {run_dir / CONTAMINATION}; `atlas report` will include it.")
+        if sc.budget_exhausted:
+            print(f"note: stopped early{who}: LLM budget exhausted after {sc.n} of {samples} probes")
+        if sc.failed == sc.n:
+            print(f"error: all {sc.n} probe replies{who} were unusable (see {run_dir / PROBE_FAILURES}); is "
+                  f"'{esc(m)}' reachable and returning JSON?", file=sys.stderr)
+            rc_out = EXIT_FAILED
+    return rc_out
 
 
 # ============================================================================ entry point
@@ -1674,6 +1758,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--samples", type=int, default=PROBE_DEFAULT_SAMPLES,
                    help="(optional) number of snapshots to probe, spread over the run's days "
                         "(default %(default)s)")
+    q.add_argument("--model", help="(optional) probe only this one model in use (default: every model in "
+                   "use: hub, spoke and per-agent overrides)")
     q.add_argument("--yes", action="store_true", help="do not ask before spending above confirm_cost_usd")
     e = sub.add_parser("errors", help="print the run's error log (errors.log), oldest of the last N first",
                        description="Read-only: print the last events of the run's errors.log, one line "

@@ -138,12 +138,13 @@ def _parse(resp: LLMResponse) -> tuple[date, str]:
 def contamination_probe(snapshots: list[tuple[Snapshot, date, str]], llm: CachedLLM,
                         tolerance_days: int, *, failures: FailureLog | None = None,
                         sleep: Callable[[float], None] = time.sleep,
-                        max_tokens: int = MAX_TOKENS) -> ContaminationScore:
+                        max_tokens: int = MAX_TOKENS, agent: str = PROBE_AGENT) -> ContaminationScore:
     """`snapshots` are (ANONYMISED snapshot, true date, true real ticker). Only the snapshot
     is sent to the model; the date and ticker are used to score the reply. No sampling
     parameter is sent; caching (CachedLLM) as everywhere else makes a re-run replay the same
     replies. A FatalApiError (request rejected) propagates. Spend counts against `llm`'s budget
-    and BudgetExceeded stops the probe cleanly with the score so far."""
+    and BudgetExceeded stops the probe cleanly with the score so far. `agent` names the model's
+    rows in the failure log (several models are probed into one log)."""
     n = date_hits = ticker_hits = any_hits = failed = 0
     outcomes: list[tuple[bool, bool, bool]] = []
     exhausted = False
@@ -157,7 +158,7 @@ def contamination_probe(snapshots: list[tuple[Snapshot, date, str]], llm: Cached
 
                 def log(reason: FailureReason, detail: str, raw: str, replayed: bool = False) -> None:
                     if failures is not None and not replayed:
-                        failures.record(FailureRecord(agent=PROBE_AGENT, date=true_date, reason=reason,
+                        failures.record(FailureRecord(agent=agent, date=true_date, reason=reason,
                                                       detail=detail, attempt=attempt, raw_response=raw))
 
                 try:

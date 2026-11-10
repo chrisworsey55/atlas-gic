@@ -282,7 +282,7 @@ def _real(df: pd.DataFrame, col: str) -> pd.Series:
 
 # ------------------------------------------------------------------------------ report
 
-def _contamination_section(c, settings: Settings | None) -> list[str]:
+def _contamination_single(c, settings: Settings | None, coverage: list[str]) -> list[str]:
     head = "## Contamination probe (optional)\n"
     try:
         d = asdict(c) if hasattr(c, "__dataclass_fields__") else dict(c)
@@ -292,7 +292,7 @@ def _contamination_section(c, settings: Settings | None) -> list[str]:
         return [head, "n/a (contamination result unreadable).\n"]
     tol = d.get("tolerance_days", settings.tolerance_days if settings is not None else None)
     any_hits = d.get("any_hits")
-    out = [head]
+    out = [head, *coverage]
     if n <= 0:
         out.append("No probes completed (n = 0), so there is no contamination estimate.\n")
     else:
@@ -327,6 +327,80 @@ def _contamination_section(c, settings: Settings | None) -> list[str]:
                "model can place these snapshots in time, so trust results for those periods less. A low rate "
                "does not prove the model has not seen the period. This probe is a data-quality check, not a "
                "measure of skill, and it does not enter the verdict.\n")
+    return out
+
+
+def _model_names(v) -> list[str]:
+    return [str(x) for x in v] if isinstance(v, list) else []
+
+
+def _coverage_lines(d: dict, models: dict) -> list[str]:
+    """Which models were probed, and a warning when a model the run uses was NOT (a probe
+    restricted with --model, or cut short by the budget): the section must not imply the whole
+    system was checked."""
+    probed = _model_names(d.get("probed_models")) or list(models)
+    in_use = _model_names(d.get("models_in_use")) or probed
+    done = [m for m in probed if not (isinstance(models.get(m), dict) and models[m].get("skipped"))]
+    missing = [m for m in in_use if m not in done]
+    out = ["Models probed: " + (", ".join(_err_text(m, 200) for m in done) if done else "none") + ".\n"]
+    if missing:
+        out.append("Warning: NOT probed: " + ", ".join(_err_text(m, 200) for m in missing)
+                   + ". This probe does not cover the whole system: results that rely on these models "
+                   "have no contamination check.\n")
+    cut = [m for m in done if isinstance(models.get(m), dict) and models[m].get("incomplete")]
+    if cut:
+        out.append("Incomplete (stopped early by the LLM budget): " + ", ".join(
+            f"{_err_text(m, 200)} ({_err_text(models[m].get('n'), 20)} of "
+            f"{_err_text(models[m].get('requested_samples', '?'), 20)} probes)" for m in cut) + ".\n")
+    return out
+
+
+def _model_row(name: str, e) -> str:
+    try:
+        n = int(e["n"])
+        dh, th = int(e["date_hits"]), int(e["ticker_hits"])
+        dr = float(e.get("date_rate", dh / n if n else 0.0))
+        tr = float(e.get("ticker_rate", th / n if n else 0.0))
+        cd, ct = e.get("chance_date"), e.get("chance_ticker")
+        status = ("skipped (budget)" if e.get("skipped") else "incomplete (budget)" if e.get("incomplete")
+                  else "complete")
+        cells = [str(n), str(dh), _f(dr, pct=True) if n else "n/a",
+                 _f(float(cd), pct=True) if cd is not None else "n/a", str(th),
+                 _f(tr, pct=True) if n else "n/a", _f(float(ct), pct=True) if ct is not None else "n/a",
+                 str(int(e.get("failed") or 0)), f"${float(e.get('spend_usd') or 0.0):.4f}", status]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        cells = ["n/a (unreadable)"] + ["n/a"] * 9
+    return "| " + " | ".join([_cell(_err_text(name, 200)), *map(_cell, cells)]) + " |"
+
+
+def _contamination_section(c, settings: Settings | None) -> list[str]:
+    head = "## Contamination probe (optional)\n"
+    try:
+        d = asdict(c) if hasattr(c, "__dataclass_fields__") else dict(c)
+    except (TypeError, ValueError):
+        return [head, "n/a (contamination result unreadable).\n"]
+    models = d.get("models")
+    if not isinstance(models, dict) or not models:  # a probe of one model, written before per-model results
+        return _contamination_single(c, settings, [])
+    coverage = _coverage_lines(d, models)
+    if len(models) == 1:
+        return _contamination_single(c, settings, coverage)
+    tol = d.get("tolerance_days", settings.tolerance_days if settings is not None else None)
+    out = [head, *coverage,
+           f"One row per model, all probed on the same anonymised snapshots. The date-hit rate is the headline: "
+           f"a date guess is a hit within {tol} day(s) of the true date. The chance columns are what a random "
+           "guesser would manage (approximate): dates (2 x tolerance + 1) / trading days in the run, tickers "
+           "1 / universe size. The sector label may identify the ticker; ticker hits are not evidence of date "
+           "memory.\n",
+           "| model | probes (n) | date hits | date-hit rate | chance (dates) | ticker hits | ticker-hit rate "
+           "| chance (tickers) | unusable replies | spend | status |", "|" + "---|" * 11]
+    out += [_model_row(m, e) for m, e in models.items()]
+    out.append("")
+    out.append("Interpretation: each model was shown anonymised price data (no dates, no tickers) and asked to "
+               "name the date and the ticker. A high date-hit rate, well above chance, means that model can "
+               "place these snapshots in time, so trust results for those periods less. A low rate does not "
+               "prove a model has not seen the period. This probe is a data-quality check, not a measure of "
+               "skill, and it does not enter the verdict.\n")
     return out
 
 
