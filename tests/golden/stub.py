@@ -13,8 +13,9 @@ from pathlib import Path
 SCRIPT = json.loads((Path(__file__).parent / "fixtures" / "stub_script.json").read_text())
 
 
-class SimulatedCrash(RuntimeError):
-    """Raised by the stub to simulate the process dying mid-day."""
+class SimulatedCrash(BaseException):
+    """Raised by the stub to simulate the process dying mid-day. A BaseException, like KeyboardInterrupt:
+    a dying process is not an `Exception` that the CLI catch-all may turn into an exit code."""
 
 
 def agent_of(system: str) -> str:

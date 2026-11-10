@@ -7,6 +7,7 @@ Commands (``atlas <command> --help`` for options)::
     atlas autoresearch --config RUN.yaml
     atlas report --run-dir RUN_DIR
     atlas probe --run-dir RUN_DIR [--samples N] [--yes]      (optional)
+    atlas errors --run-dir RUN_DIR [--tail N] [--kind KIND]  (read-only; needs no keys)
 
 The run config (documented by ``atlas/config/run.example.yaml``) names a run directory that
 holds everything a run writes::
@@ -26,6 +27,7 @@ holds everything a run writes::
     probe.json             spend of the (optional) contamination probe (counts against the cap)
     contamination.json     (optional) probe result: rate, n, tolerance, seed, model, spend
     probe_failures.sqlite  (optional) unusable probe replies, with their reason codes
+    errors.log             JSON Lines error/event log (``atlas errors`` reads it; dry runs: dry_run/)
     prices/                price cache (unless data.cache_dir says otherwise)
     dry_run/               ALL state of `backtest --dry-run` (same layout): never the real run's
     report/                report.md, equity.png, agents.csv, autoresearch.csv
@@ -108,7 +110,8 @@ from atlas.data.csv_provider import CacheOnlyPrices, CsvPriceProvider, NoMacro
 from atlas.data.fred_provider import FredFetchError
 from atlas.data.store import PriceStore
 from atlas.engine.failures import CALL_FAILURE, FailureLog
-from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, StubClient
+from atlas.errorlog import ErrorLog, NullErrorLog, read_events
+from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, StubClient, sanitise
 from atlas.engine.pipeline import Pipeline
 from atlas.portfolio.models import Portfolio
 from atlas.portfolio.simbroker import SimBroker
@@ -130,6 +133,10 @@ LLM_CACHE, WEIGHTS, RUN_CONFIG, CALIBRATION = "llm_cache.sqlite", "weights.json"
 CONTROL_STATE, AR_LOG, AR_FAILURES = "control.json", "autoresearch_log.jsonl", "autoresearch_failures.sqlite"
 OLDER_MODEL_DIR = "older_model"
 PROBE_STATE, CONTAMINATION, PROBE_FAILURES = "probe.json", "contamination.json", "probe_failures.sqlite"
+ERRORS_NAME = "errors.log"
+# the error log of the run this process is working on (set by build_run, reset by main): lets
+# main() record a known error before printing it. None until a run directory is known.
+ACTIVE_ERRORLOG: ErrorLog | None = None
 DRY_RUN_CACHE = "dry_run_llm.db"
 ABLATION_NOTE = ("CIO ablation: the decision layer's portfolio is the execution agent's stated long "
                  "target weights (scaled down to max_gross_pct); the baseline is the weight-averaged "
@@ -425,6 +432,7 @@ class Run:
     failures: FailureLog | None = None
     pipeline: Pipeline | None = None
     notes: list[str] = field(default_factory=list)
+    errors: ErrorLog = field(default_factory=NullErrorLog)  # ONE instance per run: its lock is per instance
 
     @property
     def universe(self) -> list[str]:
@@ -481,6 +489,13 @@ def _price_provider(rc: RunConfig, offline: bool):
     return YFinanceProvider()
 
 
+def open_error_log(path: Path) -> ErrorLog:
+    """The run's error log (created lazily on the first event); becomes the process's active one."""
+    global ACTIVE_ERRORLOG
+    ACTIVE_ERRORLOG = ErrorLog(path)
+    return ACTIVE_ERRORLOG
+
+
 def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = None,
               llm_client=None, dry_run: bool = False, failures_name: str = FAILURES,
               settings: Settings | None = None) -> Run:
@@ -504,7 +519,8 @@ def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = No
         else:
             notes.append(f"dry run: {FRED_KEY} is not set, so the run uses no macro series")
     store = PriceStore(_price_provider(rc, offline), macro, rc.cache_dir)
-    run = Run(rc, settings, limits, specs, prompts, periods, store, series, notes=notes)
+    run = Run(rc, settings, limits, specs, prompts, periods, store, series, notes=notes,
+              errors=open_error_log(rc.path(ERRORS_NAME)))
     if llm_client is not None or not offline:
         client = llm_client
         if client is None:
@@ -514,7 +530,7 @@ def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = No
                 client = anthropic_client(settings)
         run.llm = CachedLLM(client, rc.llm_cache_path, settings.model, require_prices(settings),
                             settings.budget_usd)
-        run.failures = FailureLog(rc.path(failures_name))
+        run.failures = FailureLog(rc.path(failures_name), error_log=run.errors)
         run.pipeline = Pipeline(specs, prompts, run.llm, run.failures, run.universe, settings.min_valid_agents,
                                 max_tokens=settings.max_output_tokens)
     return run
@@ -799,7 +815,7 @@ def cmd_backtest(args, llm_client=None) -> int:
                               PredictionLog(rc.path(PREDLOG)), checkpoint, confirm=confirmed,
                               initial_cash=rc.initial_cash, universe_sectors=None,
                               lookback_days=rc.data.lookback_days, macro_series=run.macro_series,
-                              run_dir=rc.run_dir, history_path=rc.path(HISTORY_NAME))
+                              run_dir=rc.run_dir, history_path=rc.path(HISTORY_NAME), error_log=run.errors)
     except RunPaused as e:
         if stored != record:  # the runner accepted the checkpoint: record the (allowed) changes
             _write_json(rc.path(RUN_CONFIG), record)
@@ -1019,7 +1035,7 @@ def _make_replay(run: Run) -> Replay:
     ckpt = Checkpoint(rc.path(CHECKPOINT))
     if _last_completed(ckpt) is None:
         raise OperationalError(f"no stored run in {rc.run_dir}: run `atlas backtest --config ...` first")
-    ar_failures = FailureLog(rc.path(AR_FAILURES))
+    ar_failures = FailureLog(rc.path(AR_FAILURES), error_log=run.errors)
     pipe = Pipeline(run.specs, run.prompts, run.llm, ar_failures, run.universe, run.settings.min_valid_agents)
     return Replay(run, pipe, run.trading_days(), read_day_history(rc.path(HISTORY_NAME), ckpt),
                   predlog_results(rc.path(PREDLOG)))
@@ -1365,7 +1381,8 @@ def cmd_probe(args, llm_client=None) -> int:
         snap = run.store.snapshot(day, [ticker], rc.data.lookback_days)
         anon, _ = anonymize_snapshot(snap, {ticker: labels[ticker]})
         items.append((anon, day, ticker))
-    failures = FailureLog(run_dir / PROBE_FAILURES)
+    run.errors = open_error_log(run_dir / ERRORS_NAME)
+    failures = FailureLog(run_dir / PROBE_FAILURES, error_log=run.errors)
     prev = _read_spend(run_dir / PROBE_STATE)
     try:
         score = contamination_probe(items, llm, settings.tolerance_days, failures=failures,
@@ -1415,10 +1432,26 @@ def cmd_probe(args, llm_client=None) -> int:
 
 # ============================================================================ entry point
 
+def cmd_errors(args, llm_client=None) -> int:
+    """Print the tail of <run-dir>/errors.log. Read-only: creates nothing."""
+    run_dir = Path(args.run_dir)
+    path = run_dir / ERRORS_NAME
+    if not path.is_file():
+        raise OperationalError(f"no error log in {run_dir}")
+    try:
+        events = read_events(path, kind=args.kind)
+    except (OSError, ValueError) as e:
+        raise OperationalError(f"cannot read {path}: {e}") from None
+    for ev in events[-args.tail:] if args.tail > 0 else []:
+        print(" ".join(str(ev.get(k) or "-") if k != "message" else str(ev.get(k) or "")
+                       for k in ("ts_utc", "level", "kind", "day", "agent", "reason", "message")).rstrip())
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="atlas", description="ATLAS backtest system: multi-agent LLM "
                                 "trading research with honest, leakage-aware evaluation.")
-    sub = p.add_subparsers(dest="command", required=True, metavar="{backtest,calibrate,autoresearch,report,probe}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{backtest,calibrate,autoresearch,report,probe,errors}")
     b = sub.add_parser("backtest", help="run or resume a backtest over train, validation and holdout")
     b.add_argument("--config", required=True, help="run config YAML (see atlas/config/run.example.yaml)")
     b.add_argument("--dry-run", action="store_true", help="no keys, zero LLM calls: plumbing check")
@@ -1441,11 +1474,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="(optional) number of snapshots to probe, spread over the run's days "
                         "(default %(default)s)")
     q.add_argument("--yes", action="store_true", help="do not ask before spending above confirm_cost_usd")
+    e = sub.add_parser("errors", help="print the run's error log (errors.log), oldest of the last N first",
+                       description="Read-only: print the last events of the run's errors.log, one line "
+                       "each: ts level kind day agent reason message. Needs no keys and no config.")
+    e.add_argument("--run-dir", required=True, help="a run directory (or its dry_run subdirectory)")
+    e.add_argument("--tail", type=int, default=20, help="show the last N events (default %(default)s)")
+    e.add_argument("--kind", help="only events of this kind (e.g. fatal_api_error, run_paused)")
     return p
 
 
 COMMANDS = {"backtest": cmd_backtest, "calibrate": cmd_calibrate, "autoresearch": cmd_autoresearch,
-            "report": cmd_report, "probe": cmd_probe}
+            "report": cmd_report, "probe": cmd_probe, "errors": cmd_errors}
 
 
 def main(argv: list[str] | None = None, *, llm_client=None) -> int:
@@ -1459,18 +1498,40 @@ def main(argv: list[str] | None = None, *, llm_client=None) -> int:
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     # urllib3 logs request lines at DEBUG, and the FRED request line carries api_key in its query
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    global ACTIVE_ERRORLOG
+    ACTIVE_ERRORLOG = None
+
     try:
         return COMMANDS[args.command](args, llm_client=llm_client)
     except UsageError as e:
+        _record_known("usage_error", e)
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USAGE
     except (OperationalError, ResumeRefused, FredFetchError, MissingPriceData) as e:
+        kind = ("resume_refused" if isinstance(e, ResumeRefused) else
+                "data_error" if isinstance(e, (FredFetchError, MissingPriceData)) else "operational_error")
+        _record_known(kind, e)
         print(f"error: {e}", file=sys.stderr)
         return EXIT_FAILED
     except FatalApiError as e:  # never retried; the message is already sanitised
+        _record_known("fatal_api_error", e)
         print(f"error: {e}. Nothing was retried and any checkpoint is intact: fix the cause (model name, "
               "API key, settings such as effort) and re-run the same command.", file=sys.stderr)
         return EXIT_FAILED
+    except Exception as e:  # noqa: BLE001 - last resort: one line, never a traceback (Ctrl-C/exit pass)
+        _record_known("unexpected_exception", e)
+        where = f" (details: {ACTIVE_ERRORLOG.path})" if ACTIVE_ERRORLOG is not None and ACTIVE_ERRORLOG.path else ""
+        print(f"error: unexpected {type(e).__name__}: {sanitise(str(e))}{where}", file=sys.stderr)
+        return EXIT_FAILED
+
+
+def _record_known(kind: str, exc: BaseException) -> None:
+    """Record to the active run's error log (if any) before the error is printed; never raises."""
+    try:
+        if ACTIVE_ERRORLOG is not None:
+            ACTIVE_ERRORLOG.exception(kind, exc)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":  # pragma: no cover
