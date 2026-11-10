@@ -64,6 +64,76 @@ class BudgetExceeded(Exception):
     pass
 
 
+class Budget:
+    """One hard spend cap shared by every CachedLLM of a run (one CachedLLM per model).
+
+    Holds the spend counter, the in-flight reservation counter, per-model spend and the cap
+    behind a single lock. A caller reserves the worst-case cost of a call (at its own model's
+    prices) before the call and settles it afterwards; the lock is never held during the call
+    itself, and no other lock is ever taken while it is held.
+
+    ``spent_by_model()`` attributes settled spend to the model that made the call. Spend that
+    ``restore_spent`` adds without attribution (e.g. a checkpoint total from an earlier run)
+    is kept under the key ``Budget.UNATTRIBUTED``, so the buckets always sum to ``spent_usd``
+    (up to float rounding)."""
+
+    UNATTRIBUTED = "(unattributed)"
+
+    def __init__(self, cap_usd: float, *, initial_spent_usd: float = 0.0):
+        self.cap_usd = cap_usd
+        self._spent = 0.0
+        self._reserved = 0.0
+        self._by_model: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self.restore_spent(initial_spent_usd)
+
+    @property
+    def spent_usd(self) -> float:
+        return self._spent
+
+    @property
+    def reserved_usd(self) -> float:
+        return self._reserved
+
+    def spent_by_model(self) -> dict[str, float]:
+        """A copy of spend per model (plus ``UNATTRIBUTED`` restored spend, if any)."""
+        with self._lock:
+            return dict(self._by_model)
+
+    def restore_spent(self, usd: float) -> None:
+        """Raise the spend counter to at least `usd` (spend persisted by a checkpoint).
+        Never lowers it: money already spent is not forgotten. Idempotent, so restoring the
+        same total through several CachedLLMs sharing this budget counts it once."""
+        usd = float(usd)
+        if not math.isfinite(usd) or usd < 0:
+            raise ValueError(f"invalid spend {usd!r}")
+        with self._lock:
+            if usd > self._spent:
+                extra = usd - self._spent
+                self._by_model[self.UNATTRIBUTED] = self._by_model.get(self.UNATTRIBUTED, 0.0) + extra
+                self._spent = usd
+
+    def reserve(self, estimate: float) -> None:
+        """Reserve `estimate` USD for a call about to be made, or raise BudgetExceeded (and
+        reserve nothing) if spent + in flight + estimate would exceed the cap."""
+        with self._lock:
+            if self._spent + self._reserved + estimate > self.cap_usd:
+                raise BudgetExceeded(
+                    f"call could cost up to ${estimate:.4f}; spent ${self._spent:.4f} "
+                    f"(+${self._reserved:.4f} in flight) of ${self.cap_usd:.2f} budget")
+            self._reserved += estimate
+
+    def settle(self, estimate: float, model: str, actual: float | None) -> None:
+        """Release a reservation made with `reserve(estimate)` and record the call's actual
+        cost against `model`. ``actual=None`` means no usage information (the call raised):
+        the reservation is released and nothing is spent. Call exactly once per reserve."""
+        with self._lock:
+            self._reserved -= estimate
+            if actual is not None:
+                self._spent += actual
+                self._by_model[model] = self._by_model.get(model, 0.0) + actual
+
+
 @dataclass(frozen=True)
 class LLMResponse:
     text: str
@@ -153,27 +223,31 @@ class StubClient:
 
 class CachedLLM:
     """Raw-response cache keyed by sha256(model, system, user[, client.request_tag]) plus
-    spend budget. The client's ``request_tag`` (non-default request settings such as effort)
-    is part of the key only when non-empty, so existing keys are unchanged.
+    spend budget (a Budget, private or shared with the CachedLLMs of other models). The
+    client's ``request_tag`` (non-default request settings such as effort) is part of the key
+    only when non-empty, so existing keys are unchanged.
 
     A cache hit makes no client call and costs nothing. `bypass_cache=True` forces a live
     call and overwrites the entry, so retries never replay a cached bad response.
     """
 
     def __init__(self, client: LLMClient, cache_path: Path, model: str,
-                 usd_per_mtok: tuple[float, float], budget_usd: float, *,
-                 initial_spent_usd: float = 0.0):
+                 usd_per_mtok: tuple[float, float], budget_usd: float = 0.0, *,
+                 initial_spent_usd: float = 0.0, budget: Budget | None = None):
         """`initial_spent_usd` carries spend from earlier runs (e.g. a backtest checkpoint)
-        so the budget cap spans resumes."""
+        so the budget cap spans resumes. With `budget`, that Budget is shared (one cap across
+        models) and `budget_usd` is ignored; `initial_spent_usd` is still restored into it
+        (raise-only, so restoring the same total through several instances counts it once).
+        Without it a private Budget(budget_usd) is created, as before."""
         self.client = client
         self.model = model
         self.request_tag = str(getattr(client, "request_tag", "") or "")
         self.usd_per_mtok = usd_per_mtok
-        self.budget_usd = budget_usd
-        self._spent = 0.0
-        self._reserved = 0.0
-        self._lock = threading.Lock()
-        self.restore_spent(initial_spent_usd)
+        if budget is None:
+            budget = Budget(budget_usd, initial_spent_usd=initial_spent_usd)
+        else:
+            budget.restore_spent(initial_spent_usd)
+        self.budget = budget
         self.cache_path = Path(cache_path)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._conn()) as c, c:
@@ -186,17 +260,22 @@ class CachedLLM:
         return sqlite3.connect(self.cache_path, timeout=30)
 
     @property
+    def budget_usd(self) -> float:
+        """The hard cap of this instance's Budget (shared by every instance using it)."""
+        return self.budget.cap_usd
+
+    @budget_usd.setter
+    def budget_usd(self, usd: float) -> None:
+        self.budget.cap_usd = usd
+
+    @property
     def spent_usd(self) -> float:
-        return self._spent
+        """Total spend of the Budget (all models sharing it), not of this instance alone."""
+        return self.budget.spent_usd
 
     def restore_spent(self, usd: float) -> None:
-        """Raise the spend counter to at least `usd` (spend persisted by a checkpoint).
-        Never lowers it: money already spent by this instance is not forgotten."""
-        usd = float(usd)
-        if not math.isfinite(usd) or usd < 0:
-            raise ValueError(f"invalid spend {usd!r}")
-        with self._lock:
-            self._spent = max(self._spent, usd)
+        """Raise the budget's spend counter to at least `usd` (see Budget.restore_spent)."""
+        self.budget.restore_spent(usd)
 
     def _key(self, system: str, user: str) -> str:
         h = hashlib.sha256()
@@ -228,24 +307,22 @@ class CachedLLM:
             if row:
                 return LLMResponse(*row), True
         estimate = self._worst_case(system, user, max_tokens)
-        with self._lock:  # reserve worst case before the call; lock not held during the call
-            if self._spent + self._reserved + estimate > self.budget_usd:
-                raise BudgetExceeded(
-                    f"call could cost up to ${estimate:.4f}; spent ${self._spent:.4f} "
-                    f"(+${self._reserved:.4f} in flight) of ${self.budget_usd:.2f} budget")
-            self._reserved += estimate
+        self.budget.reserve(estimate)  # worst case, under the budget lock; not held during the call
         resp = None
         try:
             resp = self.client.complete(system, user, max_tokens)
         finally:
-            with self._lock:
-                self._reserved -= estimate
+            actual = None
+            try:
                 if resp is not None:
-                    self._spent += self._cost(resp)
+                    actual = self._cost(resp)
+            finally:  # released exactly once, even if costing the response fails
+                self.budget.settle(estimate, self.model, actual)
         with closing(self._conn()) as c, c:
             c.execute(
                 "INSERT OR REPLACE INTO llm_cache VALUES (?,?,?,?,?)",
                 (key, resp.text, resp.input_tokens, resp.output_tokens, resp.stop_reason))
-        if self._spent > self.budget_usd:  # actual tokens exceeded the estimate
-            raise BudgetExceeded(f"spent ${self._spent:.4f} exceeds ${self.budget_usd:.2f} budget")
+        spent, cap = self.budget.spent_usd, self.budget.cap_usd
+        if spent > cap:  # actual tokens exceeded the estimate
+            raise BudgetExceeded(f"spent ${spent:.4f} exceeds ${cap:.2f} budget")
         return resp, False
