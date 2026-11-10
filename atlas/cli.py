@@ -1286,13 +1286,20 @@ def cmd_report(args, llm_client=None) -> int:
         except (OSError, ValueError):
             raise OperationalError(f"{run_dir / CONTAMINATION} is corrupt; delete it or re-run "
                                    "`atlas probe`") from None
+    errors_path = rc.path(ERRORS_NAME)
+    error_events = None  # missing log -> "not provided"; unreadable lines are skipped
+    if errors_path.is_file():
+        try:
+            error_events = read_events(errors_path, strict=False)
+        except OSError:
+            error_events = None
     path = build_report(result, scores, null, edits, ablation, None, failures.summary(),
                         sum(spent.values()), run_dir / "report", settings=settings,
                         ablation_by_period=by_period, null_meta=null_meta, null_source=null_src,
                         autoresearch_null_meta=ar_metas,
                         holdout_edit_ics=None, final_weights=final_weights,
                         dropped_picks=failures.dropped_picks_summary(), turnover=turnover,
-                        contamination=contamination)
+                        contamination=contamination, errors=error_events)
     print(f"null distribution: {null_src}; CIO ablation: {'computed' if by_period else 'not provided'}; "
           f"turnover: {'computed' if turnover is not None else 'not provided'}")
     print(f"wrote {path}")

@@ -24,6 +24,8 @@ from atlas.backtest.contamination import ContaminationScore  # noqa: E402,F401
 from atlas.backtest.nulltest import NullDistribution  # noqa: E402
 from atlas.backtest.runner import BacktestResult  # noqa: E402
 from atlas.config import Settings  # noqa: E402
+from atlas.engine.llm import sanitise  # noqa: E402
+from atlas.errorlog import escape_controls  # noqa: E402
 from atlas.scoring.metrics import hit_rate, rank_ic  # noqa: E402
 from atlas.scoring.store import ScoreStore  # noqa: E402
 from atlas.scoring.weights import shrunk_ic  # noqa: E402
@@ -152,6 +154,40 @@ def _table(df: pd.DataFrame) -> str:
 
 # ------------------------------------------------------------------------------ periods
 
+_ERR_COLS = ["ts_utc", "level", "kind", "day", "agent", "reason", "message"]
+_ERR_LAST = 10
+
+
+def _err_text(v, limit: int = 300) -> str:
+    """Re-sanitised, control- and bidi-escaped text of one logged value; never raises."""
+    try:
+        return escape_controls(sanitise("" if v is None else str(v), limit))
+    except Exception:
+        return "<unprintable>"
+
+
+def _errors_section(errors: list[dict] | None) -> list[str]:
+    head = ["## Errors\n"]
+    if errors is None:
+        return head + ["not provided\n"]
+    if not errors:
+        return head + ["no errors logged\n"]
+    recs = [e if isinstance(e, dict) else {} for e in errors]
+    out = head + [f"{len(recs)} events in `errors.log` (run directory).\n"]
+    for col in ("kind", "level"):
+        counts: dict[str, int] = {}
+        for e in recs:
+            k = _err_text(e.get(col), 80) or "?"
+            counts[k] = counts.get(k, 0) + 1
+        df = pd.DataFrame(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])),
+                          columns=[col, "count"])
+        out += [f"By {col}:\n", _table(df)]
+    last = pd.DataFrame([[_err_text(e.get(c)) for c in _ERR_COLS] for e in recs[-_ERR_LAST:]],
+                        columns=_ERR_COLS)
+    return out + [f"Last {min(_ERR_LAST, len(recs))} events (full detail in `errors.log`):\n",
+                  _table(last)]
+
+
 def _period_ranges(result: BacktestResult, cutoff: date | None):
     """[(name, lo, hi, contaminated, is_holdout)]. Without configured periods the whole run
     is one period; it counts as pre-cutoff only if it ends on or before the cutoff."""
@@ -258,12 +294,14 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                  ablation_by_period: dict[str, dict | None] | None = None,
                  null_meta: dict | None = None, null_source: str | None = None,
                  autoresearch_null_meta: list[dict | None] | None = None,
-                 contamination: "ContaminationScore | dict | None" = None) -> Path:
+                 contamination: "ContaminationScore | dict | None" = None,
+                 errors: list[dict] | None = None) -> Path:
     """`ablation_by_period` (optional, period name -> ablation dict or None, plus "all") renders
     the CIO ablation per period with the holdout as the headline; without it the single
     `ablation` dict is shown as before. `contamination` (optional, a ContaminationScore or its
     dict form from contamination.json) adds a "Contamination probe (optional)" section; without
-    it the section is absent. It never changes the verdict."""
+    it the section is absent. `errors` (optional, the events of errors.log) fills the "Errors"
+    section (None -> "not provided"). Neither changes the verdict."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cutoff = settings.model_cutoff if settings is not None else None
@@ -477,6 +515,9 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     # ---- failures
     md += ["## Failures\n", "Failed calls by agent and reason:\n", _table(failures),
            "Dropped picks:\n", (_table(dropped_picks) if dropped_picks is not None else "not provided\n")]
+
+    # ---- errors
+    md += _errors_section(errors)
 
     # ---- cost
     n_days = len(result.day_results) or len(eq)

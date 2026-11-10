@@ -10,7 +10,7 @@ from atlas.engine.llm import ApiError, FatalApiError, sanitise
 from atlas.errorlog import read_events
 from tests.golden.stub import GoldenStub
 from tests.golden.test_golden_backtest import (  # noqa: F401 (fixtures)
-    FAKE_ANTHROPIC, SHORT_PERIODS, cli, golden, keys, write_config,
+    FAKE_ANTHROPIC, SHORT_PERIODS, cli, copy_run, golden, keys, write_config,
 )
 
 CANARY = "sk-ant-CANARY"
@@ -535,3 +535,23 @@ def test_dry_run_log_lands_only_in_dry_run_dir(golden, tmp_path, monkeypatch):  
     assert cli(["backtest", "--config", conf, "--dry-run"]) == 0
     assert cli_mod.ACTIVE_ERRORLOG.path == tmp_path / "run" / "dry_run" / "errors.log"
     assert not (tmp_path / "run" / "errors.log").exists()
+
+
+def test_report_errors_section_missing_empty_and_torn_log(golden, tmp_path):  # noqa: F811
+    run_dir, _ = copy_run(golden, tmp_path)
+    log = run_dir / "errors.log"
+    log.unlink(missing_ok=True)
+
+    def errors_section():
+        assert cli(["report", "--run-dir", run_dir]) == 0
+        md = (run_dir / "report" / "report.md").read_text()
+        return md.split("## Errors")[1].split("\n## ")[0]
+
+    assert "not provided" in errors_section()
+    log.write_text("")
+    assert "no errors logged" in errors_section()
+    good = ('{"ts_utc":"t","level":"error","kind":"agent_failure","day":null,"agent":"cro",'
+            '"reason":"r","message":"hello","fields":{},"run_id":null}')
+    log.write_text("garbage\n" + good + "\n" + '{"torn":')  # bad middle line, torn tail
+    s = errors_section()
+    assert "agent_failure" in s and "hello" in s

@@ -260,6 +260,12 @@ atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination p
   exists. The older-model check (optional, `atlas.backtest.oldmodel.run_older_model_check`) reruns
   only the window after an older model's cutoff in `<run_dir>/older_model/<model>/`; the model
   name is yours to supply and availability is not checked.
+* Error log: every run writes `<run_dir>/errors.log` (dry runs under `dry_run/`), one JSON object per
+  line (time, level, kind, day, agent, reason, message, fields), sanitised, mode 0600, rotated at
+  5 MB to `errors.log.1`. It records failed calls, skipped days, pauses and operational errors, and
+  logging can never change or stop a run. Read it with `atlas errors --run-dir DIR` (read-only;
+  `--kind` filters) or in the report's "Errors" section ("not provided" when the file is absent).
+  It never holds raw model replies: those stay in `failures.sqlite`.
 * A run directory remembers its validated config (`run_config.json`): re-running, calibrating or
   researching it with a different config is refused. Unknown config keys are rejected.
 * Exit codes: 0 success, 1 operational failure (the message says how to fix it), 2 usage, config
