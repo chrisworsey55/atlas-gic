@@ -94,7 +94,7 @@ _FENCE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*\n(.*?)\n?```\s*$", re.DOTALL)
 
 class DayPairs(NamedTuple):
     """One day's scored picks with their tickers, so abstentions can be imputed.
-    The three lists are aligned by position."""
+    The three lists are aligned by position; tickers must be unique within a day."""
     tickers: list[str]
     convictions: list[float]
     excess: list[float]
@@ -102,6 +102,14 @@ class DayPairs(NamedTuple):
 
 RunOneDay = Callable[[date, str], "DayPairs | tuple[list[float], list[float]] | None"]
 Decision = Literal["kept", "reverted", "rejected", "uncalibrated", "error"]
+
+
+class MalformedReplayOutput(ValueError):
+    """A replay result whose lists are misaligned or whose tickers repeat. `side` is
+    "old" or "new"; a malformed NEW result rejects the edit, a malformed OLD one is a bug."""
+    def __init__(self, msg: str, side: str):
+        super().__init__(msg)
+        self.side = side
 
 
 class InsufficientReplayDays(Exception):
@@ -202,31 +210,37 @@ class PairedResult:
     new_imputed: int = 0
 
 
-def _split(agent: str, d: date, out) -> tuple[list[str] | None, list[float], list[float]]:
+def _split(agent: str, d: date, out, side: str = "old") -> tuple[list[str] | None, list[float], list[float]]:
     """(tickers or None for a plain 2-tuple, convictions, excess); ValueError if misaligned."""
     if isinstance(out, DayPairs):
         t, c, e = out
         if not len(t) == len(c) == len(e):
-            raise ValueError(f"{agent} {d}: {len(t)} tickers, {len(c)} convictions, {len(e)} excess returns")
+            raise MalformedReplayOutput(
+                f"{agent} {d}: {len(t)} tickers, {len(c)} convictions, {len(e)} excess returns", side)
         if len(set(t)) != len(t):
-            raise ValueError(f"{agent} {d}: duplicate tickers in one day's picks")
+            raise MalformedReplayOutput(f"{agent} {d}: duplicate tickers in one day's picks", side)
         return list(t), list(c), list(e)
     if len(out[0]) != len(out[1]):
-        raise ValueError(f"{agent} {d}: {len(out[0])} convictions vs {len(out[1])} excess returns")
+        raise MalformedReplayOutput(
+            f"{agent} {d}: {len(out[0])} convictions vs {len(out[1])} excess returns", side)
     return None, list(out[0]), list(out[1])
 
 
 def _impute(own: tuple[list[str], list[float], list[float]],
             other: tuple[list[str], list[float], list[float]]) -> tuple[list[float], list[float], int]:
     """Samples for `own` side: its own pairs plus, for every ticker only `other` picked, a
-    conviction-0 pair carrying `other`'s excess (cost-adjusted; an approximation). A NaN
-    excess is never imputed. Returns (convictions, excess, number imputed)."""
+    COPY of `other`'s pair (its conviction and its cost-adjusted excess; the excess is an
+    approximation). Copying the conviction makes abstaining neutral: the dropped pick is
+    the same observation on both sides, so it cannot help or hurt the difference. (A fixed
+    conviction of 0 was tried and rewards abstention: it ranks lowest when picks are mostly
+    positive, next to the lowest excess.) A pick with NaN conviction or excess is never
+    imputed. Returns (convictions, excess, number imputed)."""
     have = set(own[0])
     c, e = list(own[1]), list(own[2])
     k = 0
-    for t, ex in zip(other[0], other[2]):
-        if t not in have and ex == ex:
-            c.append(0.0); e.append(ex); k += 1
+    for t, cv, ex in zip(*other):
+        if t not in have and ex == ex and cv == cv:
+            c.append(cv); e.append(ex); k += 1
     return c, e, k
 
 
@@ -241,8 +255,8 @@ def paired_replay(agent: str, old_prompt: str, new_prompt: str, days: list[date]
     its bad days drops them from both sides): ``edit_gate`` must be applied to the result.
 
     With ``impute`` and ``DayPairs`` results on both sides of a comparable day, a ticker only
-    one prompt picked enters the other side with conviction 0 and the same excess, so
-    dropping a loser no longer removes it from the sample. The IC uses the imputed samples;
+    one prompt picked enters the other side as a copy of that pick (same conviction, same
+    excess), so dropping a loser neither removes it from the sample nor earns credit. The IC uses the imputed samples;
     ``old_pairs``/``new_pairs`` stay RAW counts (what ``edit_gate`` compares). Plain 2-tuples
     are never imputed.
     """
@@ -261,7 +275,7 @@ def paired_replay(agent: str, old_prompt: str, new_prompt: str, days: list[date]
             if out is None:
                 fails[key] += 1
                 continue
-            parts[key] = _split(agent, d, out)
+            parts[key] = _split(agent, d, out, key)
             if not parts[key][1]:
                 empty[key] += 1
         if "old" not in parts or "new" not in parts or not parts["old"][1] or not parts["new"][1]:
@@ -569,6 +583,11 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
             decision, reason, stop = "error", f"budget exceeded during evaluation: {e}", True
         except InsufficientReplayDays as e:
             decision, reason = "rejected", f"replay: {e}"
+        except MalformedReplayOutput as e:
+            if e.side != "new":
+                decision, reason, sha, err = "error", f"{type(e).__name__}: {e}", None, e
+            else:
+                decision, reason = "rejected", f"new prompt gave malformed replay output: {e}"
         except BaseException as e:  # noqa: BLE001 - recorded, cleaned up, then re-raised
             decision, reason, sha, err = "error", f"{type(e).__name__}: {e}", None, e
         # record BEFORE cleanup: a failing cleanup must never lose the attempt's record

@@ -476,6 +476,32 @@ def test_insufficient_replay_data_is_recorded_and_loop_continues(tmp_path, promp
     assert branches(prompt_repo) == ["main"]
 
 
+def test_malformed_new_side_output_rejects_the_edit_old_side_stays_loud(tmp_path, prompt_repo):
+    from atlas.autoresearch.loop import DayPairs
+
+    def broken(bad_new):
+        def make(agent):
+            def run(day, prompt):
+                is_new = prompt.endswith(NEW_SUFFIX)
+                if is_new == bad_new:
+                    return DayPairs(["A", "B"], [0.1, 0.2, 0.3], [0.1, 0.2, 0.3])
+                return DayPairs(["A", "B", "C"], [0.1, 0.2, 0.3], [0.1, 0.2, 0.3])
+            run.horizon = 1
+            return run
+        return make
+
+    base = git(prompt_repo, "rev-parse", "main")
+    recs = run(tmp_path, prompt_repo, make=broken(True), cfg=settings(max_edits=2))
+    assert [r.decision for r in recs] == ["rejected", "rejected"]
+    assert all("malformed" in r.reason for r in recs)
+    assert git(prompt_repo, "rev-parse", "main") == base and branches(prompt_repo) == ["main"]
+    tmp2 = tmp_path / "b"
+    tmp2.mkdir()
+    with pytest.raises(ValueError, match="tickers"):
+        run(tmp2, prompt_repo, make=broken(False))
+    assert branches(prompt_repo) == ["main"]
+
+
 def test_original_branch_restored_and_used_as_merge_base(tmp_path, prompt_repo):
     git(prompt_repo, "checkout", "-q", "-b", "work")
     main_sha = git(prompt_repo, "rev-parse", "main")
