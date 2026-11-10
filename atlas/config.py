@@ -107,6 +107,12 @@ class Settings(BaseModel):
     older_usd_per_mtok_output: float | None = Field(None, ge=0)
     est_input_tokens_per_call: int = 4000
     est_output_tokens_per_call: int = 800
+    # autoresearch: confirm a kept-candidate on validation days; the edit gate's floor on
+    # new/old pair counts; impute zero-conviction pairs for tickers only one prompt picked
+    confirm_on_validation: bool = True
+    confirm_min_days: int = Field(20, ge=5)
+    min_pair_ratio: float = Field(0.95, gt=0, le=1)
+    impute_abstentions: bool = True
 
     @model_validator(mode="after")
     def _price_pairs(self):

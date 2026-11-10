@@ -125,3 +125,28 @@ def test_packaged_settings_set_low_effort_and_known_model():
     s = load_settings(CFG / "settings.yaml")
     assert s.effort == "low" and s.max_output_tokens == 8192
     assert s.prices() == (2.0, 10.0)
+
+
+def test_new_settings_defaults():
+    s = _settings()
+    assert (s.confirm_on_validation, s.confirm_min_days, s.min_pair_ratio, s.impute_abstentions) == (
+        True, 20, 0.95, True)
+    for bad in (dict(confirm_min_days=4), dict(min_pair_ratio=0), dict(min_pair_ratio=1.01)):
+        with pytest.raises(ValidationError):
+            _settings(**bad)
+
+
+def test_old_run_config_still_loads_without_new_fields():
+    from atlas.cli import record_diff
+    from atlas.config import Settings
+    new = _settings().model_dump(mode="json")
+    old = {k: v for k, v in new.items() if k not in (
+        "confirm_on_validation", "confirm_min_days", "min_pair_ratio", "impute_abstentions")}
+    assert Settings(**old).min_pair_ratio == 0.95
+    # a run directory stored before these fields existed is not refused merely for the added defaults
+    assert record_diff({"settings": old}, {"settings": new}) == []
+    # ...but a real change to one of them (or to anything else) is still a difference
+    changed = {**new, "min_pair_ratio": 0.8}
+    assert record_diff({"settings": old}, {"settings": changed}) == ["settings.min_pair_ratio"]
+    assert record_diff({"settings": old}, {"settings": {**new, "budget_usd": 1}}) == []  # allowed drift
+    assert record_diff({"settings": old}, {"settings": {**new, "slippage_bps": 9}}) == ["settings.slippage_bps"]

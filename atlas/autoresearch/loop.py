@@ -235,8 +235,8 @@ def edit_gate(r: PairedResult, cfg: Settings) -> str | None:
     Tolerance for extra failures/empty days: max(2, 5% of requested days). Rejects when the
     new prompt fails or abstains on more days than the old one beyond that tolerance, fails
     on more than ``max_failure_rate`` of the days, produces fewer pairs than
-    ``rolling_ic_window`` (the n keep_margin is calibrated on) or fewer than 80% of the old
-    prompt's pairs, or there are fewer than MIN_REPLAY_DAYS comparable days."""
+    ``rolling_ic_window`` (the n keep_margin is calibrated on) or fewer than ``min_pair_ratio`` of the
+    old prompt's pairs, or there are fewer than MIN_REPLAY_DAYS comparable days."""
     tol = max(2, math.ceil(0.05 * r.n_days_requested))
     why = []
     if r.new_failures > r.old_failures + tol:
@@ -247,8 +247,8 @@ def edit_gate(r: PairedResult, cfg: Settings) -> str | None:
         why.append(f"new prompt failure rate {r.new_failures}/{r.n_days_requested} > {cfg.max_failure_rate}")
     if r.new_pairs < cfg.rolling_ic_window:
         why.append(f"new prompt gave {r.new_pairs} pairs < rolling_ic_window {cfg.rolling_ic_window}")
-    if r.new_pairs < 0.8 * r.old_pairs:
-        why.append(f"new prompt gave {r.new_pairs} pairs < 80% of old {r.old_pairs}")
+    if r.new_pairs < cfg.min_pair_ratio * r.old_pairs:
+        why.append(f"new prompt gave {r.new_pairs} pairs < min_pair_ratio {cfg.min_pair_ratio} of old {r.old_pairs}")
     if r.n_days < MIN_REPLAY_DAYS:
         why.append(f"only {r.n_days} comparable days < {MIN_REPLAY_DAYS}")
     return "; ".join(why) or None

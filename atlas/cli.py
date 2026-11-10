@@ -593,6 +593,12 @@ LEGACY_RAW = ("run_config.settings", "run_config.universe", "run_config.budget_u
 
 def record_diff(stored: dict, current: dict) -> list[str]:
     a, b = _flat(stored), _flat(current)
+    # a setting added after the run was stored is not a difference while it holds its default
+    for k in list(b):
+        f = k.split(".", 1)[-1]
+        if k.startswith("settings.") and k not in a and f in Settings.model_fields \
+                and not Settings.model_fields[f].is_required() and b[k] == Settings.model_fields[f].default:
+            del b[k]
     skip = ALLOWED_DRIFT + LEGACY_RAW
     return sorted(k for k in set(a) | set(b) if a.get(k, "<absent>") != b.get(k, "<absent>")
                   and not any(k == p or k.startswith(p + ".") for p in skip))

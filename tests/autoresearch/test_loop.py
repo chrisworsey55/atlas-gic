@@ -640,7 +640,7 @@ def test_pair_count_collapse_is_rejected(tmp_path, prompt_repo):
         return with_horizon(run_one)
 
     recs = run(tmp_path, prompt_repo, make=make, keep_margin=0.1)
-    assert recs[0].decision == "rejected" and "80%" in recs[0].reason
+    assert recs[0].decision == "rejected" and "min_pair_ratio" in recs[0].reason
     # fewer pairs than the window keep_margin was calibrated on
     recs = run(tmp_path, prompt_repo, cfg=settings(rolling_ic_window=400), keep_margin=0.1)
     assert recs[-1].decision == "rejected" and "rolling_ic_window" in recs[-1].reason
@@ -657,12 +657,12 @@ def test_equal_failures_with_real_gain_still_kept(tmp_path, prompt_repo):
 
 def test_edit_gate_thresholds():
     cfg = settings(rolling_ic_window=60, max_failure_rate=0.2)
-    ok = PairedResult(0.0, 0.3, 60, 0.3, old_failures=1, new_failures=4, old_pairs=300, new_pairs=240,
+    ok = PairedResult(0.0, 0.3, 60, 0.3, old_failures=1, new_failures=4, old_pairs=300, new_pairs=285,
                       n_days_requested=60)
-    assert edit_gate(ok, cfg) is None  # tolerance max(2, 3) = 3 extra failures, 80% pairs exactly
+    assert edit_gate(ok, cfg) is None  # tolerance max(2, 3) = 3 extra failures, 95% pairs exactly
     from dataclasses import replace
     assert edit_gate(replace(ok, new_failures=5), cfg) is not None
-    assert edit_gate(replace(ok, new_pairs=239), cfg) is not None
+    assert edit_gate(replace(ok, new_pairs=284), cfg) is not None
     assert edit_gate(replace(ok, new_pairs=59, old_pairs=59), cfg) is not None
     assert edit_gate(replace(ok, old_failures=13, new_failures=13), cfg) is not None  # > 20%
     assert edit_gate(replace(ok, new_empty=4), cfg) is not None
@@ -809,3 +809,23 @@ def test_null_test_meta_is_recorded_in_every_log_line(tmp_path, prompt_repo):
     lines = log_lines(tmp_path)
     assert len(lines) == 2 and all(line["null_test"] == meta for line in lines)
     assert all(r.null_test == meta for r in recs)
+
+
+def _pair_result(new_pairs, old_pairs=100):
+    return PairedResult(0.0, 0.3, 60, 0.3, old_failures=0, new_failures=0, old_pairs=old_pairs,
+                        new_pairs=new_pairs, n_days_requested=60)
+
+
+def test_gate_rejects_ninety_percent_of_pairs_by_default():
+    why = edit_gate(_pair_result(90), settings(rolling_ic_window=60))
+    assert why is not None and "min_pair_ratio" in why
+
+
+def test_gate_accepts_at_exactly_the_ratio():
+    assert edit_gate(_pair_result(95), settings(rolling_ic_window=60)) is None
+    assert edit_gate(_pair_result(94), settings(rolling_ic_window=60)) is not None
+
+
+def test_pair_ratio_setting_is_honoured():
+    assert edit_gate(_pair_result(90), settings(rolling_ic_window=60, min_pair_ratio=0.8)) is None
+    assert edit_gate(_pair_result(79), settings(rolling_ic_window=60, min_pair_ratio=0.8)) is not None
