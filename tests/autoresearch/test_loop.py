@@ -274,9 +274,11 @@ def test_paired_replay_computes_rank_ic_on_identical_days():
 def test_holdout_days_never_passed_to_replay(tmp_path, prompt_repo):
     seen = []
     run(tmp_path, prompt_repo, make=fake_run_one_day(seen=seen))
-    days = sorted({d for _, d, _ in seen})
+    allseen = sorted({d for _, d, _ in seen})
+    # validation confirmation (test_confirmation.py) replays validation days; never holdout
+    assert all(d < PERIODS.holdout[0] for d in allseen)
+    days = [d for d in allseen if d <= TRAIN[1]]
     assert days, "replay ran"
-    assert all(TRAIN[0] <= d <= TRAIN[1] for d in days)
     # the 1-day exit of every replay day must also lie in train: the last train day is dropped
     for d in days:
         exit_day = TRADING_DAYS[TRADING_DAYS.index(d) + 1]
@@ -520,7 +522,7 @@ def test_log_line_written_per_attempt(tmp_path, prompt_repo):
     lines = log_lines(tmp_path)
     assert len(lines) == 2
     assert set(lines[0]) == {"agent", "branch", "n_days", "old_ic", "new_ic", "diff", "keep_margin",
-                             "decision", "reason", "commit_sha", "cost_usd", "null_test"}
+                             "decision", "reason", "commit_sha", "cost_usd", "null_test", "confirm"}
     assert lines[0]["null_test"] is None  # optional: set when run_autoresearch gets null_test_meta
     assert lines[0]["agent"] == recs[0].agent and lines[0]["branch"] == "autoresearch/agent_a-0"
     assert lines[1]["branch"] == "autoresearch/agent_b-1"
@@ -594,12 +596,17 @@ def test_end_to_end_with_stub_model_and_real_pipeline(tmp_path, prompt_repo):
     assert r.new_ic > 0.8 and abs(r.old_ic) < 0.3 and r.n_days == 60
     assert (prompt_repo / "atlas/prompts/agent_a.md").read_text() == PROMPT_A + NEW_SUFFIX
     # unchanged agent: one live call per replay day despite two replays (the rest are cache hits)
+    # (60 train replay days, then 60 validation confirmation days)
     b_calls = [c for c in calls if c[0] == "agent_b"]
-    assert len(b_calls) == 60 and len({c[1] for c in b_calls}) == 60
+    assert len(b_calls) == 120 and len({c[1] for c in b_calls}) == 120
     a_new = [c for c in calls if c[0] == "agent_a" and c[2]]
     a_old = [c for c in calls if c[0] == "agent_a" and not c[2]]
-    assert len(a_new) == 60 and len(a_old) == 60
-    assert all(date.fromisoformat(c[1]) < LAST_TRAIN_DAY for c in calls)
+    assert len(a_new) == 120 and len(a_old) == 120
+    train_calls = [c for c in calls if date.fromisoformat(c[1]) <= TRAIN[1]]
+    assert len(train_calls) == 180 and all(date.fromisoformat(c[1]) < LAST_TRAIN_DAY for c in train_calls)
+    assert all(PERIODS.validation[0] <= date.fromisoformat(c[1]) < PERIODS.validation[1]
+               for c in calls if c not in train_calls)
+    assert r.confirm["passed"] is True and r.confirm["n_days"] == 60
     assert r.cost_usd > 0
 
 

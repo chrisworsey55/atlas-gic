@@ -1,5 +1,5 @@
 """The autoresearch loop: one targeted prompt edit per attempt, evaluated by paired replay
-on TRAIN days only, kept via a git merge or reverted.
+on TRAIN days, confirmed on VALIDATION days, kept via a git merge or reverted.
 
 Per attempt (at most ``Settings.max_edits`` per call):
 
@@ -19,19 +19,43 @@ Per attempt (at most ``Settings.max_edits`` per call):
    calibrated on) or than 80% of the old prompt's, or < 40 comparable days. Then
    KEEP only if ``diff > keep_margin`` (the null test's ``keep_margin()``, calibrated with
    window == ``Settings.rolling_ic_window``). ``keep_margin is None`` (not yet calibrated)
-   never keeps: the attempt is recorded as ``uncalibrated``. Kept => merged into the
-   branch that was checked out; otherwise the branch is discarded and the original branch
-   and prompt file stay byte-for-byte unchanged, including when evaluation raises.
+   never keeps: the attempt is recorded as ``uncalibrated``.
+5. Validation confirmation (``Settings.confirm_on_validation``, default on): a train win is
+   NOT merged yet. The same agent is replayed under both prompts on the ``n_confirm_days``
+   most recent validation days whose scoring exit is also inside validation
+   (``validation_days``), and the edit is kept only if there are at least
+   ``confirm_min_days`` such days, ``edit_gate`` passes on the validation result (with
+   ``min_days=confirm_min_days``) and the finite validation diff exceeds
+   ``confirm_margin(keep_margin, rolling_ic_window, new_pairs)``. Otherwise the decision is
+   ``unconfirmed`` (also when validation is too short: fail safe; no replay is run then).
+   Note: the gate already requires ``new_pairs >= rolling_ic_window``, so with the same gate
+   the sqrt factor of ``confirm_margin`` is 1 whenever the gate passes; it only matters if
+   the gate's pair floor is ever relaxed for validation.
+   Kept => merged into the branch that was checked out; otherwise the branch is discarded
+   and the original branch and prompt file stay byte-for-byte unchanged, including when
+   evaluation or confirmation raises.
 
 Holdout safety: replay days are the most recent train days whose scoring exit (``horizon``
 trading days later) also lies inside train; ``check_train_only`` raises ``HoldoutViolation``
 otherwise, and the run_one_day callable is wrapped so it can never be asked for another day.
+Confirmation days get their own check (``check_validation_only``, run once before any edit)
+and their own wrapper: neither guard accepts the other period's days, and a validation day
+whose exit falls in the holdout (the last ``horizon`` validation days) is never used.
 
 Train-only inputs: target selection (AgentStats) and the proposal's diagnostics are built
 by run_autoresearch itself from the ScoreStore, using only picks dated on or before the last
-train day whose scoring exit is still inside train (``collect_stats(max_date=...)``).
+train day whose scoring exit is still inside train (``collect_stats(max_date=...)``). They are
+built once, before the first attempt: confirmation results never feed back into them.
 Anonymised runs: ``DayContext.asof_label``/``ticker_map`` make the replay call the agent
 exactly as the runner did (same label, so cache keys match) and map tickers back for scoring.
+
+Each confirmation spends part of the validation set (the same most recent days each time), so
+it is recorded: ``EditRecord.confirm`` holds the validation numbers (None when no confirmation
+was attempted; ``n_days_requested == 0`` when validation was too short and nothing was
+replayed). The number of confirmations run is the count of log lines with
+``confirm.n_days_requested > 0``; ``Settings.max_edits`` caps attempts and so confirmations.
+The validation replay's LLM calls go through the same ``CachedLLM`` (one budget) and are
+included in ``cost_usd``.
 
 Each attempt appends one ``EditRecord`` JSON line to ``<run_dir>/autoresearch_log.jsonl``
 (flushed and fsynced immediately), written BEFORE git cleanup so a failing cleanup never
@@ -101,7 +125,7 @@ class DayPairs(NamedTuple):
 
 
 RunOneDay = Callable[[date, str], "DayPairs | tuple[list[float], list[float]] | None"]
-Decision = Literal["kept", "reverted", "rejected", "uncalibrated", "error"]
+Decision = Literal["kept", "reverted", "rejected", "uncalibrated", "unconfirmed", "error"]
 
 
 class MalformedReplayOutput(ValueError):
@@ -300,14 +324,15 @@ def paired_replay(agent: str, old_prompt: str, new_prompt: str, days: list[date]
                         len(requested), empty["old"], empty["new"], imputed["old"], imputed["new"])
 
 
-def edit_gate(r: PairedResult, cfg: Settings) -> str | None:
+def edit_gate(r: PairedResult, cfg: Settings, *, min_days: int = MIN_REPLAY_DAYS) -> str | None:
     """Reasons to REJECT an edit regardless of its IC gain (None if it may be judged on IC).
 
     Tolerance for extra failures/empty days: max(2, 5% of requested days). Rejects when the
     new prompt fails or abstains on more days than the old one beyond that tolerance, fails
     on more than ``max_failure_rate`` of the days, produces fewer pairs than
     ``rolling_ic_window`` (the n keep_margin is calibrated on) or fewer than ``min_pair_ratio`` of the
-    old prompt's pairs, or there are fewer than MIN_REPLAY_DAYS comparable days."""
+    old prompt's pairs, or there are fewer than `min_days` comparable days (MIN_REPLAY_DAYS on
+    train, ``confirm_min_days`` on validation)."""
     tol = max(2, math.ceil(0.05 * r.n_days_requested))
     why = []
     if r.new_failures > r.old_failures + tol:
@@ -320,8 +345,8 @@ def edit_gate(r: PairedResult, cfg: Settings) -> str | None:
         why.append(f"new prompt gave {r.new_pairs} pairs < rolling_ic_window {cfg.rolling_ic_window}")
     if r.new_pairs < cfg.min_pair_ratio * r.old_pairs:
         why.append(f"new prompt gave {r.new_pairs} pairs < min_pair_ratio {cfg.min_pair_ratio} of old {r.old_pairs}")
-    if r.n_days < MIN_REPLAY_DAYS:
-        why.append(f"only {r.n_days} comparable days < {MIN_REPLAY_DAYS}")
+    if r.n_days < min_days:
+        why.append(f"only {r.n_days} comparable days < {min_days}")
     return "; ".join(why) or None
 
 
@@ -380,15 +405,34 @@ def _exit_day(day: date, trading_days: Sequence[date], horizon: int) -> date | N
     return td[i] if i < len(td) else None
 
 
-def check_train_only(days: Sequence[date], trading_days: Sequence[date], periods: Periods,
-                     horizon: int = 1) -> None:
-    lo, hi = periods.train
+def _check_inside(days: Sequence[date], trading_days: Sequence[date], rng: tuple[date, date],
+                  name: str, horizon: int) -> None:
+    lo, hi = rng
     for d in days:
         if not lo <= d <= hi:
-            raise HoldoutViolation(f"replay day {d} is outside the train period {lo}..{hi}")
+            raise HoldoutViolation(f"replay day {d} is outside the {name} period {lo}..{hi}")
         ex = _exit_day(d, trading_days, horizon)
         if ex is None or ex > hi:
-            raise HoldoutViolation(f"replay day {d}: scoring exit {ex} is not inside train (ends {hi})")
+            raise HoldoutViolation(f"replay day {d}: scoring exit {ex} is not inside {name} (ends {hi})")
+
+
+def _days_inside(trading_days: Sequence[date], rng: tuple[date, date], horizon: int) -> list[date]:
+    """Trading days in `rng` whose `horizon`-day exit is a known trading day also in `rng`."""
+    lo, hi = rng
+    td = sorted(set(trading_days))
+    return [d for i, d in enumerate(td) if lo <= d <= hi and i + horizon < len(td) and td[i + horizon] <= hi]
+
+
+def check_train_only(days: Sequence[date], trading_days: Sequence[date], periods: Periods,
+                     horizon: int = 1) -> None:
+    _check_inside(days, trading_days, periods.train, "train", horizon)
+
+
+def check_validation_only(days: Sequence[date], trading_days: Sequence[date], periods: Periods,
+                          horizon: int = 1) -> None:
+    """HoldoutViolation unless every day AND its `horizon`-day scoring exit lie in validation
+    (so neither train days nor the last validation days, whose exit is in holdout, pass)."""
+    _check_inside(days, trading_days, periods.validation, "validation", horizon)
 
 
 def replay_days(trading_days: Sequence[date], periods: Periods, horizon: int = 1,
@@ -396,11 +440,23 @@ def replay_days(trading_days: Sequence[date], periods: Periods, horizon: int = 1
     """The `n` most recent train days whose `horizon`-day exit is also in train."""
     if n < MIN_REPLAY_DAYS:
         raise ValueError(f"n={n}: paired replay needs at least {MIN_REPLAY_DAYS} days")
-    lo, hi = periods.train
-    td = sorted(set(trading_days))
-    ok = [d for i, d in enumerate(td)
-          if lo <= d <= hi and i + horizon < len(td) and td[i + horizon] <= hi]
-    return ok[-n:]
+    return _days_inside(trading_days, periods.train, horizon)[-n:]
+
+
+def validation_days(trading_days: Sequence[date], periods: Periods, horizon: int = 1,
+                    n: int = 60) -> list[date]:
+    """The `n` most recent validation days whose `horizon`-day exit is also in validation
+    (never a holdout day or exit). May be shorter than ``confirm_min_days``: the caller decides."""
+    if n < 1:
+        raise ValueError(f"n={n}: need at least one validation day")
+    return _days_inside(trading_days, periods.validation, horizon)[-n:]
+
+
+def confirm_margin(keep_margin: float, window: int, new_pairs: int) -> float:
+    """The validation keep margin: ``keep_margin`` (calibrated on `window` pairs) scaled by
+    sqrt(window / new_pairs) when the validation sample is smaller, never below keep_margin.
+    A heuristic: the null spread of an IC shrinks roughly with the square root of the sample."""
+    return keep_margin * max(1.0, math.sqrt(window / max(1, new_pairs)))
 
 
 # ---------------------------------------------------------------- the loop
@@ -421,10 +477,25 @@ class EditRecord:
     # how keep_margin was calibrated (seed, n_shuffles, window, train_max_date, ...): recorded so
     # re-running with different null-test seeds until a lucky margin appears is visible
     null_test: dict | None = None
+    # validation confirmation of a train win (None when none was attempted): n_days_requested
+    # (validation days replayed; 0 = no replay ran), n_days, old_ic, new_ic, diff, margin,
+    # new_pairs, passed, reason. The top-level n_days/old_ic/new_ic/diff stay the TRAIN numbers.
+    confirm: dict | None = None
 
 
 def _num(x: float | None) -> float | None:
     return None if x is None or not math.isfinite(x) else x
+
+
+_CONFIRM_FLOATS = ("old_ic", "new_ic", "diff", "margin")
+
+
+def _confirm_info(n_requested: int, reason: str, val: PairedResult | None = None,
+                  margin: float | None = None, passed: bool = False) -> dict:
+    return {"n_days_requested": n_requested, "n_days": val.n_days if val else 0,
+            "old_ic": val.old_ic if val else None, "new_ic": val.new_ic if val else None,
+            "diff": val.diff if val else None, "margin": margin,
+            "new_pairs": val.new_pairs if val else 0, "passed": passed, "reason": reason}
 
 
 def _append(path: Path, rec: EditRecord) -> None:
@@ -432,6 +503,8 @@ def _append(path: Path, rec: EditRecord) -> None:
     d = asdict(rec)
     for f in ("old_ic", "new_ic", "diff", "keep_margin"):
         d[f] = _num(d[f])
+    if d["confirm"] is not None:
+        d["confirm"] = {k: (_num(v) if k in _CONFIRM_FLOATS else v) for k, v in d["confirm"].items()}
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(d, sort_keys=True) + "\n")
         f.flush()
@@ -440,9 +513,7 @@ def _append(path: Path, rec: EditRecord) -> None:
 
 def last_safe_train_day(trading_days: Sequence[date], periods: Periods, horizon: int = 1) -> date | None:
     """The last train day whose `horizon`-day exit is also inside train."""
-    lo, hi = periods.train
-    td = sorted(set(trading_days))
-    ok = [d for i, d in enumerate(td) if lo <= d <= hi and i + horizon < len(td) and td[i + horizon] <= hi]
+    ok = _days_inside(trading_days, periods.train, horizon)
     return ok[-1] if ok else None
 
 
@@ -478,13 +549,37 @@ def build_diagnostics(scores, agent: str, stats: list[AgentStats], cfg: Settings
     return "\n".join(lines)
 
 
+def _confirm(agent: str, old_prompt: str, new_prompt: str, vdays: list[date], run_one_day: RunOneDay,
+             keep_margin: float, cfg: Settings) -> dict:
+    """Replay a train win on the validation days and judge it (``EditRecord.confirm``).
+    Passed only with >= confirm_min_days days, the edit gate passing on the validation result
+    (min_days=confirm_min_days) and a finite ``diff > confirm_margin(...)``. BudgetExceeded,
+    MalformedReplayOutput and anything else propagate to the caller's handlers."""
+    if len(vdays) < cfg.confirm_min_days:
+        return _confirm_info(0, f"only {len(vdays)} validation days with in-validation exits "
+                                f"(< confirm_min_days {cfg.confirm_min_days})")
+    try:
+        val = paired_replay(agent, old_prompt, new_prompt, vdays, run_one_day,
+                            impute=cfg.impute_abstentions, min_days=cfg.confirm_min_days)
+    except InsufficientReplayDays as e:
+        return _confirm_info(len(vdays), f"replay: {e}")
+    margin = confirm_margin(keep_margin, cfg.rolling_ic_window, val.new_pairs)
+    gate = edit_gate(val, cfg, min_days=cfg.confirm_min_days)
+    if gate is not None:
+        return _confirm_info(len(vdays), f"gate: {gate}", val, margin)
+    if math.isfinite(val.diff) and val.diff > margin:
+        return _confirm_info(len(vdays), f"diff {val.diff:.4f} > margin {margin:.4f}", val, margin, True)
+    return _confirm_info(len(vdays), f"diff {val.diff:.4f} <= margin {margin:.4f}", val, margin)
+
+
 def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_days: Sequence[date],
                      specs: list[AgentSpec], llm: CachedLLM, scores,
                      failure_rates: dict[str, float],
                      make_run_one_day: Callable[[str], RunOneDay], keep_margin: float | None,
                      run_dir: Path, horizon: int = 1,
                      failure_notes: Callable[[str], str] | None = None,
-                     n_replay_days: int = 60, null_test_meta: dict | None = None) -> list[EditRecord]:
+                     n_replay_days: int = 60, null_test_meta: dict | None = None,
+                     n_confirm_days: int = 60) -> list[EditRecord]:
     """Run up to cfg.max_edits attempts; see the module docstring.
 
     `scores` is the backtest's ScoreStore (anything with ``picks_frame``): target selection
@@ -492,7 +587,9 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
     train. `failure_rates` (and optional `failure_notes`) must also come from train-period
     data; an agent missing from `failure_rates` is never targeted. Every
     ``make_run_one_day(agent)`` result must carry ``.horizon == horizon`` (as
-    ``build_run_one_day`` does), else ValueError."""
+    ``build_run_one_day`` does), else ValueError. With ``cfg.confirm_on_validation`` the same
+    run_one_day is also asked for the `n_confirm_days` most recent validation days (whose exit
+    is inside validation), behind its own guard."""
     if keep_margin is not None and not (math.isfinite(keep_margin) and keep_margin >= 0):
         raise ValueError(f"keep_margin must be a finite non-negative number or None, got {keep_margin!r}")
     git = GitOps(repo)
@@ -503,10 +600,15 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
         raise InsufficientReplayDays(
             f"only {len(days)} train days with in-train exits (< {MIN_REPLAY_DAYS})")
     check_train_only(days, trading_days, periods, horizon)
+    # confirmation days: chosen and checked once, up front (a holdout day refuses the run before
+    # any edit); fewer than confirm_min_days makes every train win "unconfirmed" without a replay
+    vdays = validation_days(trading_days, periods, horizon, n_confirm_days) if cfg.confirm_on_validation else []
+    check_validation_only(vdays, trading_days, periods, horizon)
     safe_end = last_safe_train_day(trading_days, periods, horizon)
     agents = [s.name for s in specs if s.kind != "control"]
     stats = train_stats(scores, agents, cfg, safe_end, horizon)
-    allowed = frozenset(days)
+    allowed_train = frozenset(days)
+    allowed_validation = frozenset(vdays)
     by_name = {s.name: s for s in specs}
     log_path = Path(run_dir) / LOG_NAME
     records: list[EditRecord] = []
@@ -553,11 +655,18 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
         base_sha = git.head_sha(original)
 
         def guarded(day: date, prompt: str, _run=raw_run):
-            if day not in allowed:
+            if day not in allowed_train:
                 raise HoldoutViolation(f"replay requested non-train day {day}")
             return _run(day, prompt)
 
+        def vguarded(day: date, prompt: str, _run=raw_run):
+            if day not in allowed_validation:
+                raise HoldoutViolation(f"confirmation replay requested non-validation day {day}")
+            return _run(day, prompt)
+
         result: PairedResult | None = None
+        confirm: dict | None = None
+        pending: dict | None = None
         decision: Decision = "error"
         reason, sha, stop, created, merged = "", None, False, False, False
         err: BaseException | None = None
@@ -574,9 +683,19 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
             elif keep_margin is None:
                 decision, reason = "uncalibrated", "keep_margin not calibrated by the null test: never keep"
             elif math.isfinite(result.diff) and result.diff > keep_margin:
-                sha = git.merge_branch(branch)
-                merged = True
-                decision, reason = "kept", f"diff {result.diff:.4f} > keep_margin {keep_margin:.4f}"
+                won = f"diff {result.diff:.4f} > keep_margin {keep_margin:.4f}"
+                if cfg.confirm_on_validation:
+                    # NOT merged yet: replay on validation days; the merge waits for confirmation
+                    confirm = pending = _confirm_info(len(vdays), "confirmation replay did not complete")
+                    confirm = _confirm(target, current, new, vdays, vguarded, keep_margin, cfg)
+                if confirm is not None and not confirm["passed"]:
+                    decision = "unconfirmed"
+                    reason = f"{won} on train; not confirmed on validation: {confirm['reason']}"
+                else:
+                    sha = git.merge_branch(branch)
+                    merged = True
+                    decision = "kept"
+                    reason = won + (f"; confirmed on validation: {confirm['reason']}" if confirm else "")
             else:
                 decision, reason = "reverted", f"diff {result.diff:.4f} <= keep_margin {keep_margin:.4f}"
         except BudgetExceeded as e:
@@ -590,10 +709,13 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
                 decision, reason = "rejected", f"new prompt gave malformed replay output: {e}"
         except BaseException as e:  # noqa: BLE001 - recorded, cleaned up, then re-raised
             decision, reason, sha, err = "error", f"{type(e).__name__}: {e}", None, e
+        if confirm is not None and confirm is pending:  # the confirmation replay raised
+            confirm["reason"] = f"{confirm['reason']}: {reason}"
         # record BEFORE cleanup: a failing cleanup must never lose the attempt's record
         emit(EditRecord(target, branch, result.n_days if result else 0,
                         result.old_ic if result else None, result.new_ic if result else None,
-                        result.diff if result else None, keep_margin, decision, reason, sha, cost()))
+                        result.diff if result else None, keep_margin, decision, reason, sha, cost(),
+                        confirm=confirm))
         cleanup_err: BaseException | None = None
         try:
             if created and not merged:
