@@ -45,9 +45,12 @@ class FailureLog:
                  rec.raw_response, kind, run_id if run_id is not None else self.run_id),
             )
         # mirror after the insert; only the detail text, never the raw model reply
-        self.error_log.event(kind, rec.detail, level="info" if kind == DROPPED_PICK else "warning",
-                             day=rec.date, agent=rec.agent, reason=rec.reason.value,
-                             attempt=rec.attempt)
+        try:
+            self.error_log.event(kind, rec.detail, level="info" if kind == DROPPED_PICK else "warning",
+                                 day=rec.date, agent=rec.agent, reason=rec.reason.value,
+                                 attempt=rec.attempt)
+        except Exception:  # noqa: BLE001 - mirroring must never break the run
+            pass
 
     def rows(self, kind: str | None = None) -> pd.DataFrame:
         q = f"SELECT {', '.join(_COLS)}, kind, run_id FROM failures"
