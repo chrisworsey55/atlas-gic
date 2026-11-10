@@ -974,6 +974,15 @@ def test_resume_refused_when_an_agent_model_changed(tmp_path):
     assert "agents" in _resume_with(tmp_path, mutate)
 
 
+def test_resume_refused_when_an_agent_model_is_set_to_the_default_model(tmp_path):
+    # an explicit per-agent model is a change even when it equals settings.model (only None is ignored)
+    def mutate(e):
+        specs = {n: sp.model_copy() for n, sp in e.pipeline.specs.items()}
+        specs["s2"] = specs["s2"].model_copy(update={"model": e.settings.model})
+        e.pipeline.specs = specs
+    assert "agents" in _resume_with(tmp_path, mutate)
+
+
 def test_resume_refused_when_spoke_model_set(tmp_path):
     def mutate(e):
         e.settings = settings(spoke_model="spoke-m", spoke_usd_per_mtok_input=1.0, spoke_usd_per_mtok_output=2.0)
