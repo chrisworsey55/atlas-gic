@@ -308,9 +308,11 @@ atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination p
 
 **Limitations** (also listed in every report)
 
-* `model_cutoff` in `atlas/config/settings.yaml` (2026-06-01) is a PLACEHOLDER GUESS and the
-  whole verdict rests on it: set it from the documented training-data cutoff of the exact model
-  you use. The CLI prints a warning while it is the shipped default.
+* `model_cutoff` in `atlas/config/settings.yaml` (2026-06-30) is the documented training cutoff
+  of the packaged model and the whole verdict rests on it: set it from the documented cutoff of
+  the exact model you use. A run is refused if a model in use (including `spoke_model` and
+  per-agent `model` overrides) has a documented cutoff in `atlas/config.py` later than
+  `model_cutoff`; the CLI warns for a model that table does not list.
 * Pricing is configured, not billed: the hard cap is an estimate (see `budget_usd` above).
 * No sampling settings are sent (current models reject `temperature`): replays are deterministic
   only because identical inputs are served from the response cache; an uncached re-run may differ.

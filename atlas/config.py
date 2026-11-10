@@ -1,6 +1,7 @@
 """Typed loaders for the YAML files in atlas/config/."""
 from __future__ import annotations
 
+import re
 from datetime import date
 from pathlib import Path
 from typing import Literal
@@ -30,14 +31,45 @@ MODEL_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5": (1.0, 5.0),
 }
 
-# the model_cutoff shipped in atlas/config/settings.yaml: a PLACEHOLDER, not a documented cutoff
-SHIPPED_MODEL_CUTOFF = date(2026, 6, 1)
+# Documented training-data cutoffs (month granular, so the month end), from the Anthropic Models
+# overview page https://platform.claude.com/docs/en/about-claude/models/overview read 2026-11-07
+# ("Jun 2026" for all four). Re-check the page whenever a model is added or changed. A run is
+# refused when a model in use has a cutoff here later than settings.model_cutoff.
+MODEL_TRAINING_CUTOFFS: dict[str, date] = {
+    "claude-haiku-5-5": date(2026, 6, 30),
+    "claude-sonnet-5-5": date(2026, 6, 30),
+    "claude-opus-5-5": date(2026, 6, 30),
+    "claude-fable-5-1": date(2026, 6, 30),
+}
+
+# the model_cutoff shipped in atlas/config/settings.yaml: the documented cutoff of the packaged
+# model. For a model absent from MODEL_TRAINING_CUTOFFS it is only a default to re-check.
+SHIPPED_MODEL_CUTOFF = date(2026, 6, 30)
+
+# agents whose model is `spoke_model` when set (the `control` agent follows them)
+SPOKE_KINDS = frozenset({"macro", "sector", "superinvestor"})
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
 class UnknownModelPrice(ValueError):
     """No price is known for a model and none was configured."""
+
+
+class ModelCutoffError(ValueError):
+    """A model in use was trained on data later than settings.model_cutoff."""
+
+
+_DATE_SUFFIX = re.compile(r"-\d{8}$")
+
+
+def documented_cutoff(model: str) -> date | None:
+    """The documented training cutoff of `model`, or None if unknown. The table is keyed by
+    exact id; a snapshot id with a trailing -YYYYMMDD (claude-sonnet-5-5-20260101) is treated as
+    its base model, conservatively: it cannot have an EARLIER cutoff than the base alias, and
+    treating it as unknown would let a contaminated run through with only a warning. Any other
+    unknown id (including aliases such as -latest) is unknown."""
+    return MODEL_TRAINING_CUTOFFS.get(model) or MODEL_TRAINING_CUTOFFS.get(_DATE_SUFFIX.sub("", model))
 
 
 def model_prices(model: str, explicit: tuple[float | None, float | None] = (None, None), *,
@@ -60,6 +92,7 @@ class AgentSpec(BaseModel):
     kind: Literal["macro", "sector", "superinvestor", "cro", "cio", "execution", "control"]
     prompt_file: str
     benchmark: str | None = None
+    model: str | None = None   # per-agent override of the model (needs a price-table entry)
 
 
 class Limits(BaseModel):
@@ -90,6 +123,11 @@ class Settings(BaseModel):
     max_failure_rate: float = 0.2
     confirm_cost_usd: float = 25.0
     older_model: str | None = None
+    # hub and spoke: spoke_model runs the macro/sector/superinvestor agents and the control agent
+    # (None = every agent uses `model`). Its own price pair, both or neither.
+    spoke_model: str | None = None
+    spoke_usd_per_mtok_input: float | None = Field(None, ge=0)
+    spoke_usd_per_mtok_output: float | None = Field(None, ge=0)
     tolerance_days: int = 5
     # request settings. No sampling parameter exists: current models reject temperature/top_p/
     # top_k with HTTP 400, and replay determinism comes from the response cache. `effort` is
@@ -117,7 +155,8 @@ class Settings(BaseModel):
     @model_validator(mode="after")
     def _price_pairs(self):
         for a, b in (("usd_per_mtok_input", "usd_per_mtok_output"),
-                     ("older_usd_per_mtok_input", "older_usd_per_mtok_output")):
+                     ("older_usd_per_mtok_input", "older_usd_per_mtok_output"),
+                     ("spoke_usd_per_mtok_input", "spoke_usd_per_mtok_output")):
             if (getattr(self, a) is None) != (getattr(self, b) is None):
                 raise ValueError(f"set both {a} and {b}, or neither")
         return self
@@ -126,12 +165,61 @@ class Settings(BaseModel):
         """(input, output) USD per million tokens for `model`; raises UnknownModelPrice."""
         return model_prices(self.model, (self.usd_per_mtok_input, self.usd_per_mtok_output))
 
+    def agent_model(self, spec: AgentSpec) -> str:
+        """Effective model: the agent's own override, else spoke_model (spoke kinds and the
+        control agent), else `model`."""
+        if spec.model:
+            return spec.model
+        if self.spoke_model and (spec.kind in SPOKE_KINDS or spec.kind == "control"):
+            return self.spoke_model
+        return self.model
+
+    def prices_for(self, model: str) -> tuple[float, float]:
+        """Prices of a model in use: the explicit pair for `model` / `spoke_model` if set (the
+        main pair wins when they are the same id), else the table; raises UnknownModelPrice
+        naming the field to set (a per-agent override model needs a table entry)."""
+        if model == self.model:
+            return self.prices()
+        if self.spoke_model and model == self.spoke_model:
+            return model_prices(model, (self.spoke_usd_per_mtok_input, self.spoke_usd_per_mtok_output),
+                                fields=("spoke_usd_per_mtok_input", "spoke_usd_per_mtok_output"))
+        return model_prices(model)
+
     def older_prices(self, model: str | None = None) -> tuple[float, float]:
         """Prices of the older model (`model` or `older_model`): its own explicit pair or table
         entry, never the main model's prices; raises UnknownModelPrice."""
         return model_prices(model or self.older_model or "", (self.older_usd_per_mtok_input,
                                                                 self.older_usd_per_mtok_output),
                             fields=("older_usd_per_mtok_input", "older_usd_per_mtok_output"))
+
+
+def check_model_cutoffs(settings: Settings, specs: list[AgentSpec]) -> list[str]:
+    """Check every model in use (each agent's effective model; `model` if there are no agents).
+    Raises ModelCutoffError if one has a documented cutoff later than settings.model_cutoff.
+    Returns warnings: a model with no documented cutoff cannot be checked, so its model_cutoff
+    must be an explicit value the user set; the shipped default is flagged, and a value earlier
+    than the newest documented cutoff is flagged as possibly too early."""
+    used = sorted({settings.agent_model(sp) for sp in specs} or {settings.model})
+    warnings: list[str] = []
+    newest = max(MODEL_TRAINING_CUTOFFS.values())
+    for m in used:
+        doc = documented_cutoff(m)
+        if doc is None:
+            msg = (f"model '{m}' has no documented training cutoff in atlas/config.py, so "
+                   f"settings.model_cutoff {settings.model_cutoff} cannot be checked against it")
+            if settings.model_cutoff == SHIPPED_MODEL_CUTOFF:
+                msg += ("; model_cutoff is the shipped default; re-check it on the Models overview page "
+                        "and set it explicitly")
+            elif settings.model_cutoff < newest:
+                msg += (f"; it is earlier than the newest documented cutoff ({newest}), so confirm it on "
+                        "the Models overview page")
+            warnings.append(msg)
+        elif doc > settings.model_cutoff:
+            raise ModelCutoffError(
+                f"model '{m}' has a documented training cutoff of {doc}, later than settings.model_cutoff "
+                f"{settings.model_cutoff}: its training data overlaps the evaluation. Set "
+                f"settings.model_cutoff to {doc} (and keep the holdout after it) or use an older model")
+    return warnings
 
 
 def _load(path: str | Path) -> dict | list:

@@ -104,7 +104,8 @@ from atlas.backtest.runner import (
     estimate_cost, preflight_prices, read_day_history, required_tickers, run_backtest,
 )
 from atlas.config import (
-    SHIPPED_MODEL_CUTOFF, AgentSpec, Limits, Settings, UnknownModelPrice, load_agents, load_limits,
+    AgentSpec, Limits, ModelCutoffError, Settings, UnknownModelPrice, check_model_cutoffs, load_agents,
+    load_limits,
 )
 from atlas.data.csv_provider import CacheOnlyPrices, CsvPriceProvider, NoMacro
 from atlas.data.fred_provider import FredFetchError
@@ -342,11 +343,18 @@ def resolve_settings(rc: RunConfig) -> Settings:
     except ValidationError as e:
         raise UsageError(f"invalid settings: {_errors(e)}") from None
     require_prices(settings)
-    if settings.model_cutoff == SHIPPED_MODEL_CUTOFF:
-        print(f"warning: settings.model_cutoff {SHIPPED_MODEL_CUTOFF} is the shipped placeholder, not the "
-              f"documented training-data cutoff of {settings.model}; the verdict rests on it. Set "
-              "settings.model_cutoff in the run config.", file=sys.stderr)
     return settings
+
+
+def check_cutoffs(settings: Settings, specs: list[AgentSpec]) -> None:
+    """Refuse (exit 2) a model whose documented cutoff is later than model_cutoff; print one
+    warning per model that cannot be checked."""
+    try:
+        warnings = check_model_cutoffs(settings, specs)
+    except ModelCutoffError as e:
+        raise UsageError(str(e)) from None
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
 
 
 def require_prices(settings: Settings) -> tuple[float, float]:
@@ -508,6 +516,7 @@ def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = No
     except (OSError, yaml.YAMLError, TypeError, ValidationError) as e:
         raise UsageError(f"cannot load limits file {lim_path}: {type(e).__name__}") from None
     specs = load_specs(rc)
+    check_cutoffs(settings, specs)
     prompts = load_prompts(rc, specs)
     periods = resolve_periods(rc)
     notes = []
@@ -600,6 +609,13 @@ def record_diff(stored: dict, current: dict) -> list[str]:
         f = k.split(".", 1)[-1]
         if k.startswith("settings.") and k not in a and f in Settings.model_fields \
                 and not Settings.model_fields[f].is_required() and b[k] == Settings.model_fields[f].default:
+            del b[k]
+    # same for an agent field added after the run was stored (AgentSpec.model) while it is None
+    for k in list(b):
+        parts = k.split(".")
+        if len(parts) == 3 and parts[0] == "agents" and k not in a and parts[2] in AgentSpec.model_fields \
+                and not AgentSpec.model_fields[parts[2]].is_required() \
+                and b[k] == AgentSpec.model_fields[parts[2]].default:
             del b[k]
     skip = ALLOWED_DRIFT + LEGACY_RAW
     return sorted(k for k in set(a) | set(b) if a.get(k, "<absent>") != b.get(k, "<absent>")

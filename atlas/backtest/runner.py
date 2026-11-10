@@ -92,9 +92,9 @@ WEIGHTED_KINDS = ("macro", "sector", "superinvestor")  # CIO/execution are score
 DRY_RUN_RESPONSE = json.dumps({"view": "neutral", "confidence": 0.0, "picks": []})
 
 LIMITATIONS = [
-    "model_cutoff: the shipped default (2026-06-01) is a PLACEHOLDER GUESS, and the whole verdict "
-    "rests on it (only days after it can be evidence). Set it from the documented training-data "
-    "cutoff of the exact model used.",
+    "model_cutoff: the whole verdict rests on it (only days after it can be evidence). The shipped "
+    "default (2026-06-30) is the documented cutoff of the packaged model; set it from the "
+    "documented training-data cutoff of the exact model used.",
     "Spend is an estimate: the budget cap counts tokens at configured per-model prices "
     "(Settings.prices()), not Anthropic's bill (cache, platform and price changes are not "
     "modelled); also set a spend limit on the Anthropic account.",

@@ -7,9 +7,9 @@ rolling_ic_window: 60
 warmup_picks: 30
 budget_usd: 50
 model: claude-sonnet-5-5
-# PLACEHOLDER GUESS: the whole verdict rests on model_cutoff (the holdout must start after it).
-# Replace it with the documented training-data cutoff of the exact model you use.
-model_cutoff: 2026-06-01
+# The whole verdict rests on model_cutoff (the holdout must start after it). 2026-06-30 is the
+# documented cutoff of the packaged model; replace it if you change `model` (see atlas/config.py).
+model_cutoff: 2026-06-30
 # request settings: effort low keeps thinking (and its billed output tokens) small; raise it
 # if agents need more reasoning. Thinking tokens count against max_output_tokens.
 effort: low

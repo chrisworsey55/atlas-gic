@@ -18,7 +18,7 @@ run_dir: runs/pass1            # everything the run writes (checkpoint, logs, sc
 periods:
   train:      {start: 2025-07-01, end: 2025-12-31}
   validation: {start: 2026-01-02, end: 2026-05-29}
-  holdout:    {start: 2026-06-02, end: 2026-10-30}
+  holdout:    {start: 2026-07-01, end: 2026-10-30}
 
 initial_cash: 100000
 anonymize: false               # true is refused: anonymised prompt variants do not exist yet
@@ -31,7 +31,7 @@ budget_usd: 150                # hard cap on ESTIMATED LLM spend (tokens x per-m
 # its documented training cutoff, or the cost confirmation ceiling.
 settings:
   model: claude-sonnet-5-5
-  model_cutoff: 2026-06-01     # PLACEHOLDER: set the documented training-data cutoff of this model
+  model_cutoff: 2026-06-30     # documented cutoff of claude-sonnet-5-5; re-check if you change the model
   # effort: low                # low | medium | high | xhigh | max (packaged default: low)
   # max_output_tokens: 8192    # per agent call; thinking tokens count against it
   # usd_per_mtok_input: 2.0    # only needed for a model not in atlas/config.py's price table

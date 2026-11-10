@@ -620,7 +620,7 @@ def test_null_section_says_the_agent_sets_differ(tmp_path):
 
 def test_limitations_disclose_every_accepted_gap(tmp_path):
     lim = _section(build(tmp_path).read_text(), "Limitations")
-    for needle in ("PLACEHOLDER GUESS", "configured per-model prices", "response cache",
+    for needle in ("documented training-data cutoff", "configured per-model prices", "response cache",
                    "Single-process only", "yfinance data can be stale", "approximate (overstated by about 7/5)",
                    "multiple testing", "within-day clustering", "survivorship", "Adjusted-price leakage",
                    "No live or paper trading", "IBKR price provider is unverified",

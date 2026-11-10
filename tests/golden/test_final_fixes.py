@@ -70,10 +70,13 @@ def test_unknown_model_without_prices_is_refused_before_any_call(golden, tmp_pat
     assert stub.calls == 0 and not (tmp_path / "run" / "checkpoint.json").exists()
 
 
-def test_known_model_is_priced_from_the_table(golden, tmp_path):
+def test_known_model_is_priced_from_the_table(golden, tmp_path, monkeypatch):
+    import atlas.config as cfg
     from atlas.cli import build_run, load_run_config
+    # a stub id (not in the cutoff table, so the golden 2024 cutoff stays valid) priced via the table
+    monkeypatch.setitem(cfg.MODEL_PRICES_USD_PER_MTOK, "golden-priced-model", (4.0, 20.0))
     conf = write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"],
-                        settings={"model": "claude-opus-5-5", "usd_per_mtok_input": None,
+                        settings={"model": "golden-priced-model", "usd_per_mtok_input": None,
                                   "usd_per_mtok_output": None})
     run = build_run(load_run_config(conf), llm_client=GoldenStub())
     assert run.llm.usd_per_mtok == (4.0, 20.0)
@@ -120,16 +123,17 @@ def test_dry_run_also_runs_the_preflight(golden, tmp_path, monkeypatch, capsys):
 
 # ---------------------------------------------------------------------------- I2 cutoff warning
 
-def test_cli_warns_when_model_cutoff_is_the_shipped_placeholder(golden, tmp_path, keys, capsys):
+def test_cli_warns_when_an_unlisted_model_uses_the_shipped_default_cutoff(golden, tmp_path, keys, capsys):
     conf = write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"],
-                        settings={"model_cutoff": "2026-06-01"})
+                        settings={"model_cutoff": "2026-06-30"})
     cli(["backtest", "--config", conf, "--dry-run"])
     err = capsys.readouterr().err
-    assert "warning: settings.model_cutoff 2026-06-01 is the shipped placeholder" in err
-    assert err.count("shipped placeholder") == 1
+    assert "golden-stub-model" in err and "model_cutoff is the shipped default; re-check it on the Models " \
+        "overview page" in err
+    assert err.count("shipped default") == 1
     conf2 = write_config(tmp_path / "run2.yaml", tmp_path / "run2", golden["repo"])
     cli(["backtest", "--config", conf2, "--dry-run"])
-    assert "shipped placeholder" not in capsys.readouterr().err
+    assert "shipped default" not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------- logging hygiene

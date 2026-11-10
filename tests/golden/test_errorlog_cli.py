@@ -20,6 +20,12 @@ def _conf(tmp_path, golden):  # noqa: F811
     return write_config(tmp_path / "run.yaml", tmp_path / "run", golden["repo"], periods=SHORT_PERIODS)
 
 
+def _no_cutoff_warning(err: str) -> str:
+    """Drop the stub model's 'no documented training cutoff' warning (the golden stub model is not
+    in the cutoff table) so these tests pin the error line only."""
+    return "".join(ln for ln in err.splitlines(True) if not ln.startswith("warning: model 'golden-stub-model'"))
+
+
 def _log(tmp_path):
     return tmp_path / "run" / "errors.log"
 
@@ -84,7 +90,7 @@ def test_unexpected_exception_after_build_run_logs_and_names_the_log(golden, tmp
 
     monkeypatch.setattr(cli_mod, "make_backtest_config", bad)
     assert cli(["backtest", "--config", conf], GoldenStub()) == 1
-    err = capsys.readouterr().err
+    err = _no_cutoff_warning(capsys.readouterr().err)
     assert err.strip() == f"error: unexpected ValueError: oops <redacted> (details: {_log(tmp_path)})"
     assert len(read_events(_log(tmp_path), kind="unexpected_exception")) == 1
 
@@ -228,7 +234,7 @@ def test_usage_error_after_build_run_is_logged_and_message_unchanged(golden, tmp
         assert cli(["backtest", "--config", conf, "--dry-run"]) == 2
     finally:
         c.make_backtest_config = orig
-    assert capsys.readouterr().err == "error: synthetic usage problem\n"
+    assert _no_cutoff_warning(capsys.readouterr().err) == "error: synthetic usage problem\n"
     ev = read_events(tmp_path / "run" / "dry_run" / "errors.log", kind="usage_error")
     assert len(ev) == 1 and ev[0]["message"] == "synthetic usage problem"
 
@@ -363,7 +369,7 @@ def test_broken_pipe_from_a_non_stdout_source_is_an_unexpected_failure(golden, t
 
     monkeypatch.setitem(cli_mod.COMMANDS, "backtest", socket_dies)
     assert cli(["backtest", "--config", conf]) == 1
-    err = capsys.readouterr().err
+    err = _no_cutoff_warning(capsys.readouterr().err)
     assert err.strip() == (f"error: unexpected BrokenPipeError: [Errno 32] net "
                            f"(details: {tmp_path / 'run' / 'errors.log'})")
     assert len(read_events(tmp_path / "run" / "errors.log", kind="unexpected_exception")) == 1
