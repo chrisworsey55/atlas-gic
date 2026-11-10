@@ -145,8 +145,11 @@ def test_old_run_config_still_loads_without_new_fields():
     assert Settings(**old).min_pair_ratio == 0.95
     # a run directory stored before these fields existed is not refused merely for the added defaults
     assert record_diff({"settings": old}, {"settings": new}) == []
-    # ...but a real change to one of them (or to anything else) is still a difference
-    changed = {**new, "min_pair_ratio": 0.8}
-    assert record_diff({"settings": old}, {"settings": changed}) == ["settings.min_pair_ratio"]
+    # the four autoresearch-only gate settings are allowed drift (the live config wins in stored_run)
+    for k, v in (("min_pair_ratio", 0.8), ("confirm_on_validation", False), ("confirm_min_days", 30),
+                 ("impute_abstentions", False)):
+        assert record_diff({"settings": old}, {"settings": {**new, k: v}}) == []
+    # ...but a real change to anything else is still a difference
+    assert record_diff({"settings": old}, {"settings": {**new, "warmup_picks": 9}}) == ["settings.warmup_picks"]
     assert record_diff({"settings": old}, {"settings": {**new, "budget_usd": 1}}) == []  # allowed drift
     assert record_diff({"settings": old}, {"settings": {**new, "slippage_bps": 9}}) == ["settings.slippage_bps"]

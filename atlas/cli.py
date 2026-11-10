@@ -562,7 +562,9 @@ def _last_completed(checkpoint: Checkpoint) -> date | None:
 # autoresearch are run, the response-cache location, the spend cap and confirmation ceiling.
 ALLOWED_DRIFT = ("run_config.run_dir", "run_config.null_test", "run_config.autoresearch",
                  "run_config.llm_cache", "settings.budget_usd", "settings.confirm_cost_usd",
-                 "settings.max_output_tokens", "macro_series")
+                 "settings.max_output_tokens", "macro_series",
+                 "settings.confirm_on_validation", "settings.confirm_min_days",
+                 "settings.min_pair_ratio", "settings.impute_abstentions")
 
 
 def run_record(rc: RunConfig, run: Run) -> dict:
@@ -632,8 +634,9 @@ def stored_run(rc: RunConfig, run: Run, command: str) -> dict:
                          f"{rc.path(RUN_CONFIG)})")
     src = RunConfig.model_validate(stored["run_config"]).model_copy(update={"run_dir": rc.run_dir})
     run.periods = resolve_periods(src)
-    run.settings = Settings(**{**stored["settings"], "budget_usd": run.settings.budget_usd,
-                               "confirm_cost_usd": run.settings.confirm_cost_usd})
+    from atlas.autoresearch.loop import GATE_SETTINGS
+    live = {k: getattr(run.settings, k) for k in ("budget_usd", "confirm_cost_usd", *GATE_SETTINGS)}
+    run.settings = Settings(**{**stored["settings"], **live})  # the live config wins on ALLOWED_DRIFT settings
     return stored
 
 
@@ -1077,8 +1080,8 @@ def train_failure_stats(failures: FailureLog, specs: list[AgentSpec], periods: P
 def cmd_autoresearch(args, llm_client=None) -> int:
     from atlas.autoresearch.gitops import DirtyWorkingTree, GitError, GitOps
     from atlas.autoresearch.loop import (
-        HoldoutViolation, InsufficientReplayDays, last_safe_train_day, run_autoresearch,
-        validation_days,
+        HoldoutViolation, InsufficientReplayDays, N_CONFIRM_DAYS, last_safe_train_day,
+        run_autoresearch, validation_days,
     )
     rc = load_run_config(args.config)
     refuse_anonymize(rc, "autoresearch")
@@ -1100,16 +1103,16 @@ def cmd_autoresearch(args, llm_client=None) -> int:
     replay = _make_replay(run)
     if run.settings.confirm_on_validation:
         # same eligibility as the loop: validation days whose scoring exit is also inside validation
-        eligible = len(validation_days(replay.all_days, run.periods, 1, n=len(replay.all_days) or 1))
+        eligible = len(validation_days(replay.all_days, run.periods, 1, n=N_CONFIRM_DAYS))  # as the loop uses
         need = run.settings.confirm_min_days
         if eligible < need:
             raise OperationalError(
-                f"autoresearch refused: the validation period has {eligible} usable trading days (days whose "
-                f"scoring exit is also inside validation), fewer than confirm_min_days {need}. Every kept edit "
+                f"autoresearch refused: the validation period gives {eligible} usable trading days (days whose "
+                f"scoring exit is also inside validation, at most {N_CONFIRM_DAYS} are replayed), fewer than confirm_min_days {need}. Every kept edit "
                 f"must be confirmed on validation days: give the validation period at least {need} trading "
-                "days, or set `settings.confirm_on_validation: false` in the run config BEFORE the backtest "
-                "(it is part of the stored run, so changing it means a new run_dir; edits are then judged "
-                "on train days alone and the validation confirmation is lost). The real requirement is also pair-based: the "
+                "days, or set `settings.confirm_on_validation: false` in the config (it may be changed after the "
+                "backtest; edits are then judged on train days alone and the validation confirmation is "
+                "lost). The real requirement is also pair-based: the "
                 f"confirmation needs at least rolling_ic_window ({run.settings.rolling_ic_window}) validation "
                 "pairs, i.e. about rolling_ic_window / picks_per_day days (window 60 with 1-2 picks a day "
                 "needs 30-60 clean days). Each confirmation reuses (spends) the same validation days.")

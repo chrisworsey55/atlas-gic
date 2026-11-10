@@ -259,10 +259,12 @@ atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination p
   the edit is discarded. Requirements: at least `confirm_min_days` (default 20) usable validation
   days, and, because the gate needs at least `rolling_ic_window` validation pairs, about
   `rolling_ic_window / picks_per_day` days (window 60 with 1-2 picks a day needs 30-60 clean days).
-  `atlas autoresearch` refuses (exit 1) when the validation period is too short; the opt-out is
-  `settings.confirm_on_validation: false`, which is part of the stored run, so set it before the
-  backtest (changing it later means a new `run_dir`) and accept that edits are then judged on train
-  days alone. Each confirmation reuses the SAME validation days, so every attempt spends some of
+  `atlas autoresearch` refuses (exit 1) when the validation period is too short (at most 60 days are
+  replayed, so `confirm_min_days` above 60 can never pass); the opt-out is
+  `settings.confirm_on_validation: false`, which may be changed in the config after the backtest
+  (like `confirm_min_days`, `min_pair_ratio` and `impute_abstentions`, which only autoresearch reads;
+  any other changed setting is still refused) and means edits are judged on train days alone. Each
+  log record stores the gate settings used and the report says when confirmation was disabled. Each confirmation reuses the SAME validation days, so every attempt spends some of
   them: validation is a repeatedly used sample, `max_edits` caps the attempts per command, and the
   report's Autoresearch section counts the confirmations run over the whole log.
 * Replay gate settings: `min_pair_ratio` (default 0.95) rejects an edit whose new prompt yields fewer

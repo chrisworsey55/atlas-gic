@@ -522,7 +522,7 @@ def test_log_line_written_per_attempt(tmp_path, prompt_repo):
     lines = log_lines(tmp_path)
     assert len(lines) == 2
     assert set(lines[0]) == {"agent", "branch", "n_days", "old_ic", "new_ic", "diff", "keep_margin",
-                             "decision", "reason", "commit_sha", "cost_usd", "null_test", "confirm"}
+                             "decision", "reason", "commit_sha", "cost_usd", "null_test", "confirm", "gates"}
     assert lines[0]["null_test"] is None  # optional: set when run_autoresearch gets null_test_meta
     assert lines[0]["agent"] == recs[0].agent and lines[0]["branch"] == "autoresearch/agent_a-0"
     assert lines[1]["branch"] == "autoresearch/agent_b-1"

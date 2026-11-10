@@ -173,6 +173,12 @@ def _confirmation_section(edits: list) -> list[str]:
            "Validation is a repeatedly used sample: every confirmation replays the same most recent "
            "validation days, so each one partly spends them and a lucky edit becomes more likely the "
            "more attempts are made.", ""]
+    gates = [getattr(e, "gates", None) for e in edits]
+    gates = [g if isinstance(g, dict) else None for g in gates]
+    off = sum(1 for g in gates if g is not None and g.get("confirm_on_validation") is False)
+    if off:
+        out += [f"**Validation confirmation was DISABLED for {off} logged attempts; those edits were "
+                "judged on train days alone.**", ""]
     rows = []
     for e, c in confs:
         if c is None:
@@ -183,8 +189,13 @@ def _confirmation_section(edits: list) -> list[str]:
                      _f(_num_of(c.get("diff"))), _f(_num_of(c.get("margin"))), _err_text(c.get("reason"))])
     if rows:
         out += [_table(pd.DataFrame(rows, columns=_CONF_COLS))]
+    elif off == len(edits) and edits:
+        out += ["Confirmation was off for every logged attempt, so no confirmation records exist.\n"]
+    elif any(g is not None for g in gates):
+        out += ["No logged edit has a validation confirmation record (no attempt won on train).\n"]
     else:
-        out += ["No logged edit has a validation confirmation record.\n"]
+        out += ["No logged edit has a validation confirmation record (older log without gate records, "
+                "or no attempt won on train).\n"]
     return out
 
 

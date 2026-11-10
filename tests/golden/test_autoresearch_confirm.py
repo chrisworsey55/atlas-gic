@@ -129,7 +129,7 @@ def test_cli_refuses_short_validation_with_actionable_message(short_validation_r
     assert "Traceback" not in text and stub.calls == 0
     assert "9 usable trading days" in text and "confirm_min_days 20" in text
     assert "settings.confirm_on_validation: false" in text
-    assert "new run_dir" in text  # the setting is part of the stored run
+    assert "may be changed after the backtest" in text
     assert "rolling_ic_window / picks_per_day" in text and "reuses (spends) the same validation days" in text
     assert not (short_validation_run["run_dir"] / "autoresearch_log.jsonl").exists()
     assert (short_validation_run["run_dir"] / "run_config.json").read_bytes() == head_before
@@ -245,3 +245,62 @@ def test_verdict_section_unchanged_by_confirmation_records(tmp_path):
     a = v(build(tmp_path / "a", edits=[_rec("a", confirm=None)]).read_text())
     b = v(build(tmp_path / "b", edits=[_rec("a"), _rec("b", "unconfirmed")]).read_text())
     assert a == b
+
+
+# ---------------------------------------------------------------------------- drift, gates, boundary
+
+def test_confirm_settings_can_change_after_the_backtest_and_the_live_value_is_used(long_golden, tmp_path, keys):
+    for name, val in (("confirm_min_days", 21), ("min_pair_ratio", 0.5), ("impute_abstentions", False)):
+        d = tmp_path / name
+        run_dir, repo, conf = _copy(long_golden, d, settings={name: val})
+        assert cli(["autoresearch", "--config", conf], HindsightStub()) == 0, name
+        (rec,) = _records(run_dir)
+        assert rec["gates"][name] == val, name
+        assert rec["gates"]["confirm_on_validation"] is True
+
+
+def test_confirm_on_validation_false_after_the_backtest_skips_confirmation_and_is_recorded(long_golden, tmp_path, keys):
+    run_dir, repo, conf = _copy(long_golden, tmp_path, settings={"confirm_on_validation": False})
+    assert cli(["autoresearch", "--config", conf], HindsightStub()) == 0
+    (rec,) = _records(run_dir)
+    assert rec["confirm"] is None and rec["gates"]["confirm_on_validation"] is False
+    assert cli(["report", "--run-dir", run_dir]) == 0
+    sec = _ar((run_dir / "report" / "report.md").read_text())
+    assert "Validation confirmation was DISABLED for 1 logged attempts" in sec
+    assert "Confirmation was off for every logged attempt" in sec
+
+
+def test_another_changed_setting_is_still_refused(long_golden, tmp_path, keys, capsys):
+    run_dir, repo, conf = _copy(long_golden, tmp_path, settings={"max_failure_rate": 0.01})
+    assert cli(["autoresearch", "--config", conf], HindsightStub()) == 2
+    assert "settings.max_failure_rate" in "".join(capsys.readouterr())
+
+
+def test_refusal_boundary_equals_passes_one_below_refuses(long_golden, tmp_path, keys, capsys):
+    """24 usable validation days: confirm_min_days 24 passes the refusal, 25 refuses."""
+    _, _, conf = _copy(long_golden, tmp_path / "eq", settings={"confirm_min_days": 24})
+    assert cli(["autoresearch", "--config", conf], HindsightStub()) == 0
+    _, _, conf = _copy(long_golden, tmp_path / "gt", settings={"confirm_min_days": 25})
+    assert cli(["autoresearch", "--config", conf], HindsightStub()) == 1
+    assert "gives 24 usable trading days" in "".join(capsys.readouterr())
+
+
+def test_refusal_caps_the_count_at_the_days_the_loop_replays(long_golden, tmp_path, keys, capsys, monkeypatch):
+    """24 usable days but the loop would replay only N_CONFIRM_DAYS: the CLI must count the same."""
+    from atlas.autoresearch import loop
+    assert loop.N_CONFIRM_DAYS == 60
+    monkeypatch.setattr(loop, "N_CONFIRM_DAYS", 10)
+    _, _, conf = _copy(long_golden, tmp_path)
+    assert cli(["autoresearch", "--config", conf], HindsightStub()) == 1
+    text = "".join(capsys.readouterr())
+    assert "gives 10 usable trading days" in text and "at most 10" in text
+
+
+def test_report_gate_notes_for_old_and_on_logs(tmp_path):
+    old = _ar(build(tmp_path / "o", edits=[_rec("a", confirm=None)]).read_text())
+    assert "older log without gate records" in old and "DISABLED" not in old
+    on = _ar(build(tmp_path / "n", edits=[_rec("a", "reverted", None, gates={"confirm_on_validation": True})]).read_text())
+    assert "no attempt won on train" in on and "older log" not in on and "DISABLED" not in on
+    mixed = _ar(build(tmp_path / "m", edits=[_rec("a", "kept", None, gates={"confirm_on_validation": False}),
+                                             _rec("b")]).read_text())
+    assert "DISABLED for 1 logged attempts" in mixed and "Confirmation was off for every" not in mixed

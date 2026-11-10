@@ -468,6 +468,8 @@ def confirm_margin(keep_margin: float, window: int, new_pairs: int) -> float:
 
 
 # ---------------------------------------------------------------- the loop
+N_CONFIRM_DAYS = 60  # most recent validation days a confirmation replays (run_autoresearch default)
+GATE_SETTINGS = ("confirm_on_validation", "confirm_min_days", "min_pair_ratio", "impute_abstentions")
 
 @dataclass
 class EditRecord:
@@ -489,6 +491,9 @@ class EditRecord:
     # (validation days replayed; 0 = no replay ran), n_days, old_ic, new_ic, diff, margin,
     # new_pairs, passed, reason. The top-level n_days/old_ic/new_ic/diff stay the TRAIN numbers.
     confirm: dict | None = None
+    # the gate settings in force for this attempt (confirm_on_validation, confirm_min_days,
+    # min_pair_ratio, impute_abstentions); None in logs written before they were recorded
+    gates: dict | None = None
 
 
 def _num(x: float | None) -> float | None:
@@ -587,7 +592,7 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
                      run_dir: Path, horizon: int = 1,
                      failure_notes: Callable[[str], str] | None = None,
                      n_replay_days: int = 60, null_test_meta: dict | None = None,
-                     n_confirm_days: int = 60) -> list[EditRecord]:
+                     n_confirm_days: int = N_CONFIRM_DAYS) -> list[EditRecord]:
     """Run up to cfg.max_edits attempts; see the module docstring.
 
     `scores` is the backtest's ScoreStore (anything with ``picks_frame``): target selection
@@ -625,6 +630,7 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
     def emit(rec: EditRecord) -> None:
         if null_test_meta is not None:
             rec.null_test = dict(null_test_meta)
+        rec.gates = {k: getattr(cfg, k) for k in GATE_SETTINGS}
         _append(log_path, rec)
         records.append(rec)
 
