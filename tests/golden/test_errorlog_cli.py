@@ -331,18 +331,78 @@ class _ClosedStdout:
         raise BrokenPipeError(32, "Broken pipe")
 
 
-def test_broken_pipe_on_stdout_is_quiet_in_errors_and_in_the_catch_all(tmp_path, monkeypatch, capsys):
+def test_broken_pipe_on_stdout_is_quiet_in_errors(tmp_path, monkeypatch, capsys):
     d = _seed(tmp_path)
     monkeypatch.setattr(sys, "stdout", _ClosedStdout())
     assert cli(["errors", "--run-dir", d]) == 0
-
-    def pipe_command(args, llm_client=None):
-        raise BrokenPipeError(32, "Broken pipe")
-
-    monkeypatch.setitem(cli_mod.COMMANDS, "report", pipe_command)
-    assert cli(["report", "--run-dir", d]) == 0
     assert capsys.readouterr().err == ""
     assert read_events(d / "errors.log", kind="unexpected_exception") == []
+
+
+def test_broken_pipe_at_the_final_stdout_flush_is_quiet_for_any_command(tmp_path, monkeypatch, capsys):
+    class FlushFails:
+        def write(self, s):
+            return len(s)
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setitem(cli_mod.COMMANDS, "report", lambda args, llm_client=None: cli_mod.EXIT_OK)
+    monkeypatch.setattr(sys, "stdout", FlushFails())
+    assert cli(["report", "--run-dir", tmp_path]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_broken_pipe_from_a_non_stdout_source_is_an_unexpected_failure(golden, tmp_path, keys, monkeypatch,  # noqa: F811
+                                                                    capsys):
+    conf = _conf(tmp_path, golden)
+
+    def socket_dies(args, llm_client=None):
+        cli_mod.build_run(cli_mod.load_run_config(args.config), offline=True)  # a run log is active
+        raise BrokenPipeError(32, "net")
+
+    monkeypatch.setitem(cli_mod.COMMANDS, "backtest", socket_dies)
+    assert cli(["backtest", "--config", conf]) == 1
+    err = capsys.readouterr().err
+    assert err.strip() == (f"error: unexpected BrokenPipeError: [Errno 32] net "
+                           f"(details: {tmp_path / 'run' / 'errors.log'})")
+    assert len(read_events(tmp_path / "run" / "errors.log", kind="unexpected_exception")) == 1
+
+
+def test_broken_pipe_raised_by_the_computation_of_a_backtest_is_a_failure(golden, tmp_path, keys, monkeypatch,  # noqa: F811
+                                                                         capsys):
+    def dies(*a, **k):
+        raise BrokenPipeError(32, "net")
+
+    monkeypatch.setattr(cli_mod, "run_backtest", dies)
+    assert cli(["backtest", "--config", _conf(tmp_path, golden)], GoldenStub()) == 1
+    assert "error: unexpected BrokenPipeError" in capsys.readouterr().err
+    assert len(read_events(tmp_path / "run" / "errors.log", kind="unexpected_exception")) == 1
+
+
+def test_invisible_and_bidi_characters_are_escaped_idempotently(tmp_path, capsys):
+    from atlas.errorlog import escape_controls
+    chars = [chr(c) for c in (*range(0x200B, 0x2010), *range(0x202A, 0x202F), *range(0x2066, 0x206A), 0xFEFF)]
+    for ch in chars:
+        assert escape_controls("a" + ch + "b") == "a\\u%04xb" % ord(ch)
+    keep = "caf\u00e9 \u65e5\u672c\u8a9e \U0001f600 \u00a0"
+    assert escape_controls(keep) == keep
+    once = escape_controls("x\x1b" + "".join(chars))
+    assert escape_controls(once) == once
+    # write side
+    path = tmp_path / "errors.log"
+    ErrorLog(path).event("k", "m\u202eevil\u200b" + keep.rstrip(), **{"f\ufeff": "\u2066v"})
+    raw = path.read_text(encoding="utf-8")
+    assert not any(ch in raw for ch in chars) and "\\\\u202e" in raw and keep.rstrip() in json.loads(raw.splitlines()[0])["message"]
+    # read side: an edited log
+    d = tmp_path / "rd"
+    d.mkdir()
+    rec = {"ts_utc": "t", "level": "error", "kind": "k\u202e", "day": None, "agent": "a\u200f", "reason": None,
+           "message": "m\ufeff\u2069 " + keep.rstrip(), "fields": {}}
+    (d / "errors.log").write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
+    assert cli(["errors", "--run-dir", d]) == 0
+    out = capsys.readouterr().out
+    assert not any(ch in out for ch in chars) and "\\u202e" in out and "\\ufeff" in out and keep.rstrip() in out
 
 
 class _OrderedStderr:

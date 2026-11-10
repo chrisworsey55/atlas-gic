@@ -1461,6 +1461,16 @@ def cmd_errors(args, llm_client=None) -> int:
     return EXIT_OK
 
 
+def _flush_stdout() -> None:
+    """Flush stdout at the end of a command. A reader that left (`atlas report | head`) is not a
+    bug, but ONLY a failed write/flush of stdout itself is treated so; any other BrokenPipeError
+    (socket, subprocess, file) is not caught here and reaches the unexpected_exception path."""
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        _quiet_broken_pipe()
+
+
 def _quiet_broken_pipe() -> None:
     """The reader closed the pipe (`| head`): not a bug. Point stdout at devnull so the flush at
     interpreter exit cannot raise (the recipe in the Python docs)."""
@@ -1524,7 +1534,9 @@ def main(argv: list[str] | None = None, *, llm_client=None) -> int:
     ACTIVE_ERRORLOG = None
 
     try:
-        return COMMANDS[args.command](args, llm_client=llm_client)
+        code = COMMANDS[args.command](args, llm_client=llm_client)
+        _flush_stdout()
+        return code
     except UsageError as e:
         _record_known("usage_error", e)
         print(f"error: {e}", file=sys.stderr)
@@ -1540,9 +1552,6 @@ def main(argv: list[str] | None = None, *, llm_client=None) -> int:
         print(f"error: {e}. Nothing was retried and any checkpoint is intact: fix the cause (model name, "
               "API key, settings such as effort) and re-run the same command.", file=sys.stderr)
         return EXIT_FAILED
-    except BrokenPipeError:  # `atlas ... | head`: the reader left; neither an error nor a bug
-        _quiet_broken_pipe()
-        return EXIT_OK
     except Exception as e:  # noqa: BLE001 - last resort: one line, never a traceback (Ctrl-C/exit pass)
         _record_known("unexpected_exception", e)
         where = f" (details: {ACTIVE_ERRORLOG.path})" if ACTIVE_ERRORLOG is not None and ACTIVE_ERRORLOG.path else ""

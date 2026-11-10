@@ -54,12 +54,16 @@ def _warn_once(exc: BaseException) -> None:
 
 
 _CTRL = re.compile("[\x00-\x1f\x7f-\x9f]")
+# bidirectional / invisible format characters: can reorder or hide text on a terminal
+_INVISIBLE = re.compile("[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 
 
 def escape_controls(text: str) -> str:
-    """Every control character becomes a visible escape (``\\x1b``): one line, nothing a
-    terminal can interpret."""
-    return _CTRL.sub(lambda m: "\\x%02x" % ord(m.group()), text)
+    """Control characters become a visible ``\\xNN`` and bidi/invisible format characters a
+    visible ``\\uNNNN``: one line, nothing a terminal can interpret or reorder. Idempotent;
+    ordinary letters (accents, CJK, emoji) pass through unchanged."""
+    text = _CTRL.sub(lambda m: "\\x%02x" % ord(m.group()), text)
+    return _INVISIBLE.sub(lambda m: "\\u%04x" % ord(m.group()), text)
 
 
 def _s(x, limit: int = _FIELD_LIMIT) -> str:
