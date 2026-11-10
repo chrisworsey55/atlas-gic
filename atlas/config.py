@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import date
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Anthropic first-party list prices, USD per million tokens (input, output), from the Claude API
 # reference (models table cached 2026-10-06). Only models that reference confirms are listed;
@@ -86,6 +87,18 @@ def model_prices(model: str, explicit: tuple[float | None, float | None] = (None
         f"pricing page) in the run config. Known models: {', '.join(sorted(MODEL_PRICES_USD_PER_MTOK))}")
 
 
+def check_model_name(v: str | None) -> str | None:
+    """A model id is one printable token: no whitespace, line breaks, control, format (bidi,
+    zero-width) or other non-printing characters, so it cannot alter a log line, the stdout
+    models table or the report's structure."""
+    if v is None:
+        return v
+    if not v or any(unicodedata.category(ch)[0] in "CZ" for ch in v):
+        raise ValueError("a model name must be non-empty and contain no spaces, line breaks or control/format "
+                         "characters")
+    return v
+
+
 class AgentSpec(BaseModel):
     name: str
     layer: int
@@ -93,6 +106,11 @@ class AgentSpec(BaseModel):
     prompt_file: str
     benchmark: str | None = None
     model: str | None = None   # per-agent override of the model (needs a price-table entry)
+
+    @field_validator("model")
+    @classmethod
+    def _model_name(cls, v):
+        return check_model_name(v)
 
 
 class Limits(BaseModel):
@@ -151,6 +169,11 @@ class Settings(BaseModel):
     confirm_min_days: int = Field(20, ge=5)
     min_pair_ratio: float = Field(0.95, gt=0, le=1)
     impute_abstentions: bool = True
+
+    @field_validator("model", "spoke_model", "older_model")
+    @classmethod
+    def _model_names(cls, v):
+        return check_model_name(v)
 
     @model_validator(mode="after")
     def _price_pairs(self):

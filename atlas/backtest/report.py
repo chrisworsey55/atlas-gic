@@ -458,7 +458,7 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     adf = pd.DataFrame(arows, columns=["agent", "n_scored", "hit_rate", "rank_ic", "shrunk_ic",
                                        "final_weight", "failures"])
     if mixed:
-        adf.insert(1, "model", [agent_models.get(a, "n/a") for a in adf["agent"]])
+        adf.insert(1, "model", [_err_text(agent_models.get(a, "n/a"), 200) for a in adf["agent"]])
     adf.to_csv(out_dir / "agents.csv", index=False)
     md += ["## Agents\n",
            "Control-agent rows are shown but excluded from every real-agent mean/median. "
@@ -583,7 +583,7 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     if mixed and spent_by_model:
         unattr = Budget.UNATTRIBUTED
         md += ["Cost by model (one hard budget covers all of them):\n"]
-        md += [f"- {m}: ${v:.2f}" for m, v in sorted(spent_by_model.items()) if m != unattr]
+        md += [f"- {_err_text(m, 200)}: ${v:.2f}" for m, v in sorted(spent_by_model.items()) if m != unattr]
         if unattr in spent_by_model:
             md.append(f"- {unattr}: ${spent_by_model[unattr]:.2f} (autoresearch, older-model checks and "
                       "spend restored from a checkpoint written before per-model tracking)")
@@ -594,7 +594,7 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     md += [f"- {x}" for x in list(result.limitations) + EXTRA_LIMITATIONS]
     if mixed:
         md.append("- Mixed models: results cannot be attributed to the hub or the spokes (models: "
-                  + ", ".join(sorted(set(agent_models.values()))) + ").")
+                  + ", ".join(_err_text(m, 200) for m in sorted(set(agent_models.values()))) + ").")
     md.append("")
     if result.halted:
         md.append(f"- Run HALTED: {result.halt_reason}")

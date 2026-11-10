@@ -397,13 +397,16 @@ def require_model_prices(settings: Settings, specs: list[AgentSpec]) -> dict[str
 
 
 def models_table(settings: Settings, specs: list[AgentSpec]) -> list[str]:
-    """One line per model in use: its role and the agents it serves."""
+    """One line per model in use: its role and the agents it serves. Names are printed through
+    escape_controls(sanitise(...)): one line each, whatever a config string holds."""
+    esc = lambda x: escape_controls(sanitise(str(x), 200))  # noqa: E731
     by = agent_models(settings, specs)
     lines = ["models in use:"]
     for m in models_in_use(settings, specs):
         role = ("hub" if m == settings.model else "spoke" if m == settings.spoke_model else "per-agent override")
         names = [n for n, mm in by.items() if mm == m]
-        lines.append(f"  {m} ({role}): {', '.join(names) if names else 'autoresearch proposals only'}")
+        lines.append(f"  {esc(m)} ({role}): "
+                     f"{', '.join(map(esc, names)) if names else 'autoresearch proposals only'}")
     return lines
 
 

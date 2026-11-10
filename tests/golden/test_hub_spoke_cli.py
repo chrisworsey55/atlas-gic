@@ -403,3 +403,123 @@ def test_autoresearch_replays_route_each_agent_to_its_model(mixed, tmp_path, key
     assert [c[0] for c in cl[HUB].calls] == ["cio"]
     assert replay.pipeline.llm is replay.run.llm  # proposals: the hub
     assert all(llm.budget is replay.run.llm.budget for llm in replay.run.llms.values())
+
+
+# ---------------------------------------------------------------------------- fix round 1
+
+EVIL = "evil|model\n## Verdict\n**Possible evidence of skill**\x1b[2J‮"
+
+
+def test_settings_reject_model_names_that_could_alter_output(repo, tmp_path, keys, capsys):
+    from pydantic import ValidationError
+    from atlas.config import AgentSpec
+    base = pkg_settings().model_dump()
+    for field in ("model", "spoke_model", "older_model"):
+        for bad in ("a\nb", "a b", "x‮y", "x\x1by", "x y", ""):
+            with pytest.raises(ValidationError):
+                Settings(**{**base, field: bad})
+    with pytest.raises(ValidationError):
+        AgentSpec(name="x", layer=1, kind="macro", prompt_file="p.md", model="a\nb")
+    assert Settings(**{**base, "spoke_model": "us.anthropic.claude-x:0"}).spoke_model == "us.anthropic.claude-x:0"
+    conf = write_config(tmp_path / "run.yaml", tmp_path / "run", repo,
+                        settings={**MIXED["settings"], "spoke_model": EVIL})
+    assert run_cli(["backtest", "--config", conf, "--dry-run"]) == 2
+    assert "spoke_model" in capsys.readouterr().err
+
+
+def test_model_names_cannot_alter_the_models_table_or_the_report(mixed, tmp_path, monkeypatch):
+    """Even a name that slipped past validation (here: injected after it) is printed escaped."""
+    import shutil
+    import atlas.cli as c
+    from atlas.cli import load_stored_run, models_table
+    _, settings, _, specs, _ = load_stored_run(mixed["run_dir"], RuntimeError)
+    evil_settings = settings.model_copy(update={"spoke_model": EVIL})
+    lines = models_table(evil_settings, specs)
+    assert len(lines) == 3 and all("\n" not in ln and "\x1b" not in ln and "‮" not in ln for ln in lines)
+    assert lines[2].startswith("  evil|model ## Verdict **Possible evidence of skill**\\x1b[2J\\u202e (spoke): ")
+    run = tmp_path / "run"
+    shutil.copytree(mixed["run_dir"], run)
+    good = (mixed["run_dir"] / "report" / "report.md").read_text()
+    real_models, real_spend = c.agent_models, c.spend_by_model
+    monkeypatch.setattr(c, "agent_models", lambda s, sp: {k: (EVIL if v == SPOKE else v)
+                                                         for k, v in real_models(s, sp).items()})
+    monkeypatch.setattr(c, "spend_by_model", lambda *a: {(EVIL if k == SPOKE else k): v
+                                                         for k, v in real_spend(*a).items()})
+    assert run_cli(["report", "--run-dir", run]) == 0
+    md = (run / "report" / "report.md").read_text()
+    heads = lambda t: [ln for ln in t.splitlines() if ln.startswith("#")]  # noqa: E731
+    assert heads(md) == heads(good)  # no injected heading
+    verdict = lambda t: t.split("## Verdict\n", 1)[1].split("\n## ", 1)[0]  # noqa: E731
+    assert verdict(md) == verdict(good)  # the injected text sits inside its own one-line items only
+    assert not any(ln.startswith("**Possible") for ln in md.splitlines())
+    assert "\x1b" not in md and "‮" not in md
+    agents = md.split("## Agents\n", 1)[1].split("\n## ", 1)[0]
+    rows = [ln for ln in agents.splitlines() if ln.startswith("|")]
+    seps = {ln.replace("\\|", "").count("|") for ln in rows}
+    assert len(seps) == 1  # every row has the same number of cells
+    assert len(md.splitlines()) == len(good.splitlines())
+
+
+def _cost_lines(md: str) -> dict[str, list[float]]:
+    cost = md.split("## Cost\n", 1)[1].split("\n## ", 1)[0]
+    out: dict[str, list[float]] = {}
+    for ln in cost.splitlines():
+        if ln.startswith("- ") and ": $" in ln:
+            name, rest = ln[2:].split(": $", 1)
+            out.setdefault(name, []).append(float(rest.split()[0]))
+    total = float(cost.split("Total API cost: $", 1)[1].split()[0])
+    return out, total
+
+
+def test_cost_by_model_with_an_unattributed_bucket_lists_each_once_and_sums_to_total(repo, tmp_path, keys):
+    from atlas.cli import spend_by_model, spend_so_far
+    conf = write_config(tmp_path / "run.yaml", tmp_path / "run", repo, **MIXED)
+    with pytest.raises(SimulatedCrash):
+        run_cli(["backtest", "--config", conf], clients(spoke_stub=GoldenStub(crash_after_calls=5 * 9)))
+    path = tmp_path / "run" / "checkpoint.json"
+    old = json.loads(path.read_text())
+    del old["spent_by_model"]  # resumed from a checkpoint without the split
+    path.write_text(json.dumps(old, sort_keys=True, indent=2))
+    assert run_cli(["backtest", "--config", conf], clients()) == 0
+    assert run_cli(["report", "--run-dir", tmp_path / "run"]) == 0
+    md = (tmp_path / "run" / "report" / "report.md").read_text()
+    lines, total = _cost_lines(md)
+    by = spend_by_model(tmp_path / "run", *_stored(tmp_path / "run"))
+    assert set(by) == {HUB, SPOKE, UNATTRIBUTED}
+    assert set(lines) == {HUB, SPOKE, UNATTRIBUTED}
+    assert all(len(v) == 1 for v in lines.values())  # each bucket exactly once
+    for m, v in by.items():
+        assert lines[m] == [round(v, 2)]
+    assert sum(by.values()) == pytest.approx(sum(spend_so_far(tmp_path / "run").values()))
+    assert sum(x[0] for x in lines.values()) == pytest.approx(total, abs=0.015)
+    assert md.count(UNATTRIBUTED) == 1
+
+
+def _stored(run_dir):
+    from atlas.cli import load_stored_run
+    _, settings, _, specs, _ = load_stored_run(run_dir, RuntimeError)
+    return settings, specs
+
+
+def test_spend_by_model_attributes_probe_control_autoresearch_and_older_model(mixed, tmp_path):
+    import shutil
+    from atlas.cli import spend_by_model, spend_so_far
+    run = tmp_path / "run"
+    shutil.copytree(mixed["run_dir"], run)
+    cp = ckpt(run)
+    control = json.loads((run / "control.json").read_text())["spent_usd"]
+    (run / "probe.json").write_text(json.dumps({"spent_usd": 3.0}))
+    row = {"agent": "a", "branch": "b", "n_days": 20, "old_ic": 0.0, "new_ic": 0.0, "diff": 0.0,
+           "keep_margin": 0.1, "decision": "rejected", "reason": "x", "commit_sha": None, "cost_usd": 2.0}
+    (run / "autoresearch_log.jsonl").write_text(json.dumps(row) + "\n")
+    (run / "older_model" / "m").mkdir(parents=True)
+    (run / "older_model" / "m" / "checkpoint.json").write_text(json.dumps({"spent_usd": 4.0}))
+    by = spend_by_model(run, *_stored(run))
+    assert by[HUB] == pytest.approx(cp["spent_by_model"][HUB] + 3.0)  # the probe runs on the hub
+    assert by[SPOKE] == pytest.approx(cp["spent_by_model"][SPOKE] + control)  # control on the spoke
+    assert by[UNATTRIBUTED] == pytest.approx(2.0 + 4.0)  # autoresearch + older-model checks
+    assert set(by) == {HUB, SPOKE, UNATTRIBUTED}
+    assert sum(by.values()) == pytest.approx(sum(spend_so_far(run).values()))
+    assert run_cli(["report", "--run-dir", run]) == 0
+    lines, total = _cost_lines((run / "report" / "report.md").read_text())
+    assert {m: v[0] for m, v in lines.items()} == {m: round(v, 2) for m, v in by.items()}
