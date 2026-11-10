@@ -32,6 +32,13 @@ budget_usd: 150                # hard cap on ESTIMATED LLM spend (tokens x per-m
 settings:
   model: claude-sonnet-5-5
   model_cutoff: 2026-06-30     # documented cutoff of claude-sonnet-5-5; re-check if you change the model
+  # Hub and spoke: run the macro, sector and superinvestor agents (and the control agent) on a
+  # cheaper model while cro/cio/execution keep `model`. Trade-offs: about 3x cheaper per day, but
+  # the cheaper model is weaker, results then mix two models (the report cannot attribute them to
+  # hub or spokes), and the cutoff check and contamination probe cover BOTH models (the probe
+  # costs more with each model). A per-agent `model:` in agents.yaml overrides it. Prices of an
+  # unlisted spoke model: spoke_usd_per_mtok_input / spoke_usd_per_mtok_output (set both).
+  # spoke_model: claude-haiku-5-5
   # effort: low                # low | medium | high | xhigh | max (packaged default: low)
   # max_output_tokens: 8192    # per agent call; thinking tokens count against it
   # usd_per_mtok_input: 2.0    # only needed for a model not in atlas/config.py's price table

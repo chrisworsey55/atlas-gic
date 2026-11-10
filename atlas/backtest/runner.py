@@ -96,6 +96,12 @@ LIMITATIONS = [
     "model_cutoff: the whole verdict rests on it (only days after it can be evidence). The shipped "
     "default (2026-06-30) is the documented cutoff of the packaged model; set it from the "
     "documented training-data cutoff of the exact model used.",
+    "The training-cutoff table in atlas/config.py is month-granular (the month end is used) and "
+    "copied from the Anthropic Models overview page, which can change: the cutoff validator is a "
+    "guard, not a guarantee. A model missing from the table only warns.",
+    "The contamination probe covers every model in use (hub, spoke and per-agent overrides), so "
+    "its cost scales with the number of models; a partial or failed probe leaves some models "
+    "unchecked.",
     "Spend is an estimate: the budget cap counts tokens at configured per-model prices "
     "(Settings.prices()), not Anthropic's bill (cache, platform and price changes are not "
     "modelled); also set a spend limit on the Anthropic account.",
