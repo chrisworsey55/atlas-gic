@@ -30,11 +30,11 @@ Every task's requirements include these (copied from the spec and the earlier sy
 
 Failure modes the spec implies but no task's tests would exercise by themselves, most likely first. Each has a pinning test in the owning task.
 
-1. **Logging breaks the run**: a read-only or full run directory, or two agent threads logging at once, must not raise or interleave lines (Task A1).
-2. **Mixed-model budget race**: two `CachedLLM` instances sharing one `Budget` called from many threads must never exceed the cap, and a resume must restore spend once, not once per model (Task B2).
-3. **Silent contamination by a per-agent model**: an agent override or `spoke_model` with a later documented cutoff than `model_cutoff` must refuse the run, not warn (Task B1).
-4. **Confirmation peeks at holdout**: the last validation day's exit date lies in the holdout; it must be excluded, and a holdout day in the confirmation set must raise `HoldoutViolation` (Task C3).
-5. **Confirmation shopping**: an edit confirmed on validation is the only way to keep one; repeated attempts must each be logged with their confirmation numbers and capped by `max_edits` (Task C3).
+1. **Logging breaks the run**: a read-only or full run directory, or two agent threads logging at once, must not raise or interleave lines (Task 1).
+2. **Mixed-model budget race**: two `CachedLLM` instances sharing one `Budget` called from many threads must never exceed the cap, and a resume must restore spend once, not once per model (Task 10).
+3. **Silent contamination by a per-agent model**: an agent override or `spoke_model` with a later documented cutoff than `model_cutoff` must refuse the run, not warn (Task 9).
+4. **Confirmation peeks at holdout**: the last validation day's exit date lies in the holdout; it must be excluded, and a holdout day in the confirmation set must raise `HoldoutViolation` (Task 7).
+5. **Confirmation shopping**: an edit confirmed on validation is the only way to keep one; repeated attempts must each be logged with their confirmation numbers and capped by `max_edits` (Task 7).
 
 ---
 
@@ -56,9 +56,11 @@ tests/...                              # one test module per task
 
 ---
 
+> **Task numbering:** tasks run 1-14 in build order: Part A = tasks 1-4, Part C = tasks 5-8, Part B = tasks 9-14.
+
 ## Part A: Error log
 
-### Task A1: ErrorLog module
+### Task 1: ErrorLog module
 
 **Files:**
 - Create: `atlas/errorlog.py`
@@ -77,14 +79,14 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** the tests. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: add run-level ErrorLog`.
 
-### Task A2: Mirror failures and emit runner events
+### Task 2: Mirror failures and emit runner events
 
 **Files:**
 - Modify: `atlas/engine/failures.py`, `atlas/backtest/runner.py`
 - Test: `tests/engine/test_failures_mirror.py`, `tests/backtest/test_runner_errorlog.py`
 
 **Interfaces:**
-- Consumes: `ErrorLog` from A1.
+- Consumes: `ErrorLog` from 1.
 - Produces: `FailureLog.__init__(self, db_path, run_id=None, error_log: ErrorLog | None = None)`; `record()` additionally writes `error_log.event("call_failure", detail, level="warning", day=rec.date, agent=rec.agent, reason=rec.reason.value, attempt=rec.attempt)` for kind `call_failure` and `event("dropped_pick", ..., level="info")` for `dropped_pick` (never `raw_response`). `run_backtest(..., error_log: ErrorLog | None = None)` writes: `day_skipped` (level warning; fields `failed` = agent→code), `run_paused` (fields `pause_kind`, `failed`), `budget_exceeded`, `fatal_api_error`, `risk_error` (the swallowed exception, via `exception()`), `halted` (level error, with `halt_reason`).
 
 - [ ] **Step 1: Write the failing tests**: `test_failure_record_is_mirrored_without_raw_response`; `test_dropped_pick_mirrored_as_info`; `test_skipped_day_event_lists_failed_agents_and_codes`; `test_transient_pause_writes_run_paused_before_raising`; `test_budget_pause_writes_budget_exceeded`; `test_fatal_api_error_event_is_sanitised` (canary in the exception text); `test_risk_layer_exception_is_logged_and_sends_no_orders` (patch `RiskLayer.apply` to raise); `test_kill_switch_writes_halted_event_once`; `test_resumed_run_appends_to_the_same_log`. Reuse the fixtures in `tests/backtest/test_runner.py` (fake provider, `StubClient`).
@@ -93,14 +95,14 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/engine tests/backtest -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: log failures and run events to the error log`.
 
-### Task A3: CLI wiring and `atlas errors`
+### Task 3: CLI wiring and `atlas errors`
 
 **Files:**
 - Modify: `atlas/cli.py`
 - Test: `tests/golden/test_errorlog_cli.py`
 
 **Interfaces:**
-- Consumes: A1, A2.
+- Consumes: 1, 2.
 - Produces: constant `ERRORS_NAME = "errors.log"`; `Run.errors: ErrorLog` created in `build_run` at `rc.path(ERRORS_NAME)` (so dry runs land in `dry_run/`) and passed to `FailureLog(error_log=...)` and `run_backtest(error_log=...)`; module-level `ACTIVE_ERRORLOG: ErrorLog | None` set by `build_run`, reset at the start of `main()`; `main()` records `usage_error`/`operational_error`/`resume_refused`/`data_error`/`fatal_api_error` events to `ACTIVE_ERRORLOG` before printing, and a final `except Exception` writes `unexpected_exception` (sanitised traceback), prints `error: unexpected <Type>: <sanitised message> (details: <path to errors.log>)` and returns 1; new subcommand `errors --run-dir PATH [--tail N=20] [--kind K]` printing one human line per event (`ts level kind day agent reason message`), exit 1 with `error: no error log in <dir>` if missing.
 
 - [ ] **Step 1: Write the failing tests**: `test_rejected_request_writes_fatal_api_error_event_and_exits_1`; `test_unexpected_exception_is_caught_logged_and_exits_1_without_traceback` (inject a client that raises `RuntimeError("boom sk-ant-CANARY")`); `test_paused_run_leaves_run_paused_event_and_resume_appends`; `test_dry_run_writes_log_under_dry_run_dir_only`; `test_errors_subcommand_prints_tail_and_filters_by_kind`; `test_errors_subcommand_missing_log_exits_1`; `test_canary_key_absent_from_errors_log_and_stdout_stderr`; `test_config_error_before_run_known_prints_error_but_creates_no_log`.
@@ -109,7 +111,7 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/golden -q`. Expected: PASS (existing golden tests unchanged).
 - [ ] **Step 5: Commit** `feat: wire the error log into the CLI and add atlas errors`.
 
-### Task A4: Report section and docs
+### Task 4: Report section and docs
 
 **Files:**
 - Modify: `atlas/backtest/report.py`, `atlas/cli.py` (pass events to `build_report`), `README.md`
@@ -128,7 +130,7 @@ tests/...                              # one test module per task
 
 ## Part C: Autoresearch validation confirmation and abstention accounting
 
-### Task C1: Settings and the configurable pair floor
+### Task 5: Settings and the configurable pair floor
 
 **Files:**
 - Modify: `atlas/config.py`, `atlas/autoresearch/loop.py` (`edit_gate`)
@@ -143,7 +145,7 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/autoresearch tests/test_config.py -q`. Expected: PASS (update any existing test that relied on 0.8).
 - [ ] **Step 5: Commit** `feat: configurable pair-ratio floor and confirmation settings`.
 
-### Task C2: DayPairs and abstention imputation
+### Task 6: DayPairs and abstention imputation
 
 **Files:**
 - Modify: `atlas/autoresearch/loop.py`, `atlas/cli.py` (replay `scorer`)
@@ -158,14 +160,14 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/autoresearch tests/golden -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: impute abstentions in paired replay`.
 
-### Task C3: Validation confirmation in the loop
+### Task 7: Validation confirmation in the loop
 
 **Files:**
 - Modify: `atlas/autoresearch/loop.py`
 - Test: `tests/autoresearch/test_confirmation.py`
 
 **Interfaces:**
-- Consumes: C1, C2.
+- Consumes: 5, 6.
 - Produces: `validation_days(trading_days: Sequence[date], periods: Periods, horizon: int = 1, n: int = 60) -> list[date]` (the `n` most recent validation days whose `horizon`-day exit is also inside validation); `check_validation_only(days, trading_days, periods, horizon) -> None` (raises `HoldoutViolation` for any day or exit outside validation); `confirm_margin(keep_margin: float, window: int, new_pairs: int) -> float` = `keep_margin * max(1.0, sqrt(window / max(1, new_pairs)))`; `Decision` gains `"unconfirmed"`; `EditRecord.confirm: dict | None = None` with keys `n_days, old_ic, new_ic, diff, margin, new_pairs, passed, reason`; inside `run_autoresearch`, after a train win and BEFORE `merge_branch`, run the validation replay when `cfg.confirm_on_validation`; merge only if confirmed. Fewer than `cfg.confirm_min_days` validation days → `unconfirmed`. The train/validation guards are separate (`allowed_train`, `allowed_validation`).
 
 - [ ] **Step 1: Write the failing tests** (real temp git repo as in `tests/autoresearch/test_loop.py`): `test_train_win_and_validation_win_is_kept_and_merged`; `test_train_win_validation_loss_is_unconfirmed_and_branch_discarded` (original branch byte-identical); `test_validation_too_short_is_unconfirmed_not_kept`; `test_confirmation_disabled_keeps_old_behaviour`; `test_selective_abstention_learned_on_train_fails_validation` (stub prompt that drops exactly the train-period worst picks: passes train, fails validation); `test_last_validation_day_with_holdout_exit_is_excluded`; `test_holdout_day_in_confirmation_raises_holdout_violation`; `test_confirm_margin_grows_with_fewer_pairs_and_never_below_keep_margin`; `test_confirmation_numbers_are_logged_in_the_jsonl_record`; `test_confirmation_result_never_reaches_proposal_diagnostics_or_target_selection` (spy on `build_diagnostics`/`select_target` inputs); `test_every_attempt_is_logged_and_max_edits_caps_confirmations`.
@@ -174,7 +176,7 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/autoresearch -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: confirm autoresearch edits on validation days`.
 
-### Task C4: CLI, report, docs
+### Task 8: CLI, report, docs
 
 **Files:**
 - Modify: `atlas/cli.py` (`cmd_autoresearch`), `atlas/backtest/report.py` (Autoresearch section), `README.md`
@@ -193,7 +195,7 @@ tests/...                              # one test module per task
 
 ## Part B: Hub-and-spoke model routing
 
-### Task B1: Config, price lookup, cutoff table
+### Task 9: Config, price lookup, cutoff table
 
 **Files:**
 - Modify: `atlas/config.py`, `atlas/config/settings.yaml`, `atlas/cli.py` (`resolve_settings` validation, shipped-cutoff warning text)
@@ -208,7 +210,7 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/test_config.py tests/golden -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: spoke model, per-agent model and training-cutoff table`.
 
-### Task B2: Shared Budget
+### Task 10: Shared Budget
 
 **Files:**
 - Modify: `atlas/engine/llm.py`
@@ -223,14 +225,14 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/engine -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `refactor: shared Budget for multi-model spend`.
 
-### Task B3: Routing and per-model estimate
+### Task 11: Routing and per-model estimate
 
 **Files:**
 - Modify: `atlas/engine/pipeline.py`, `atlas/backtest/runner.py` (`estimate_cost`)
 - Test: `tests/engine/test_pipeline_routing.py`, `tests/backtest/test_estimate_models.py`
 
 **Interfaces:**
-- Consumes: B1, B2.
+- Consumes: 9, 10.
 - Produces: `Pipeline.__init__(..., llms: Mapping[str, CachedLLM] | None = None, models: Mapping[str, str] | None = None)` where `models` maps agent name → effective model and `llms` maps model → `CachedLLM`; `Pipeline.llm_for(spec) -> CachedLLM` (falls back to `self.llm`); `run_day`, `run_single` and the layer workers call `run_agent(..., llm=self.llm_for(spec))`; `estimate_cost(cfg, n_days, n_agents, agent_models: Sequence[str] | None = None) -> float` summing `settings.prices_for(model)` per agent (unchanged result when `agent_models` is `None`).
 
 - [ ] **Step 1: Write the failing tests**: `test_each_agent_call_goes_to_its_models_client` (record which stub client served each agent; spokes → spoke stub, hub → hub stub); `test_run_single_routes_like_run_day`; `test_missing_model_mapping_falls_back_to_default_llm`; `test_estimate_matches_hand_computed_mixed_cost` (9 spokes + 3 hub at known prices); `test_estimate_unchanged_without_agent_models`; `test_cache_keys_differ_between_models_for_identical_prompts`.
@@ -239,14 +241,14 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/engine tests/backtest -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: route agents to their models and estimate per model`.
 
-### Task B4: CLI construction, control, autoresearch, per-model spend
+### Task 12: CLI construction, control, autoresearch, per-model spend
 
 **Files:**
 - Modify: `atlas/cli.py`, `atlas/backtest/runner.py` (checkpoint `spent_by_model`, optional), `atlas/backtest/report.py`
 - Test: `tests/golden/test_hub_spoke_cli.py`
 
 **Interfaces:**
-- Consumes: B1-B3.
+- Consumes: 9-11.
 - Produces: `anthropic_client(settings, model: str | None = None)`; `build_run` builds one client and one `CachedLLM` per distinct effective model, all sharing one `Budget` and the same cache file, sets `run.llm` to the hub (`Settings.model`) `CachedLLM`, `run.llms` (model → `CachedLLM`) and passes `llms`/`models` to `Pipeline`; dry runs use `_NoCalls` for every model; `estimate_cost` gets the effective models (including control when `--with-control`); `run_control_pass` uses `run.llms[settings.agent_model(control_spec)]`; autoresearch proposals use `run.llm` (hub), replays use each agent's model via the pipeline; checkpoint stores optional `spent_by_model` and `restore_spent` is called once on the shared budget; the report Cost section prints one line per model and the Agents table a `model` column (`build_report(..., agent_models: dict[str, str] | None = None, spent_by_model: dict[str, float] | None = None)`); Limitations gains "mixed models: results cannot be attributed to the hub or the spokes" only when more than one model is in use.
 
 - [ ] **Step 1: Write the failing tests**: `test_mixed_run_dry_run_makes_zero_calls_and_prints_models`; `test_mixed_run_calls_reach_the_right_stub_clients_and_spend_is_split`; `test_hard_cap_spans_both_models`; `test_resume_restores_spend_once_for_all_models`; `test_changing_spoke_model_on_an_existing_run_is_refused_by_the_stored_record`; `test_control_agent_uses_spoke_model`; `test_report_shows_model_column_and_per_model_cost_only_when_mixed`; `test_single_model_golden_run_is_byte_identical_to_before` (equity, score rows, prediction-log bytes against a run with `spoke_model` unset).
@@ -255,14 +257,14 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/golden -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: build one client per model under a shared budget`.
 
-### Task B5: The contamination probe covers every model in use
+### Task 13: The contamination probe covers every model in use
 
 **Files:**
 - Modify: `atlas/cli.py` (`cmd_probe`), `atlas/backtest/contamination.py` (only if the score type needs a model field), `atlas/backtest/report.py` (probe section)
 - Test: `tests/golden/test_probe_models.py`
 
 **Interfaces:**
-- Consumes: B1-B4 (`Settings.agent_model`, `prices_for`, `run.llms`, shared `Budget`).
+- Consumes: 9-12 (`Settings.agent_model`, `prices_for`, `run.llms`, shared `Budget`).
 - Produces: `probe --run-dir PATH [--samples N] [--model MODEL] [--yes]`: by default probes EACH distinct effective model (hub, spoke, per-agent overrides, in a stable order) on the SAME anonymised snapshots (same seed `PROBE_SEED`, `N` samples per model); `--model` restricts to one (priced via `prices_for`, refused with exit 2 if unknown). `contamination.json` keeps its existing top-level fields for the hub model (`Settings.model`) and adds `models: {model: {n, date_hits, ticker_hits, date_rate, ticker_rate, failed, chance_date, chance_ticker, spend_usd, by_period}}`. The cost estimate/confirmation covers all models; spend goes to `probe.json` (total plus `by_model`) and into the shared budget once. `build_report(..., contamination=...)` renders one table row per model (date-hit rate vs chance, ticker hits with the sector-label caveat, spend), keeps the existing wording ("not a measure of skill"), and states which models were probed. A model whose probe was cut short by the budget is marked incomplete.
 
 - [ ] **Step 1: Write the failing tests**: `test_default_probes_every_distinct_model_on_the_same_snapshots` (record the user messages each stub client receives: the sets are identical across models); `test_model_flag_restricts_to_one_model`; `test_unknown_model_without_prices_exits_2`; `test_single_model_run_probes_one_model_and_json_is_backward_compatible`; `test_contamination_json_has_per_model_scores_and_top_level_hub_fields`; `test_estimate_and_confirmation_cover_all_models`; `test_probe_spend_split_by_model_and_counted_once_in_the_cap`; `test_budget_stop_marks_the_current_model_incomplete_and_skips_the_rest_cleanly`; `test_report_has_one_row_per_model_and_never_claims_skill`; `test_verdict_section_unchanged_with_probe`; `test_probe_prompts_still_contain_no_real_ticker_or_date_for_every_model`.
@@ -271,7 +273,7 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: probe every model in use`.
 
-### Task B6: Docs and Limitations
+### Task 14: Docs and Limitations
 
 **Files:**
 - Modify: `README.md`, `atlas/backtest/runner.py` (`LIMITATIONS`), `atlas/config/run.example.yaml`
@@ -290,8 +292,8 @@ tests/...                              # one test module per task
 
 ## Self-review notes
 
-- **Spec coverage:** error log 2.1 (A1-A4), hub-and-spoke 2.2 (B1-B6 incl. cutoff table, budget, estimate, report, checkpoint), confirmation and abstention accounting 2.3 (C1-C4). The spec's all-models probe (decision of 2026-11-10) is B5.
-- **Type consistency:** `ErrorLog` (A1) is the only logger type used by A2-A4; `Budget` (B2) is what `CachedLLM(budget=...)` takes in B3-B4; `DayPairs` (C2) is what the CLI scorer returns in C2/C4; `Settings` fields added in C1 and B1 do not overlap.
-- **Order and independence:** A, C and B do not depend on each other except that B4 touches `build_run` and `cmd_report` after A3/A4 did, so build in order A, C, B; each part's final task leaves the suite green.
+- **Spec coverage:** error log 2.1 (1-4), hub-and-spoke 2.2 (9-14 incl. cutoff table, budget, estimate, report, checkpoint), confirmation and abstention accounting 2.3 (5-8). The spec's all-models probe (decision of 2026-11-10) is 13.
+- **Type consistency:** `ErrorLog` (1) is the only logger type used by 2-4; `Budget` (10) is what `CachedLLM(budget=...)` takes in 11-12; `DayPairs` (6) is what the CLI scorer returns in 6/8; `Settings` fields added in 5 and 9 do not overlap.
+- **Order and independence:** A, C and B do not depend on each other except that 12 touches `build_run` and `cmd_report` after 3/4 did, so build in order A, C, B; each part's final task leaves the suite green.
 - **Known follow-ups not planned:** dynamic hub dispatch, portfolio-level edit scoring, error-log shipping/alerting.
 - **Operational note:** to use validation confirmation, the validation period must have at least `confirm_min_days` (20) trading days whose exit is inside validation; the private runbook's 11-day validation window must grow to about 30 days (for example train 2026-03-02..2026-05-15, validation 2026-05-18..2026-06-30).
