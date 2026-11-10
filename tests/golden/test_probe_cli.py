@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from atlas.cli import build_parser, spend_so_far
+from atlas.cli import OperationalError, build_parser, spend_so_far
 from tests.golden.test_golden_backtest import (
     FAKE_ANTHROPIC, cli, golden, keys, write_config,  # noqa: F401 (fixtures)
 )
@@ -323,3 +323,22 @@ def test_probe_passes_max_output_tokens(run, keys, monkeypatch):  # noqa: F811
     monkeypatch.setattr(cont, "contamination_probe", spy)
     assert cli(["probe", "--run-dir", run, "--samples", "2", "--yes"], wrong) == 0
     assert seen["max_tokens"] == 8192
+
+
+@pytest.mark.parametrize("where", ["autoresearch", "older_model"])
+def test_nan_recorded_spend_cannot_disable_the_cap(run, keys, capsys, where):  # noqa: F811
+    """A NaN spend would make `remaining = budget - spent` NaN and every cap check False."""
+    if where == "autoresearch":
+        row = {"agent": "a", "branch": "b", "n_days": 20, "old_ic": 0.0, "new_ic": 0.0, "diff": 0.0,
+               "keep_margin": 0.1, "decision": "rejected", "reason": "x", "commit_sha": None,
+               "cost_usd": float("nan")}
+        (run / "autoresearch_log.jsonl").write_text(json.dumps(row) + "\n")
+    else:
+        (run / "older_model" / "m").mkdir(parents=True)
+        (run / "older_model" / "m" / "checkpoint.json").write_text('{"spent_usd": NaN}')
+    with pytest.raises(OperationalError, match=f"recorded {where} spend"):
+        spend_so_far(run)
+    assert cli(["probe", "--run-dir", run, "--samples", "2", "--yes"], wrong) == 1
+    err = "".join(capsys.readouterr())
+    assert "not a valid amount" in err and "Traceback" not in err
+    assert not (run / "contamination.json").exists()

@@ -277,3 +277,19 @@ def test_old_run_config_without_spoke_and_agent_models_is_not_refused():
                        {"settings": {**new_s, "spoke_model": "claude-haiku-5-5"}, "agents": new_a}) == ["settings.spoke_model"]
     changed = [{**new_a[0], "model": "claude-opus-5-5"}]
     assert record_diff({"settings": old_s, "agents": old_a}, {"settings": new_s, "agents": changed}) == ["agents.a.model"]
+
+
+@pytest.mark.parametrize("field,bad", [("budget_usd", float("nan")), ("budget_usd", "nan"),
+                                       ("budget_usd", float("inf")), ("budget_usd", 0), ("budget_usd", -1),
+                                       ("confirm_cost_usd", float("nan")), ("confirm_cost_usd", float("inf")),
+                                       ("confirm_cost_usd", -0.01)])
+def test_money_caps_must_be_real_numbers(field, bad):
+    # a NaN cap makes every `spend > cap` comparison False, i.e. no cap at all
+    with pytest.raises(ValidationError, match=field):
+        _settings(**{field: bad})
+
+
+def test_money_caps_keep_accepting_current_values():
+    assert _settings(budget_usd=0.2).budget_usd == 0.2
+    assert _settings(confirm_cost_usd=0.0).confirm_cost_usd == 0.0  # 0 = always ask (used by tests)
+    assert _settings(confirm_cost_usd=1e9).confirm_cost_usd == 1e9

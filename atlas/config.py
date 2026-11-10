@@ -114,14 +114,14 @@ class Settings(BaseModel):
     min_valid_agents: int
     rolling_ic_window: int
     warmup_picks: int
-    budget_usd: float
+    budget_usd: float = Field(gt=0, allow_inf_nan=False)  # the hard LLM spend cap: finite, > 0
     model: str
     model_cutoff: date
     shrinkage_k: float = 20.0
     dead_zone: float | None = None
     max_edits: int = 5
     max_failure_rate: float = 0.2
-    confirm_cost_usd: float = 25.0
+    confirm_cost_usd: float = Field(25.0, ge=0, allow_inf_nan=False)  # NaN would never ask
     older_model: str | None = None
     # hub and spoke: spoke_model runs the macro/sector/superinvestor agents and the control agent
     # (None = every agent uses `model`). Its own price pair, both or neither.

@@ -1,4 +1,5 @@
 """Shared Budget: one hard spend cap across several CachedLLM instances (one per model)."""
+import math
 import sqlite3
 import sys
 import threading
@@ -348,3 +349,72 @@ def test_every_counter_update_takes_the_budget_lock():
         before = len(entered)
         op()
         assert len(entered) == before + 1
+
+
+@pytest.mark.parametrize("bad", [float("nan"), "nan"])
+def test_nan_cap_is_rejected(tmp_path, bad):
+    with pytest.raises(ValueError, match="budget cap"):
+        Budget(bad)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="budget cap"):
+        CachedLLM(StubClient(lambda s, u: "x"), tmp_path / "c.db", "m", (1.0, 1.0), bad)
+    llm = CachedLLM(StubClient(lambda s, u: "x"), tmp_path / "c.db", "m", (1.0, 1.0), 5.0)
+    with pytest.raises(ValueError, match="budget cap"):
+        llm.budget_usd = bad
+    assert llm.budget_usd == 5.0  # a rejected cap leaves the old one in place
+    shared = Budget(2.0)
+    with pytest.raises(ValueError, match="budget cap"):
+        shared.cap_usd = bad
+    assert shared.cap_usd == 2.0
+
+
+def test_infinite_zero_and_negative_caps_still_allowed(tmp_path):
+    assert Budget(math.inf).cap_usd == math.inf  # dry-run stubs use an unlimited cap
+    assert Budget(0.0).cap_usd == 0.0 and Budget(-1.0).cap_usd == -1.0  # refuse every call, as before
+    llm = CachedLLM(StubClient(lambda s, u: "x"), tmp_path / "c.db", "m", (1.0, 1.0), math.inf)
+    llm.call("s", "u")
+    llm.budget_usd = 0.0
+    with pytest.raises(BudgetExceeded):
+        llm.call("s2", "u")
+
+
+def test_spend_exactly_at_cap_after_a_call_does_not_raise(tmp_path):
+    class Exact:
+        def complete(self, system, user, max_tokens):
+            return LLMResponse("x", 1, 0, "end_turn")  # $1.00 at $1e6/Mtok
+
+    budget = Budget(1.0)
+    llm = CachedLLM(Exact(), tmp_path / "c.db", "a", (1e6, 0.0), budget=budget)
+    resp = llm.call("", "", max_tokens=1)  # reserves (0 // 4 + 1) * $1 = $1.00 == cap: allowed
+    assert resp.text == "x" and budget.spent_usd == 1.0 == budget.cap_usd  # spend == cap: no raise
+
+
+def test_setting_budget_usd_on_one_instance_sets_the_shared_cap(tmp_path):
+    budget = Budget(10.0)
+    ca, cb = SleepyClient(1000, sleep=0), SleepyClient(500, sleep=0)
+    a = CachedLLM(ca, tmp_path / "c.db", "a", PRICE_A, budget=budget)
+    b = CachedLLM(cb, tmp_path / "c.db", "b", PRICE_B, budget=budget)
+    a.budget_usd = 0.5  # narrowing the cap through A narrows it for B too
+    assert b.budget_usd == 0.5 == budget.cap_usd
+    with pytest.raises(BudgetExceeded, match=r"of \$0\.50 budget"):
+        b.call(prompt("b", 1), "u", max_tokens=1)
+    assert cb.calls == 0
+    b.budget_usd = 3.0
+    assert a.budget_usd == 3.0
+    a.call(prompt("a", 2), "u", max_tokens=1)
+    assert ca.calls == 1
+
+
+def test_nan_estimate_or_cost_fails_closed(tmp_path):
+    b = Budget(10.0)
+    with pytest.raises(BudgetExceeded):
+        b.reserve(float("nan"))
+    assert b.reserved_usd == 0.0
+
+    class Nan:
+        def complete(self, system, user, max_tokens):
+            return LLMResponse("x", 1, 0, "end_turn")
+
+    llm = CachedLLM(Nan(), tmp_path / "c.db", "a", (1.0, 0.0), budget=b)
+    llm._cost = lambda r: float("nan")  # a NaN cost must not slip past the post-call check
+    with pytest.raises(BudgetExceeded):
+        llm.call("s", "u", max_tokens=1)

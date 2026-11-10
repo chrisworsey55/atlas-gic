@@ -210,7 +210,7 @@ class RunConfig(_Strict):
     initial_cash: float = Field(100_000.0, gt=0)
     anonymize: bool = False
     universe: list[str] | None = None  # overrides settings.universe
-    budget_usd: float | None = Field(None, gt=0)  # overrides settings.budget_usd (hard cap)
+    budget_usd: float | None = Field(None, gt=0, allow_inf_nan=False)  # overrides settings.budget_usd (hard cap)
     settings: dict = Field(default_factory=dict)  # any other Settings field overrides
     settings_file: Path | None = None
     limits_file: Path | None = None
@@ -744,11 +744,16 @@ def spend_so_far(run_dir: Path) -> dict[str, float]:
     ar_cost = sum((float(r.get("cost_usd") or 0.0) for r in read_ar_log(run_dir / AR_LOG)), 0.0)
     older = sum((float((_load_checkpoint(Checkpoint(c)) or {}).get("spent_usd", 0.0))
                  for c in sorted((run_dir / OLDER_MODEL_DIR).glob("*/" + CHECKPOINT))), 0.0)
-    return {"backtest": float(raw.get("spent_usd", 0.0)),
-            "control": _read_spend(run_dir / CONTROL_STATE),
-            "autoresearch": ar_cost,
-            "probe": _read_spend(run_dir / PROBE_STATE),
-            "older_model": older}
+    spent = {"backtest": float(raw.get("spent_usd", 0.0)),
+             "control": _read_spend(run_dir / CONTROL_STATE),
+             "autoresearch": ar_cost,
+             "probe": _read_spend(run_dir / PROBE_STATE),
+             "older_model": older}
+    for name, v in spent.items():  # a NaN would make every remaining-cap comparison False
+        if not math.isfinite(v) or v < 0:
+            raise OperationalError(f"recorded {name} spend in {run_dir} is not a valid amount ({v!r}); "
+                                   "the run directory is corrupt")
+    return spent
 
 
 def _spent_by(spent: dict[str, float], *names: str) -> float:

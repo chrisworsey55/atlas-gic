@@ -88,6 +88,20 @@ class Budget:
         self.restore_spent(initial_spent_usd)
 
     @property
+    def cap_usd(self) -> float:
+        return self._cap
+
+    @cap_usd.setter
+    def cap_usd(self, usd: float) -> None:
+        """A NaN cap is refused: every comparison with NaN is False, so it would disable the
+        hard cap. Infinity (unlimited, dry-run stubs) and zero/negative (refuse every call)
+        are allowed."""
+        usd = float(usd)
+        if math.isnan(usd):
+            raise ValueError("invalid budget cap nan: the hard spend cap must be a number")
+        self._cap = usd
+
+    @property
     def spent_usd(self) -> float:
         return self._spent
 
@@ -117,10 +131,11 @@ class Budget:
         """Reserve `estimate` USD for a call about to be made, or raise BudgetExceeded (and
         reserve nothing) if spent + in flight + estimate would exceed the cap."""
         with self._lock:
-            if self._spent + self._reserved + estimate > self.cap_usd:
+            # `not <=` (not `>`): a NaN anywhere refuses the call instead of passing the check
+            if not self._spent + self._reserved + estimate <= self._cap:
                 raise BudgetExceeded(
                     f"call could cost up to ${estimate:.4f}; spent ${self._spent:.4f} "
-                    f"(+${self._reserved:.4f} in flight) of ${self.cap_usd:.2f} budget")
+                    f"(+${self._reserved:.4f} in flight) of ${self._cap:.2f} budget")
             self._reserved += estimate
 
     def settle(self, estimate: float, model: str, actual: float | None) -> None:
@@ -323,6 +338,6 @@ class CachedLLM:
                 "INSERT OR REPLACE INTO llm_cache VALUES (?,?,?,?,?)",
                 (key, resp.text, resp.input_tokens, resp.output_tokens, resp.stop_reason))
         spent, cap = self.budget.spent_usd, self.budget.cap_usd
-        if spent > cap:  # actual tokens exceeded the estimate
+        if not spent <= cap:  # actual tokens exceeded the estimate (or a NaN cost: fail closed)
             raise BudgetExceeded(f"spent ${spent:.4f} exceeds ${cap:.2f} budget")
         return resp, False
