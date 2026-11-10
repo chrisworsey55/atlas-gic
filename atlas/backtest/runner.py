@@ -73,6 +73,7 @@ from atlas.backtest.checkpoint import Checkpoint, dump_date, load_date
 from atlas.backtest.predlog import PredictionLog
 from atlas.config import Limits, Settings
 from atlas.data.store import PriceStore, Snapshot
+from atlas.errorlog import ErrorLog, NullErrorLog
 from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, StubClient
 from atlas.engine.pipeline import DayResult, Pipeline, _last_close, orders_from_targets
 from atlas.portfolio.models import Fill, Order, Portfolio
@@ -471,7 +472,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                  scores: ScoreStore, weightbook: WeightBook, predlog: PredictionLog,
                  checkpoint: Checkpoint, *, confirm: bool = False, initial_cash: float = 100_000.0, universe_sectors: dict[str, str] | None = None,
                  lookback_days: int = 60, macro_series=(), run_dir: Path | None = None,
-                 history_path: Path | None = None) -> BacktestResult:
+                 history_path: Path | None = None, error_log: ErrorLog | None = None) -> BacktestResult:
     """Run (or resume) the backtest over train, validation and holdout in date order.
 
     One continuous portfolio spans all three periods; use ``cfg.periods.period_of`` to split
@@ -481,6 +482,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
     ``pipeline.llm``: its spend is restored from the checkpoint so the budget spans resumes. ``run_dir`` holds the dry-run stub cache (a temp dir if omitted).
     Raises CostConfirmationRequired, RunPaused, ResumeRefused (see module docstring).
     """
+    elog = error_log if error_log is not None else NullErrorLog()
     s = cfg.settings
     universe = list(dict.fromkeys(s.universe))
     snap_tickers = universe + ([BENCHMARK] if BENCHMARK not in universe else [])
@@ -564,6 +566,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
         def pause(reason: str, day: date, failed: dict[str, str], kind: str) -> RunPaused:
             committed.spent_usd = active_llm.spent_usd
             checkpoint.save(committed.to_json())
+            elog.event("run_paused", reason, level="warning", day=day, pause_kind=kind, failed=failed)
             return RunPaused(reason, day, failed, kind)
 
         for T in todo:
@@ -595,12 +598,18 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             try:
                 day = active.run_day(T, pipe_in, weights, agent_state, asof_label=label)
             except BudgetExceeded as e:
+                elog.exception("budget_exceeded", e, day=T)
                 raise pause(f"LLM budget exceeded: {e}", T, {}, "budget") from e
-            except FatalApiError:  # not a pause: commit nothing of T, keep the spend, propagate
+            except FatalApiError as e:  # not a pause: commit nothing of T, keep the spend, propagate
+                elog.exception("fatal_api_error", e, day=T)
                 committed.spent_usd = active_llm.spent_usd
                 checkpoint.save(committed.to_json())
                 raise
             failed = _pause_failed(active, day)
+            if day.skipped_reason is not None and failed is None:
+                elog.event("day_skipped", day.skipped_reason, level="warning", day=T,
+                           failed={n: (r.failure.reason.value if r.failure is not None else "no_output")
+                                   for n, r in sorted(day.results.items()) if r.status != "ok"})
             if failed is not None:
                 raise pause(f"transient infrastructure failures decided the day ({day.skipped_reason})",
                             T, failed, "transient")
@@ -635,10 +644,13 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                 except Exception as e:  # noqa: BLE001 - fail closed on ANY risk-layer error
                     log.exception("%s: risk layer failed; no orders sent", T)
                     st.risk_errors[T] = f"{type(e).__name__}: {e}"
+                    elog.exception("risk_error", e, day=T)
                 else:
                     if decision.halted:
                         st.halted, st.halt_reason = True, decision.halt_reason
                         log.error("%s: HALT: %s", T, decision.halt_reason)
+                        elog.event("halted", f"kill switch fired: {decision.halt_reason}", level="error",
+                                   day=T, halt_reason=decision.halt_reason)
                     for o, why in decision.rejected:
                         log.info("%s: risk rejected %s: %s", T, o, why)
                     to_send = list(decision.orders)

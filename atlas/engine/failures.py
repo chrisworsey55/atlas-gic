@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from atlas.errorlog import ErrorLog, NullErrorLog
 from atlas.schemas import FailureRecord
 
 _COLS = ["agent", "date", "reason", "detail", "attempt", "raw_response"]
@@ -20,9 +21,10 @@ class FailureLog:
     """kind='call_failure' rows are failed LLM attempts; kind='dropped_pick' rows are
     out-of-universe picks removed from an otherwise valid output."""
 
-    def __init__(self, db_path: Path, run_id: str | None = None):
+    def __init__(self, db_path: Path, run_id: str | None = None, error_log: ErrorLog | None = None):
         self.db_path = Path(db_path)
         self.run_id = run_id
+        self.error_log = error_log if error_log is not None else NullErrorLog()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._conn()) as c, c:
             c.execute(
@@ -42,6 +44,10 @@ class FailureLog:
                 (rec.agent, rec.date.isoformat(), rec.reason.value, rec.detail, rec.attempt,
                  rec.raw_response, kind, run_id if run_id is not None else self.run_id),
             )
+        # mirror after the insert; only the detail text, never the raw model reply
+        self.error_log.event(kind, rec.detail, level="info" if kind == DROPPED_PICK else "warning",
+                             day=rec.date, agent=rec.agent, reason=rec.reason.value,
+                             attempt=rec.attempt)
 
     def rows(self, kind: str | None = None) -> pd.DataFrame:
         q = f"SELECT {', '.join(_COLS)}, kind, run_id FROM failures"
