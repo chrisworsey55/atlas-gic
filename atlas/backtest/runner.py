@@ -63,6 +63,7 @@ import math
 import os
 import tempfile
 from contextlib import ExitStack
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -239,12 +240,23 @@ class BacktestResult:
     periods: Periods | None = None
 
 
-def estimate_cost(cfg: BacktestConfig, n_days: int, n_agents: int) -> float:
+def estimate_cost(cfg: BacktestConfig, n_days: int, n_agents: int,
+                  agent_models: Sequence[str] | None = None) -> float:
     """Upper-level estimate from Settings.prices() (per-model table or explicit prices); 0 for a dry run. Ignores
-    cache hits and retries (cached days are free, retries cost extra)."""
+    cache hits and retries (cached days are free, retries cost extra). `agent_models` (one
+    model per agent, so its length must equal n_agents) prices each agent at
+    ``settings.prices_for(model)``."""
+    if agent_models is not None and len(agent_models) != n_agents:
+        raise ValueError(f"agent_models has {len(agent_models)} entries for {n_agents} agents")
     if cfg.dry_run:
         return 0.0
     s = cfg.settings
+    if agent_models is not None:
+        total = 0.0
+        for m in agent_models:
+            p_in, p_out = s.prices_for(m)
+            total += (s.est_input_tokens_per_call * p_in + s.est_output_tokens_per_call * p_out) / 1e6
+        return float(n_days) * total
     p_in, p_out = s.prices()  # UnknownModelPrice for an unpriced model
     per_call = (s.est_input_tokens_per_call * p_in + s.est_output_tokens_per_call * p_out) / 1e6
     return float(n_days) * float(n_agents) * per_call
@@ -524,7 +536,9 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
     todo = [d for d in all_days if st.last_completed_day is None or d > st.last_completed_day]
 
     agent_specs = [sp for sp in pipeline.specs.values() if sp.kind != "control"]
-    est = estimate_cost(cfg, len(todo), len(agent_specs))
+    routed = pipeline.models
+    est = estimate_cost(cfg, len(todo), len(agent_specs),
+                        None if routed is None else [routed.get(sp.name, s.model) for sp in agent_specs])
     if est > s.confirm_cost_usd and not confirm:
         raise CostConfirmationRequired(est, s.confirm_cost_usd)
 
@@ -548,6 +562,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             active_llm = CachedLLM(StubClient(lambda _s, _u: DRY_RUN_RESPONSE), d / "dry_run_llm.db",
                                    "dry-run", (0.0, 0.0), math.inf)
             active.llm = active_llm
+            active.llms = None  # the stub serves every agent
         limitations = list(LIMITATIONS)
         sectors: dict[str, str] = {}
         fwd: dict[str, str] = {}
