@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import traceback
@@ -52,10 +53,19 @@ def _warn_once(exc: BaseException) -> None:
         pass
 
 
+_CTRL = re.compile("[\x00-\x1f\x7f-\x9f]")
+
+
+def escape_controls(text: str) -> str:
+    """Every control character becomes a visible escape (``\\x1b``): one line, nothing a
+    terminal can interpret."""
+    return _CTRL.sub(lambda m: "\\x%02x" % ord(m.group()), text)
+
+
 def _s(x, limit: int = _FIELD_LIMIT) -> str:
-    """sanitise(str(x)) that never raises."""
+    """escape_controls(sanitise(str(x))) that never raises."""
     try:
-        return sanitise(str(x), limit)
+        return escape_controls(sanitise(str(x), limit))
     except Exception:
         try:
             name = type(x).__name__
@@ -163,9 +173,11 @@ class NullErrorLog(ErrorLog):
         super().__init__(None)
 
 
-def read_events(path: Path, *, kind: str | None = None) -> list[dict]:
+def read_events(path: Path, *, kind: str | None = None, strict: bool = True,
+                skipped: list[int] | None = None) -> list[dict]:
     """Records of an error log (see the module docstring for torn-line rules). Missing file or a
-    non-file path -> []."""
+    non-file path -> []. ``strict=False`` skips every malformed line instead of raising; the
+    1-based numbers of all skipped lines are appended to ``skipped`` if given."""
     path = Path(path)
     if not path.is_file():
         return []
@@ -185,7 +197,10 @@ def read_events(path: Path, *, kind: str | None = None) -> list[dict]:
     for n, (i, rec) in enumerate(parsed):
         if rec is None:
             nxt = parsed[n + 1][1] if n + 1 < len(parsed) else None
-            if n == len(parsed) - 1 or (nxt is not None and nxt.get("kind") == "log_repaired"):
+            if n == len(parsed) - 1 or (nxt is not None and nxt.get("kind") == "log_repaired") \
+                    or not strict:
+                if skipped is not None:
+                    skipped.append(i + 1)
                 continue
             raise ValueError(f"error log is corrupt at line {i + 1}: {path}")
         if kind is None or rec.get("kind") == kind:

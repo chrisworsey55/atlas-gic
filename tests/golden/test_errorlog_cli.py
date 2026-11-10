@@ -231,3 +231,247 @@ def test_usage_error_after_build_run_is_logged_and_message_unchanged(golden, tmp
     assert capsys.readouterr().err == "error: synthetic usage problem\n"
     ev = read_events(tmp_path / "run" / "dry_run" / "errors.log", kind="usage_error")
     assert len(ev) == 1 and ev[0]["message"] == "synthetic usage problem"
+
+
+# ---------------------------------------------------------------------------- fix round 1
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from atlas.engine.failures import FailureLog  # noqa: E402
+from atlas.errorlog import ErrorLog  # noqa: E402
+from atlas.schemas import FailureRecord, FailureReason  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[2]
+NASTY = "hi \x1b[2J\x1b]0;pwned\x07 cr\rbs\bdel\x7f c1\x9b end"
+
+
+def _no_ctrl(raw: bytes) -> bool:
+    return not any(b < 0x20 and b != 0x0A or b == 0x7F for b in raw)
+
+
+def test_control_characters_are_escaped_on_the_write_side(tmp_path):
+    path = tmp_path / "errors.log"
+    ErrorLog(path).event("k\x1bind", NASTY, day="2024\x07", agent="a\rb", reason="r\x08",
+                         **{"f\x1b": NASTY, "nested": [NASTY, {"x": NASTY}]})
+    try:
+        raise ValueError(NASTY)
+    except ValueError as e:
+        ErrorLog(path).exception("unexpected_exception", e)
+    raw = path.read_bytes()
+    assert _no_ctrl(raw) and b"\xc2\x9b" not in raw
+    # JSON doubles the backslash of the visible escape; CR/LF are whitespace and collapse to a space
+    assert b"\\\\x1b" in raw and b"\\\\x07" in raw and b"\\\\x08" in raw and b"\\\\x7f" in raw
+    assert len(raw.splitlines()) == 2
+    ev = read_events(path)[0]
+    assert ev["message"].startswith("hi \\x1b[2J\\x1b]0;pwned\\x07")
+    assert "\x1b" not in json.dumps(ev, ensure_ascii=False)
+
+
+def test_errors_command_reescapes_and_redacts_an_edited_log(tmp_path, capsys):
+    d = tmp_path / "rd"
+    d.mkdir()
+    rec = {"ts_utc": "2024-01-01T00:00:00+\x1b[31m", "level": "error", "kind": "k\x1b[0m", "day": "2024-01-01",
+           "agent": "a\rb", "reason": "r\x08", "fields": {},
+           "message": NASTY + " sk-ant-api03-ABCDEFGHIJKLMNOP"}
+    (d / "errors.log").write_text(json.dumps(rec) + "\n")
+    assert cli(["errors", "--run-dir", d]) == 0
+    out = capsys.readouterr().out
+    assert _no_ctrl(out.rstrip("\n").encode()) and "\x9b" not in out
+    assert "\\x1b[2J" in out and "\\x07" in out and "sk-ant-api03" not in out and "<redacted>" in out
+    assert len(out.strip().splitlines()) == 1
+
+
+def test_errors_command_keeps_valid_events_and_warns_about_malformed_lines(tmp_path, capsys):
+    d = _seed(tmp_path)
+    lines = (d / "errors.log").read_text().splitlines()
+    lines.insert(2, "{not json")
+    lines.insert(4, "[1, 2]")
+    (d / "errors.log").write_text("\n".join(lines) + "\n")
+    assert cli(["errors", "--run-dir", d]) == 0
+    cap = capsys.readouterr()
+    assert len(cap.out.strip().splitlines()) == 6
+    assert cap.err.strip() == f"warning: skipped 2 malformed line(s) in {d / 'errors.log'}"
+    assert [e["kind"] for e in read_events(d / "errors.log", strict=False)].count("call_failure") == 5
+    with pytest.raises(ValueError):
+        read_events(d / "errors.log")  # strict default unchanged
+
+
+def test_errors_command_on_all_garbage_prints_only_the_warning(tmp_path, capsys):
+    d = tmp_path / "rd"
+    d.mkdir()
+    (d / "errors.log").write_text("garbage\nmore garbage\nand more\n")
+    assert cli(["errors", "--run-dir", d]) == 0
+    cap = capsys.readouterr()
+    assert cap.out == "" and "skipped 3 malformed line(s)" in cap.err
+
+
+def test_closed_pipe_is_not_an_error_subprocess(tmp_path):
+    d = tmp_path / "rd"
+    d.mkdir()
+    rec = json.dumps({"ts_utc": "t", "level": "error", "kind": "call_failure", "day": "2024-01-01",
+                      "agent": "a", "reason": "r", "message": "m" * 60, "fields": {}})
+    (d / "errors.log").write_text((rec + "\n") * 30000)
+    p = subprocess.Popen([sys.executable, "-m", "atlas", "errors", "--run-dir", str(d), "--tail", "100000"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT)
+    assert p.stdout.readline().startswith(b"t error call_failure")
+    p.stdout.close()
+    err = p.stderr.read()
+    assert p.wait(timeout=60) == 0
+    assert err == b""
+
+
+class _ClosedStdout:
+    def write(self, s):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def test_broken_pipe_on_stdout_is_quiet_in_errors_and_in_the_catch_all(tmp_path, monkeypatch, capsys):
+    d = _seed(tmp_path)
+    monkeypatch.setattr(sys, "stdout", _ClosedStdout())
+    assert cli(["errors", "--run-dir", d]) == 0
+
+    def pipe_command(args, llm_client=None):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setitem(cli_mod.COMMANDS, "report", pipe_command)
+    assert cli(["report", "--run-dir", d]) == 0
+    assert capsys.readouterr().err == ""
+    assert read_events(d / "errors.log", kind="unexpected_exception") == []
+
+
+class _OrderedStderr:
+    """stderr that notes, at the first write of an error line, which events are already on disk."""
+
+    def __init__(self, log):
+        self.log, self.seen, self.text = log, None, ""
+
+    def write(self, s):
+        if self.seen is None and s.startswith("error:"):
+            self.seen = [e["kind"] for e in read_events(self.log, strict=False)] if self.log.exists() else []
+        self.text += s
+        return len(s)
+
+    def flush(self):
+        pass
+
+
+def test_known_errors_are_recorded_before_they_are_printed(golden, tmp_path, keys, monkeypatch):  # noqa: F811
+    conf = _conf(tmp_path, golden)
+    log = tmp_path / "run" / "dry_run" / "errors.log"
+    # operational error (run record mismatch) and usage error, both after build_run
+    assert cli(["backtest", "--config", conf, "--dry-run"]) == 0
+    other = write_config(tmp_path / "run2.yaml", tmp_path / "run", golden["repo"],
+                         periods={**SHORT_PERIODS, "train": {"start": "2024-01-01", "end": "2024-01-02"}})
+    fake = _OrderedStderr(log)
+    monkeypatch.setattr(sys, "stderr", fake)
+    assert cli(["backtest", "--config", other, "--dry-run"]) == 1
+    assert fake.seen == ["operational_error"]
+
+    def usage(*a, **k):
+        raise cli_mod.UsageError("synthetic usage problem")
+
+    monkeypatch.setattr(cli_mod, "make_backtest_config", usage)
+    fake = _OrderedStderr(log)
+    monkeypatch.setattr(sys, "stderr", fake)
+    assert cli(["backtest", "--config", conf, "--dry-run"]) == 2
+    assert fake.seen == ["operational_error", "usage_error"]
+
+
+def test_fatal_and_unexpected_are_recorded_before_they_are_printed(golden, tmp_path, keys, monkeypatch):  # noqa: F811
+    conf = _conf(tmp_path, golden)
+    log = tmp_path / "run" / "errors.log"
+
+    def bad(*a, **k):
+        raise ValueError("oops")
+
+    monkeypatch.setattr(cli_mod, "make_backtest_config", bad)
+    fake = _OrderedStderr(log)
+    monkeypatch.setattr(sys, "stderr", fake)
+    assert cli(["backtest", "--config", conf], GoldenStub()) == 1
+    assert fake.seen == ["unexpected_exception"]
+
+
+def test_one_error_log_instance_is_shared_by_every_failure_log_and_the_runner(golden, tmp_path, keys,  # noqa: F811
+                                                                           monkeypatch):
+    made, runner_got = [], []
+
+    class Spy(FailureLog):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    real_run = cli_mod.run_backtest
+
+    def spy_run(*a, **k):
+        runner_got.append(k.get("error_log"))
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(cli_mod, "FailureLog", Spy)
+    monkeypatch.setattr(cli_mod, "run_backtest", spy_run)
+    assert cli(["backtest", "--config", _conf(tmp_path, golden)], GoldenStub()) == 0
+    active = cli_mod.ACTIVE_ERRORLOG
+    assert active is not None and active.path == tmp_path / "run" / "errors.log"
+    assert len(made) == 1 and made[0].error_log is active
+    assert runner_got == [active]
+
+
+def test_build_run_wires_run_errors_into_failures(golden, tmp_path):  # noqa: F811
+    from atlas.engine.llm import StubClient
+    rc = cli_mod.load_run_config(_conf(tmp_path, golden))
+    run = cli_mod.build_run(rc, llm_client=StubClient(GoldenStub()))
+    assert run.failures.error_log is run.errors and run.errors is cli_mod.ACTIVE_ERRORLOG
+    assert run.errors.path == rc.path(cli_mod.ERRORS_NAME)
+
+
+def test_replay_and_probe_failure_logs_get_the_same_instance(golden, tmp_path, keys, monkeypatch):  # noqa: F811
+    from atlas.engine.llm import StubClient
+    from tests.golden.test_golden_backtest import copy_run
+    run_dir, conf = copy_run(golden, tmp_path)
+    made = []
+
+    class Spy(FailureLog):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    monkeypatch.setattr(cli_mod, "FailureLog", Spy)
+    replay = cli_mod.build_replay(conf, llm_client=StubClient(GoldenStub()))
+    assert len(made) == 2 and all(f.error_log is replay.run.errors for f in made)
+    assert made[1].db_path.name == cli_mod.AR_FAILURES
+    made.clear()
+    wrong = json.dumps({"date": "1990-01-01", "ticker": "ZZZZ"})
+    assert cli(["probe", "--run-dir", run_dir, "--samples", "3", "--yes"], lambda s, u: wrong) == 0
+    assert len(made) == 1 and made[0].db_path.name == cli_mod.PROBE_FAILURES
+    assert made[0].error_log is cli_mod.ACTIVE_ERRORLOG and made[0].error_log.path == run_dir / "errors.log"
+
+
+def test_threads_logging_through_two_failure_logs_never_interleave(tmp_path):
+    shared = ErrorLog(tmp_path / "errors.log")
+    logs = [FailureLog(tmp_path / f"f{i}.sqlite", error_log=shared) for i in range(2)]
+    from datetime import date
+
+    def work(fl, tag):
+        for i in range(100):
+            fl.record(FailureRecord(agent=tag, date=date(2024, 1, 2), reason=FailureReason.TIMEOUT,
+                                    detail="d" * 200 + str(i), attempt=1, raw_response="raw"))
+
+    ts = [threading.Thread(target=work, args=(logs[i % 2], f"t{i}")) for i in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    lines = (tmp_path / "errors.log").read_text().splitlines()
+    assert len(lines) == 400 and all(json.loads(ln)["kind"] == "call_failure" for ln in lines)
+
+
+def test_dry_run_log_lands_only_in_dry_run_dir(golden, tmp_path, monkeypatch):  # noqa: F811
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    conf = _conf(tmp_path, golden)
+    assert cli(["backtest", "--config", conf, "--dry-run"]) == 0
+    assert cli_mod.ACTIVE_ERRORLOG.path == tmp_path / "run" / "dry_run" / "errors.log"
+    assert not (tmp_path / "run" / "errors.log").exists()

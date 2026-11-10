@@ -110,7 +110,7 @@ from atlas.data.csv_provider import CacheOnlyPrices, CsvPriceProvider, NoMacro
 from atlas.data.fred_provider import FredFetchError
 from atlas.data.store import PriceStore
 from atlas.engine.failures import CALL_FAILURE, FailureLog
-from atlas.errorlog import ErrorLog, NullErrorLog, read_events
+from atlas.errorlog import ErrorLog, NullErrorLog, escape_controls, read_events
 from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, StubClient, sanitise
 from atlas.engine.pipeline import Pipeline
 from atlas.portfolio.models import Portfolio
@@ -1438,14 +1438,36 @@ def cmd_errors(args, llm_client=None) -> int:
     path = run_dir / ERRORS_NAME
     if not path.is_file():
         raise OperationalError(f"no error log in {run_dir}")
+    skipped: list[int] = []
     try:
-        events = read_events(path, kind=args.kind)
+        events = read_events(path, kind=args.kind, strict=False, skipped=skipped)
     except (OSError, ValueError) as e:
         raise OperationalError(f"cannot read {path}: {e}") from None
-    for ev in events[-args.tail:] if args.tail > 0 else []:
-        print(" ".join(str(ev.get(k) or "-") if k != "message" else str(ev.get(k) or "")
-                       for k in ("ts_utc", "level", "kind", "day", "agent", "reason", "message")).rstrip())
+    if skipped:
+        print(f"warning: skipped {len(skipped)} malformed line(s) in {path}", file=sys.stderr)
+
+    def cell(ev: dict, k: str) -> str:  # stored text is data: re-sanitised, never raw bytes
+        v = ev.get(k)
+        return escape_controls(sanitise("" if v is None else str(v), 500)) if v not in (None, "") else (
+            "" if k == "message" else "-")
+
+    try:
+        for ev in events[-args.tail:] if args.tail > 0 else []:
+            print(" ".join(cell(ev, k) for k in ("ts_utc", "level", "kind", "day", "agent", "reason",
+                                                  "message")).rstrip())
+        sys.stdout.flush()
+    except BrokenPipeError:
+        _quiet_broken_pipe()
     return EXIT_OK
+
+
+def _quiet_broken_pipe() -> None:
+    """The reader closed the pipe (`| head`): not a bug. Point stdout at devnull so the flush at
+    interpreter exit cannot raise (the recipe in the Python docs)."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except Exception:  # noqa: BLE001 - e.g. a captured stdout without a file descriptor
+        pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1518,6 +1540,9 @@ def main(argv: list[str] | None = None, *, llm_client=None) -> int:
         print(f"error: {e}. Nothing was retried and any checkpoint is intact: fix the cause (model name, "
               "API key, settings such as effort) and re-run the same command.", file=sys.stderr)
         return EXIT_FAILED
+    except BrokenPipeError:  # `atlas ... | head`: the reader left; neither an error nor a bug
+        _quiet_broken_pipe()
+        return EXIT_OK
     except Exception as e:  # noqa: BLE001 - last resort: one line, never a traceback (Ctrl-C/exit pass)
         _record_known("unexpected_exception", e)
         where = f" (details: {ACTIVE_ERRORLOG.path})" if ACTIVE_ERRORLOG is not None and ACTIVE_ERRORLOG.path else ""
