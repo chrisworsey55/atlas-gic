@@ -100,10 +100,10 @@ class Pipeline:
                  llms: Mapping[str, CachedLLM] | None = None, models: Mapping[str, str] | None = None):
         """`llm` is the default client. For a hub-and-spoke run, `models` maps agent name ->
         effective model and `llms` maps model -> its CachedLLM; both None means every agent
-        uses `llm` (single-model run, unchanged). An agent missing from `models`, or whose
-        model has no client in `llms`, FALLS BACK to `llm` silently: such a call is priced and
-        its spend attributed under `llm`'s model, so callers must supply a client for every
-        model in `models`."""
+        uses `llm` (single-model run, unchanged). An agent missing from `models` falls back to
+        `llm`; an agent whose mapped model has no client in `llms` is a configuration error and
+        raises (a silent fallback would run a different model than the one mapped and
+        misattribute its spend)."""
         self.specs = {s.name: s for s in specs}
         self.max_tokens = max_tokens  # per agent call (Settings.max_output_tokens in the CLI)
         self.prompts = prompts
@@ -115,12 +115,18 @@ class Pipeline:
         self.min_valid_agents = min_valid_agents
 
     def llm_for(self, spec: AgentSpec) -> CachedLLM:
-        """The client serving this agent's model; `self.llm` when there is no routing or no
-        client for the model (see __init__)."""
+        """The client serving this agent's model; `self.llm` when there is no routing or the
+        agent is not in `models`. A mapped model with no client raises (see __init__)."""
         if self.llms is None or self.models is None:
             return self.llm
         model = self.models.get(spec.name)
-        return self.llms.get(model, self.llm) if model is not None else self.llm
+        if model is None:
+            return self.llm
+        try:
+            return self.llms[model]
+        except KeyError:
+            raise RuntimeError(f"agent '{spec.name}' is mapped to model '{model}' but no client was "
+                               f"built for it (clients: {sorted(self.llms)})") from None
 
     # ---- per-agent building blocks (shared by run_day and run_single) ----
     def _view(self, spec: AgentSpec, r: AgentResult, weights: dict[str, float]) -> dict:

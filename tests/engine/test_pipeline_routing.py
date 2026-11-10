@@ -54,16 +54,22 @@ def test_run_single_routes_like_run_day(tmp_path):
     assert r.labels("m1") == {"spoke"} and r.labels("cio") == {"hub"}
 
 
-def test_missing_model_mapping_falls_back_to_default_llm(tmp_path):
-    # agent absent from `models`, and a model with no client in `llms`
+def test_agent_absent_from_models_falls_back_to_default_llm(tmp_path):
     models = dict(MODELS)
     del models["m1"]
-    r = Routed(tmp_path, models=models, only=("hub-m",))
+    r = Routed(tmp_path, models=models)
     r.pipe.run_single("m1", ASOF, snapshot(), WEIGHTS, STATE, {})
-    r.pipe.run_single("m2", ASOF, snapshot(), WEIGHTS, STATE, {})  # spoke-m has no client
     r.pipe.run_single("cio", ASOF, snapshot(), WEIGHTS, STATE, {})
-    assert r.labels("m1") == {"default"} and r.labels("m2") == {"default"}
+    assert r.labels("m1") == {"default"}
     assert r.labels("cio") == {"hub"}
+
+
+def test_mapped_model_without_a_client_raises_instead_of_falling_back(tmp_path):
+    import pytest
+    r = Routed(tmp_path, only=("hub-m",))  # spoke-m is mapped but has no client
+    with pytest.raises(RuntimeError, match="spoke-m"):
+        r.pipe.run_single("m2", ASOF, snapshot(), WEIGHTS, STATE, {})
+    assert r.served == []
 
 
 def test_no_routing_uses_single_llm(tmp_path):
