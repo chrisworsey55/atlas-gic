@@ -255,20 +255,21 @@ tests/...                              # one test module per task
 - [ ] **Step 4: Run** `pytest tests/golden -q`. Expected: PASS.
 - [ ] **Step 5: Commit** `feat: build one client per model under a shared budget`.
 
-### Task B5 (optional): `atlas probe --model`
+### Task B5: The contamination probe covers every model in use
 
 **Files:**
-- Modify: `atlas/cli.py`
-- Test: `tests/golden/test_probe_cli.py`
+- Modify: `atlas/cli.py` (`cmd_probe`), `atlas/backtest/contamination.py` (only if the score type needs a model field), `atlas/backtest/report.py` (probe section)
+- Test: `tests/golden/test_probe_models.py`
 
 **Interfaces:**
-- Produces: `probe --run-dir PATH [--samples N] [--model MODEL]` (optional; help says so): probes the named model (default `Settings.model`), priced via `prices_for`, refused if unknown; `contamination.json` records the model; the report line names it.
+- Consumes: B1-B4 (`Settings.agent_model`, `prices_for`, `run.llms`, shared `Budget`).
+- Produces: `probe --run-dir PATH [--samples N] [--model MODEL] [--yes]`: by default probes EACH distinct effective model (hub, spoke, per-agent overrides, in a stable order) on the SAME anonymised snapshots (same seed `PROBE_SEED`, `N` samples per model); `--model` restricts to one (priced via `prices_for`, refused with exit 2 if unknown). `contamination.json` keeps its existing top-level fields for the hub model (`Settings.model`) and adds `models: {model: {n, date_hits, ticker_hits, date_rate, ticker_rate, failed, chance_date, chance_ticker, spend_usd, by_period}}`. The cost estimate/confirmation covers all models; spend goes to `probe.json` (total plus `by_model`) and into the shared budget once. `build_report(..., contamination=...)` renders one table row per model (date-hit rate vs chance, ticker hits with the sector-label caveat, spend), keeps the existing wording ("not a measure of skill"), and states which models were probed. A model whose probe was cut short by the budget is marked incomplete.
 
-- [ ] **Step 1: Write the failing tests**: `test_probe_model_flag_uses_that_client_and_prices`; `test_probe_unknown_model_without_prices_exits_2`; `test_contamination_json_records_model`.
-- [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement.**
+- [ ] **Step 1: Write the failing tests**: `test_default_probes_every_distinct_model_on_the_same_snapshots` (record the user messages each stub client receives: the sets are identical across models); `test_model_flag_restricts_to_one_model`; `test_unknown_model_without_prices_exits_2`; `test_single_model_run_probes_one_model_and_json_is_backward_compatible`; `test_contamination_json_has_per_model_scores_and_top_level_hub_fields`; `test_estimate_and_confirmation_cover_all_models`; `test_probe_spend_split_by_model_and_counted_once_in_the_cap`; `test_budget_stop_marks_the_current_model_incomplete_and_skips_the_rest_cleanly`; `test_report_has_one_row_per_model_and_never_claims_skill`; `test_verdict_section_unchanged_with_probe`; `test_probe_prompts_still_contain_no_real_ticker_or_date_for_every_model`.
+- [ ] **Step 2: Run** `pytest tests/golden/test_probe_models.py -v`. Expected: FAIL.
+- [ ] **Step 3: Implement** by looping the existing single-model probe body over models; reuse the snapshot selection (deterministic from the seed) once.
 - [ ] **Step 4: Run** `pytest -q`. Expected: PASS.
-- [ ] **Step 5: Commit** `feat: optional probe --model`.
+- [ ] **Step 5: Commit** `feat: probe every model in use`.
 
 ### Task B6: Docs and Limitations
 
@@ -277,9 +278,9 @@ tests/...                              # one test module per task
 - Test: `tests/test_docs_consistency.py`
 
 **Interfaces:**
-- Produces: README sections for `spoke_model`, per-agent `model`, the cutoff table (what it is, that it is month-granular and copied from the Models overview page, how to re-check it), the validation-days requirement for autoresearch, `atlas errors`; example YAML shows `spoke_model: claude-haiku-5-5` commented; `LIMITATIONS` gains the cutoff-table caveat and the probe-covers-one-model note.
+- Produces: README sections for `spoke_model`, per-agent `model`, the cutoff table (what it is, that it is month-granular and copied from the Models overview page, how to re-check it), the validation-days requirement for autoresearch, `atlas errors`; example YAML shows `spoke_model: claude-haiku-5-5` commented; `LIMITATIONS` gains the cutoff-table caveat and the note that the probe covers every model in use (cost scales with the number of models).
 
-- [ ] **Step 1: Write the failing tests**: `test_every_documented_cli_flag_exists` (parse the README code blocks, run each `--help`); `test_limitations_mention_cutoff_table_and_probe_scope`; `test_run_example_yaml_loads`.
+- [ ] **Step 1: Write the failing tests**: `test_every_documented_cli_flag_exists` (parse the README code blocks, run each `--help`); `test_limitations_mention_cutoff_table_and_probe_models`; `test_run_example_yaml_loads`.
 - [ ] **Step 2: Run.** Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `pytest -q` (whole suite, about 4 minutes). Expected: PASS.
@@ -289,7 +290,7 @@ tests/...                              # one test module per task
 
 ## Self-review notes
 
-- **Spec coverage:** error log 2.1 (A1-A4), hub-and-spoke 2.2 (B1-B6 incl. cutoff table, budget, estimate, report, checkpoint), confirmation and abstention accounting 2.3 (C1-C4). The spec's optional probe flag is B5.
+- **Spec coverage:** error log 2.1 (A1-A4), hub-and-spoke 2.2 (B1-B6 incl. cutoff table, budget, estimate, report, checkpoint), confirmation and abstention accounting 2.3 (C1-C4). The spec's all-models probe (decision of 2026-11-10) is B5.
 - **Type consistency:** `ErrorLog` (A1) is the only logger type used by A2-A4; `Budget` (B2) is what `CachedLLM(budget=...)` takes in B3-B4; `DayPairs` (C2) is what the CLI scorer returns in C2/C4; `Settings` fields added in C1 and B1 do not overlap.
 - **Order and independence:** A, C and B do not depend on each other except that B4 touches `build_run` and `cmd_report` after A3/A4 did, so build in order A, C, B; each part's final task leaves the suite green.
 - **Known follow-ups not planned:** dynamic hub dispatch, portfolio-level edit scoring, error-log shipping/alerting.

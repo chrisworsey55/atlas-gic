@@ -34,7 +34,8 @@ Scope: three independent changes to the existing `atlas/` package. No live or pa
 * **Training cutoff:** a new `MODEL_TRAINING_CUTOFFS` table (from Anthropic's Models overview page, read 2026-11-07: Jun 2026 for Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.1, taken as the month end, 2026-06-30). If any model in use has a table entry later than `Settings.model_cutoff`, the run is refused (exit 2) naming the model and date. The shipped default becomes `2026-06-30`. A model not in the table produces a warning, and the user must set `model_cutoff` for it.
 * **Checkpoint/resume:** the per-agent model is part of the stored agents record, and `spoke_model` is part of the stored settings, so changing either on an existing run is refused by the existing check. The checkpoint gains an optional `spent_by_model`.
 * **Report:** the Agents table gets a `model` column, the Cost section a per-model line, and Limitations says mixed models mean results cannot be attributed to the hub or the spokes.
-* **Not changed:** the contamination probe still probes `Settings.model` only (documented; a `--model` flag is an optional task). Autoresearch proposals use the hub model; replays use each agent's own model.
+* **Contamination probe covers every model in use** (decision of 2026-11-10): `atlas probe` probes each distinct effective model (hub, spoke and any per-agent override) on the SAME anonymised snapshots (same seed), so the rates are comparable. `--model MODEL` restricts it to one. Each model's score, chance level and spend are stored under `models` in `contamination.json` (the existing top-level fields keep the hub model's score for compatibility) and the report shows one row per model. Probe cost scales with the number of models; all spend stays under the one shared budget (a `probe.json` bucket, split by model).
+* **Not changed:** autoresearch proposals use the hub model; replays use each agent's own model.
 
 ### 2.3 Validation confirmation and abstention accounting
 
@@ -62,4 +63,16 @@ Scope: three independent changes to the existing `atlas/` package. No live or pa
 
 ## 5. Out of scope
 
-Dynamic hub dispatch, portfolio-level edit scoring, per-model contamination probes (beyond an optional flag), error-log shipping/alerting, any live or paper trading.
+Dynamic hub dispatch, portfolio-level edit scoring, error-log shipping/alerting, any live or paper trading.
+
+## 6. Which agents are hub and which are spokes
+
+| Role | Agents | Layer | Default model after this change |
+|---|---|---|---|
+| Spoke | `macro_rates`, `macro_volatility`, `macro_dollar_commodities` | 1 | `spoke_model` (e.g. Haiku 5.5) |
+| Spoke | `sector_semiconductors`, `sector_financials`, `sector_energy`, `sector_healthcare` | 2 | `spoke_model` |
+| Spoke | `superinvestor_druckenmiller`, `superinvestor_ackman` | 3 | `spoke_model` |
+| Hub | `cro`, `cio`, `execution` | 4 | `Settings.model` (e.g. Sonnet 5.5) |
+| Control (not one of the 12) | `control` | 4 | `spoke_model` (compared against the spokes) |
+
+Nine spokes and three hub agents. Any agent can be moved with a per-agent `model:` in `agents.yaml`.
