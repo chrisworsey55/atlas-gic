@@ -50,7 +50,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
-from typing import Callable, Literal, Sequence
+from typing import Callable, Literal, NamedTuple, Sequence
 
 from atlas.autoresearch.gitops import GitOps
 from atlas.backtest.runner import Periods, _demap_results
@@ -90,7 +90,17 @@ no markdown code fences around it.
 
 _FENCE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*\n(.*?)\n?```\s*$", re.DOTALL)
 
-RunOneDay = Callable[[date, str], "tuple[list[float], list[float]] | None"]
+
+
+class DayPairs(NamedTuple):
+    """One day's scored picks with their tickers, so abstentions can be imputed.
+    The three lists are aligned by position."""
+    tickers: list[str]
+    convictions: list[float]
+    excess: list[float]
+
+
+RunOneDay = Callable[[date, str], "DayPairs | tuple[list[float], list[float]] | None"]
 Decision = Literal["kept", "reverted", "rejected", "uncalibrated", "error"]
 
 
@@ -188,45 +198,92 @@ class PairedResult:
     n_days_requested: int = 0
     old_empty: int = 0
     new_empty: int = 0
+    old_imputed: int = 0
+    new_imputed: int = 0
+
+
+def _split(agent: str, d: date, out) -> tuple[list[str] | None, list[float], list[float]]:
+    """(tickers or None for a plain 2-tuple, convictions, excess); ValueError if misaligned."""
+    if isinstance(out, DayPairs):
+        t, c, e = out
+        if not len(t) == len(c) == len(e):
+            raise ValueError(f"{agent} {d}: {len(t)} tickers, {len(c)} convictions, {len(e)} excess returns")
+        if len(set(t)) != len(t):
+            raise ValueError(f"{agent} {d}: duplicate tickers in one day's picks")
+        return list(t), list(c), list(e)
+    if len(out[0]) != len(out[1]):
+        raise ValueError(f"{agent} {d}: {len(out[0])} convictions vs {len(out[1])} excess returns")
+    return None, list(out[0]), list(out[1])
+
+
+def _impute(own: tuple[list[str], list[float], list[float]],
+            other: tuple[list[str], list[float], list[float]]) -> tuple[list[float], list[float], int]:
+    """Samples for `own` side: its own pairs plus, for every ticker only `other` picked, a
+    conviction-0 pair carrying `other`'s excess (cost-adjusted; an approximation). A NaN
+    excess is never imputed. Returns (convictions, excess, number imputed)."""
+    have = set(own[0])
+    c, e = list(own[1]), list(own[2])
+    k = 0
+    for t, ex in zip(other[0], other[2]):
+        if t not in have and ex == ex:
+            c.append(0.0); e.append(ex); k += 1
+    return c, e, k
 
 
 def paired_replay(agent: str, old_prompt: str, new_prompt: str, days: list[date],
-                  run_one_day: RunOneDay) -> PairedResult:
+                  run_one_day: RunOneDay, *, impute: bool = False,
+                  min_days: int = MIN_REPLAY_DAYS) -> PairedResult:
     """Rank IC of the agent's picks under each prompt, over the SAME days only.
 
     A day is comparable when both prompts returned non-empty (convictions, excess) pairs; at
     least MIN_REPLAY_DAYS distinct comparable days are required (InsufficientReplayDays
     otherwise). Restricting to comparable days alone is gameable (a prompt that abstains on
     its bad days drops them from both sides): ``edit_gate`` must be applied to the result.
+
+    With ``impute`` and ``DayPairs`` results on both sides of a comparable day, a ticker only
+    one prompt picked enters the other side with conviction 0 and the same excess, so
+    dropping a loser no longer removes it from the sample. The IC uses the imputed samples;
+    ``old_pairs``/``new_pairs`` stay RAW counts (what ``edit_gate`` compares). Plain 2-tuples
+    are never imputed.
     """
     oc, oe, nc, ne = [], [], [], []
     n = 0
+    imputed = {"old": 0, "new": 0}
     fails = {"old": 0, "new": 0}
     empty = {"old": 0, "new": 0}
     requested = sorted(set(days))
+    raw = {"old": 0, "new": 0}
     for d in requested:
         old = run_one_day(d, old_prompt)
         new = run_one_day(d, new_prompt)
+        parts = {}
         for key, out in (("old", old), ("new", new)):
             if out is None:
                 fails[key] += 1
                 continue
-            if len(out[0]) != len(out[1]):
-                raise ValueError(f"{agent} {d}: {len(out[0])} convictions vs {len(out[1])} excess returns")
-            if not out[0]:
+            parts[key] = _split(agent, d, out)
+            if not parts[key][1]:
                 empty[key] += 1
-        if old is None or new is None or not old[0] or not new[0]:
+        if "old" not in parts or "new" not in parts or not parts["old"][1] or not parts["new"][1]:
             continue
-        oc += old[0]; oe += old[1]; nc += new[0]; ne += new[1]
+        o, nw = parts["old"], parts["new"]
+        raw["old"] += len(o[1]); raw["new"] += len(nw[1])
+        if impute and o[0] is not None and nw[0] is not None:
+            c1, e1, k1 = _impute(o, nw)
+            c2, e2, k2 = _impute(nw, o)
+            imputed["old"] += k1; imputed["new"] += k2
+        else:
+            c1, e1, c2, e2 = o[1], o[2], nw[1], nw[2]
+        oc += c1; oe += e1; nc += c2; ne += e2
         n += 1
-    if n < MIN_REPLAY_DAYS:
+    if n < min_days:
         raise InsufficientReplayDays(
             f"{agent}: only {n} of {len(requested)} replay days with picks under both prompts "
-            f"(< {MIN_REPLAY_DAYS}); failures old {fails['old']} new {fails['new']}, "
+            f"(< {min_days}); failures old {fails['old']} new {fails['new']}, "
             f"empty old {empty['old']} new {empty['new']}")
     old_ic, new_ic = rank_ic(oc, oe), rank_ic(nc, ne)
-    return PairedResult(old_ic, new_ic, n, new_ic - old_ic, fails["old"], fails["new"], len(oc), len(nc),
-                        len(requested), empty["old"], empty["new"])
+    return PairedResult(old_ic, new_ic, n, new_ic - old_ic, fails["old"], fails["new"], raw["old"], raw["new"],
+                        len(requested), empty["old"], empty["new"], imputed["old"], imputed["new"])
 
 
 def edit_gate(r: PairedResult, cfg: Settings) -> str | None:
@@ -270,7 +327,7 @@ class DayContext:
 
 def build_run_one_day(pipeline: Pipeline, agent_name: str,
                       day_context: Callable[[date], DayContext | None],
-                      scorer: Callable[[AgentResult, date], tuple[list[float], list[float]]],
+                      scorer: Callable[[AgentResult, date], "DayPairs | tuple[list[float], list[float]]"],
                       *, horizon: int = 1) -> RunOneDay:
     """run_one_day for paired_replay: re-run only `agent_name` with the given prompt on the
     day's recorded upstream results, called exactly as the runner calls it (same asof_label,
@@ -495,7 +552,8 @@ def run_autoresearch(cfg: Settings, *, repo: Path, periods: Periods, trading_day
             created = True
             git.write_file(prompt_path, new)
             git.commit_file(prompt_path, f"autoresearch: targeted edit of {target} prompt")
-            result = paired_replay(target, current, new, days, guarded)
+            result = paired_replay(target, current, new, days, guarded,
+                                    impute=cfg.impute_abstentions)
             gate = edit_gate(result, cfg)
             if gate is not None:
                 decision, reason = "rejected", gate

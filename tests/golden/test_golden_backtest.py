@@ -445,8 +445,8 @@ def test_autoresearch_replay_reconstructs_the_runs_inputs_exactly(golden, tmp_pa
             assert res.output.model_dump(mode="json") == rec["output"], (name, day)
     assert stub.calls == 0
     run = replay.run_one_day("sector_energy")
-    conv, exc = run(date(2024, 1, 10), replay.prompts["sector_energy"])
-    assert len(conv) == len(exc) > 0
+    tickers, conv, exc = run(date(2024, 1, 10), replay.prompts["sector_energy"])
+    assert len(tickers) == len(conv) == len(exc) > 0
     assert run.horizon == 1
     assert stub.calls == 0
 

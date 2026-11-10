@@ -1005,11 +1005,12 @@ class Replay:
             self._snaps[day] = _filter(snap, set(r.universe))
         return DayContext(self._snaps[day], copy.deepcopy(h["weights"]), copy.deepcopy(h["state"]), dict(res))
 
-    def scorer(self, res: AgentResult, day: date) -> tuple[list[float], list[float]]:
-        """Horizon-1 (signed conviction, excess) pairs, as ScoreStore scores them."""
+    def scorer(self, res: AgentResult, day: date):
+        """Horizon-1 (tickers, signed conviction, excess) as ScoreStore scores them."""
+        from atlas.autoresearch.loop import DayPairs
         i = self.all_days.index(day)
         if i + 1 >= len(self.all_days) or res.output is None:
-            return [], []
+            return DayPairs([], [], [])
         nxt = self.all_days[i + 1]
         bench = self.run.pipeline.specs[res.agent].benchmark or BENCHMARK
         rows = {}
@@ -1022,7 +1023,7 @@ class Replay:
             ex = excess_return(tp, bp, 1, self.run.cost_frac, sign)
             if ex == ex:
                 rows[p.ticker] = (sign * p.conviction, ex)
-        return [c for c, _ in rows.values()], [e for _, e in rows.values()]
+        return DayPairs(list(rows), [c for c, _ in rows.values()], [e for _, e in rows.values()])
 
     def run_agent(self, name: str, day: date, prompt: str) -> AgentResult:
         ctx = self.context(day)
