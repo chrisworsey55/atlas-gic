@@ -156,3 +156,129 @@ def test_unknown_level_is_coerced_to_error(tmp_path):
     log.event("a", level="warning")
     log.event("b", level="bogus")
     assert [e["level"] for e in read_events(p)] == ["warning", "error"]
+
+
+class Bad:
+    def __str__(self):
+        raise RuntimeError("no str")
+
+
+class BadExc(Exception):
+    def __str__(self):
+        raise RuntimeError("no str")
+
+
+def test_unprintable_values_degrade_but_record_is_written(tmp_path):
+    p = tmp_path / "errors.log"
+    log = ErrorLog(p)
+    log.event("k", "m", bad=Bad(), nested={Bad(): [Bad()]})
+    log.event("k2", Bad())
+    log.event(Bad(), "m", agent=Bad(), reason=Bad(), day=Bad())
+    try:
+        raise BadExc()
+    except BadExc as e:
+        log.exception("x", e)
+    recs = read_events(p)
+    assert len(recs) == 4
+    assert recs[0]["fields"]["bad"] == "<unprintable Bad>"
+    assert recs[1]["message"] == "<unprintable Bad>"
+    assert recs[2]["kind"] == "<unprintable Bad>" and recs[2]["day"] == "<unprintable Bad>"
+    assert recs[3]["fields"]["exc_type"] == "BadExc"
+    assert recs[3]["message"] == "<unprintable BadExc>"
+
+
+def test_every_string_field_is_sanitised(tmp_path):
+    p = tmp_path / "errors.log"
+    ErrorLog(p).event(f"k-{CANARY}", f"m-{CANARY}", agent=f"a-{CANARY}", reason=f"r-{CANARY}",
+                      day=f"d-{CANARY}", **{f"f-{CANARY}": f"v-{CANARY}"})
+    assert "CANARY" not in p.read_text()
+
+
+def test_exception_message_present_and_redacted(tmp_path):
+    p = tmp_path / "errors.log"
+    ErrorLog(p).exception("x", ValueError(f"disk full key {CANARY} at https://h.example/p?api_key=CANARY"))
+    rec = read_events(p)[0]
+    assert rec["message"].startswith("disk full key <redacted>")
+    assert "CANARY" not in p.read_text()
+
+
+def test_each_event_is_fsynced(tmp_path, monkeypatch):
+    calls = []
+    real = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (calls.append(fd), real(fd))[1])
+    log = ErrorLog(tmp_path / "errors.log")
+    for _ in range(3):
+        log.event("k")
+    assert len(calls) == 3
+
+
+def test_rotation_boundary_is_exact(tmp_path):
+    probe = tmp_path / "probe.log"
+    ErrorLog(probe).event("k", "m" * 50)
+    n = probe.stat().st_size
+    p = tmp_path / "errors.log"
+    log = ErrorLog(p, max_bytes=2 * n)
+    log.event("k", "m" * 50)
+    log.event("k", "m" * 50)
+    assert not (tmp_path / "errors.log.1").exists() and p.stat().st_size == 2 * n
+    log.event("k", "m" * 50)
+    assert (tmp_path / "errors.log.1").exists() and p.stat().st_size == n
+
+
+def test_concurrent_writes_across_rotation_lose_nothing(tmp_path):
+    p = tmp_path / "errors.log"
+    log = ErrorLog(p, max_bytes=200_000)
+    errs = []
+
+    def work(t):
+        try:
+            for i in range(50):
+                log.event("k", "m" * 100, t=t, i=i)
+        except Exception as e:  # pragma: no cover
+            errs.append(e)
+
+    ts = [threading.Thread(target=work, args=(t,)) for t in range(16)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errs
+    b = tmp_path / "errors.log.1"
+    assert b.exists()
+    recs = read_events(b) + read_events(p)  # raises on any malformed line
+    assert len(recs) == 800
+    assert len({(r["fields"]["t"], r["fields"]["i"]) for r in recs}) == 800
+
+
+def test_torn_line_is_repaired_before_next_append(tmp_path):
+    p = tmp_path / "errors.log"
+    good = json.dumps({"kind": "old"})
+    p.write_text(good + "\n" + '{"kind":"tor')
+    os.chmod(p, 0o600)
+    ErrorLog(p).event("a")
+    ErrorLog(p).event("b")
+    kinds = [e["kind"] for e in read_events(p)]
+    assert kinds == ["old", "log_repaired", "a", "b"]
+    assert read_events(p, kind="b")[0]["kind"] == "b"
+    # a malformed line NOT followed by a marker is still corruption
+    p.write_text(good + "\nnot json\n" + good + "\n")
+    with pytest.raises(ValueError):
+        read_events(p)
+
+
+def test_rotation_failure_falls_back_to_live_file(tmp_path, monkeypatch):
+    monkeypatch.setattr("atlas.errorlog._warned", False)
+    p = tmp_path / "errors.log"
+    (tmp_path / "errors.log.1").mkdir()
+    log = ErrorLog(p, max_bytes=300)
+    for i in range(10):
+        log.event("k", "m" * 100, i=i)
+    assert [e["fields"]["i"] for e in read_events(p)] == list(range(10))
+
+
+def test_read_events_directory_and_blank_lines(tmp_path):
+    d = tmp_path / "d"
+    d.mkdir()
+    assert read_events(d) == []
+    p = tmp_path / "errors.log"
+    g = json.dumps({"kind": "k"})
+    p.write_text("\n" + g + "\n\n   \n" + g + "\n\n")
+    assert len(read_events(p)) == 2
