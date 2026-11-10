@@ -252,6 +252,24 @@ atlas probe --run-dir runs/pass2 --samples 30       # (optional) contamination p
   the report next to the real agents'.
 * `autoresearch` needs a clean git working tree, edits only `atlas/prompts/`, never pushes, and needs
   at least 40 train days. `anonymize: true` is refused for now (the prompt files name tickers).
+* Validation confirmation (`settings.confirm_on_validation`, default on): an edit that wins on train
+  days is NOT kept until the same paired replay also wins on the most recent validation days (only
+  days whose scoring exit is also inside validation; holdout is never touched). It must beat
+  `keep_margin` there too and pass the same edit gate, otherwise the decision is `unconfirmed` and
+  the edit is discarded. Requirements: at least `confirm_min_days` (default 20) usable validation
+  days, and, because the gate needs at least `rolling_ic_window` validation pairs, about
+  `rolling_ic_window / picks_per_day` days (window 60 with 1-2 picks a day needs 30-60 clean days).
+  `atlas autoresearch` refuses (exit 1) when the validation period is too short; the opt-out is
+  `settings.confirm_on_validation: false`, which is part of the stored run, so set it before the
+  backtest (changing it later means a new `run_dir`) and accept that edits are then judged on train
+  days alone. Each confirmation reuses the SAME validation days, so every attempt spends some of
+  them: validation is a repeatedly used sample, `max_edits` caps the attempts per command, and the
+  report's Autoresearch section counts the confirmations run over the whole log.
+* Replay gate settings: `min_pair_ratio` (default 0.95) rejects an edit whose new prompt yields fewer
+  than that share of the old prompt's scored pairs, and `impute_abstentions` (default true) scores a
+  ticker only one prompt picked as if the other prompt had repeated the pick, so abstaining is
+  neutral and cannot inflate the paired IC by itself. Dropping many picks is caught by
+  `min_pair_ratio`, not by the IC.
 * `probe` (optional) shows the model anonymised snapshots of the run's own days (opaque ids, rebased
   prices, relative day index, sector labels; never a real ticker or date) and asks it to guess the
   calendar date and real ticker. A high hit rate means the model can recognise those periods, so

@@ -152,6 +152,42 @@ def _table(df: pd.DataFrame) -> str:
     return "\n".join(lines) + "\n"
 
 
+_CONF_COLS = ["agent", "decision", "validation days", "old IC", "new IC", "diff", "margin", "confirmation"]
+
+
+def _confirm_of(e) -> dict | None:
+    c = getattr(e, "confirm", None)
+    return c if isinstance(c, dict) else None
+
+
+def _num_of(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _confirmation_section(edits: list) -> list[str]:
+    """Validation confirmation of train wins: a count over the WHOLE log and one row per edit that
+    has a `confirm` record (old logs without one simply have no rows)."""
+    confs = [(e, _confirm_of(e)) for e in edits]
+    ran = sum(1 for _, c in confs if c is not None and (_num_of(c.get("n_days_requested")) or 0) > 0)
+    out = [f"Validation confirmations run: {ran} (of {len(edits)} logged attempts, whole log).",
+           "Validation is a repeatedly used sample: every confirmation replays the same most recent "
+           "validation days, so each one partly spends them and a lucky edit becomes more likely the "
+           "more attempts are made.", ""]
+    rows = []
+    for e, c in confs:
+        if c is None:
+            continue
+        d = _num_of(c.get("n_days"))
+        rows.append([_err_text(e.agent), _err_text(e.decision), "n/a" if d is None else int(d),
+                     _f(_num_of(c.get("old_ic"))), _f(_num_of(c.get("new_ic"))),
+                     _f(_num_of(c.get("diff"))), _f(_num_of(c.get("margin"))), _err_text(c.get("reason"))])
+    if rows:
+        out += [_table(pd.DataFrame(rows, columns=_CONF_COLS))]
+    else:
+        out += ["No logged edit has a validation confirmation record.\n"]
+    return out
+
+
 # ------------------------------------------------------------------------------ periods
 
 _ERR_COLS = ["ts_utc", "level", "kind", "day", "agent", "reason", "message"]
@@ -458,6 +494,7 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
         md.append("")
         md.append(AUTORESEARCH_GAP)
     md.append("")
+    md += _confirmation_section(edits)
 
     # ---- null
     md += ["## Null test\n"]

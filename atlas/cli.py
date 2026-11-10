@@ -1078,6 +1078,7 @@ def cmd_autoresearch(args, llm_client=None) -> int:
     from atlas.autoresearch.gitops import DirtyWorkingTree, GitError, GitOps
     from atlas.autoresearch.loop import (
         HoldoutViolation, InsufficientReplayDays, last_safe_train_day, run_autoresearch,
+        validation_days,
     )
     rc = load_run_config(args.config)
     refuse_anonymize(rc, "autoresearch")
@@ -1097,6 +1098,21 @@ def cmd_autoresearch(args, llm_client=None) -> int:
     run = build_run(rc, fred_key=fred_key, llm_client=llm_client)
     stored_run(rc, run, "autoresearch")  # train/holdout split and settings of the STORED run (ruling U)
     replay = _make_replay(run)
+    if run.settings.confirm_on_validation:
+        # same eligibility as the loop: validation days whose scoring exit is also inside validation
+        eligible = len(validation_days(replay.all_days, run.periods, 1, n=len(replay.all_days) or 1))
+        need = run.settings.confirm_min_days
+        if eligible < need:
+            raise OperationalError(
+                f"autoresearch refused: the validation period has {eligible} usable trading days (days whose "
+                f"scoring exit is also inside validation), fewer than confirm_min_days {need}. Every kept edit "
+                f"must be confirmed on validation days: give the validation period at least {need} trading "
+                "days, or set `settings.confirm_on_validation: false` in the run config BEFORE the backtest "
+                "(it is part of the stored run, so changing it means a new run_dir; edits are then judged "
+                "on train days alone and the validation confirmation is lost). The real requirement is also pair-based: the "
+                f"confirmation needs at least rolling_ic_window ({run.settings.rolling_ic_window}) validation "
+                "pairs, i.e. about rolling_ic_window / picks_per_day days (window 60 with 1-2 picks a day "
+                "needs 30-60 clean days). Each confirmation reuses (spends) the same validation days.")
     spent = spend_so_far(rc.run_dir)
     remaining = run.settings.budget_usd - sum(spent.values())
     if remaining <= 0:

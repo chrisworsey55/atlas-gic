@@ -21,6 +21,8 @@ settings:
   rolling_ic_window: 20
   min_valid_agents: 8
   confirm_cost_usd: 25
+  # the 10-day validation period is too short for autoresearch's validation confirmation
+  confirm_on_validation: false
 data:
   prices: {source: csv, dir: prices}
   macro: {source: none}
