@@ -25,7 +25,9 @@ holds everything a run writes::
     autoresearch_log.jsonl one line per autoresearch attempt
     autoresearch_failures.sqlite  failures of autoresearch replay calls (kept separate)
     probe.json             spend of the (optional) contamination probe (counts against the cap)
-    contamination.json     (optional) probe result: rate, n, tolerance, seed, model, spend
+    contamination.json     (optional) probe result: rate, n, tolerance, seed, model, spend; the top-level
+                           fields are the first probed model's (the hub unless --model; see `model`),
+                           per-model results are under `models`
     probe_failures.sqlite  (optional) unusable probe replies, with their reason codes
     errors.log             JSON Lines error/event log (``atlas errors`` reads it; dry runs: dry_run/)
     prices/                price cache (unless data.cache_dir says otherwise)
@@ -1590,6 +1592,7 @@ def cmd_probe(args, llm_client=None) -> int:
         snap = run.store.snapshot(day, [ticker], rc.data.lookback_days)
         anon, _ = anonymize_snapshot(snap, {ticker: labels[ticker]})
         items.append((anon, day, ticker))
+    (run_dir / CONTAMINATION).unlink(missing_ok=True)  # an aborted probe must not leave an older result
     run.errors = open_error_log(run_dir / ERRORS_NAME)
     failures = FailureLog(run_dir / PROBE_FAILURES, error_log=run.errors)
     prev = _read_spend(run_dir / PROBE_STATE)
@@ -1598,15 +1601,20 @@ def cmd_probe(args, llm_client=None) -> int:
     # earlier spend is already subtracted in `remaining`, so this Budget starts from zero)
     shared = Budget(remaining)
     scores: dict[str, ContaminationScore] = {}
+    fatal: FatalApiError | None = None
+    fatal_model = ""
     try:
         for m in probed:
-            if any(sc.budget_exhausted for sc in scores.values()):
-                continue  # the cap is spent: later models are not started
+            if fatal is not None or any(sc.budget_exhausted for sc in scores.values()):
+                continue  # the cap is spent or the API rejected a request: later models are not started
             llm = CachedLLM(client_for(llm_client, settings, m), rc.llm_cache_path, m, prices[m], remaining,
                             budget=shared)
-            scores[m] = contamination_probe(items, llm, settings.tolerance_days, failures=failures,
-                                            max_tokens=settings.max_output_tokens,
-                                            agent=PROBE_AGENT if m == settings.model else f"{PROBE_AGENT}[{m}]")
+            try:
+                scores[m] = contamination_probe(items, llm, settings.tolerance_days, failures=failures,
+                                                max_tokens=settings.max_output_tokens,
+                                                agent=PROBE_AGENT if m == settings.model else f"{PROBE_AGENT}[{m}]")
+            except FatalApiError as e:  # recorded below; re-raised after the results are written
+                fatal, fatal_model = e, m
     finally:
         this_run = shared.spent_by_model()
         new_by = dict(prev_by)
@@ -1618,6 +1626,12 @@ def cmd_probe(args, llm_client=None) -> int:
     def entry(m: str) -> dict:
         sc = scores.get(m)
         spend = new_by.get(m, 0.0)
+        if m == fatal_model:  # the API rejected a request: its partial replies are not kept
+            return {"n": 0, "date_hits": 0, "ticker_hits": 0, "any_hits": 0, "rate": 0.0, "date_rate": 0.0,
+                    "ticker_rate": 0.0, "failed": 0, "chance_date": chance_d, "chance_ticker": chance_t,
+                    "spend_usd": spend, "by_period": {}, "requested_samples": samples,
+                    "budget_exhausted": False, "incomplete": True, "skipped": False, "failed_fatal": True,
+                    "error": escape_controls(sanitise(str(fatal), 300))}
         if sc is None:  # never started: an earlier model used up the cap
             return {"n": 0, "date_hits": 0, "ticker_hits": 0, "any_hits": 0, "rate": 0.0, "date_rate": 0.0,
                     "ticker_rate": 0.0, "failed": 0, "chance_date": chance_d, "chance_ticker": chance_t,
@@ -1639,7 +1653,7 @@ def cmd_probe(args, llm_client=None) -> int:
 
     models_out = {m: entry(m) for m in probed}
     head = probed[0]  # the hub, unless --model restricted the run: top-level fields are this model's
-    hs, he = scores[head], models_out[head]
+    hs, he = scores.get(head) or ContaminationScore(n=0, date_hits=0, ticker_hits=0, rate=0.0), models_out[head]
     out = {"n": hs.n, "date_hits": hs.date_hits, "ticker_hits": hs.ticker_hits,
            "any_hits": hs.any_hits, "rate": hs.rate, "date_rate": hs.date_rate,
            "ticker_rate": hs.ticker_rate, "chance_date_rate": chance_d, "chance_ticker_rate": chance_t,
@@ -1649,7 +1663,9 @@ def cmd_probe(args, llm_client=None) -> int:
            "requested_samples": samples, "spent_usd": prev + shared.spent_usd,
            "samples": [{"date": d.isoformat(), "ticker": t} for _, d, t in items[:hs.n]],
            "models": models_out, "models_in_use": in_use, "probed_models": probed}
-    _write_json(run_dir / CONTAMINATION, out)
+    _write_json(run_dir / CONTAMINATION, out)  # also after a fatal error: no stale file survives
+    if fatal is not None:
+        raise fatal
     esc = lambda x: escape_controls(sanitise(str(x), 200))  # noqa: E731
     rc_out = EXIT_OK
     for m in probed:
@@ -1759,7 +1775,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="(optional) number of snapshots to probe, spread over the run's days "
                         "(default %(default)s)")
     q.add_argument("--model", help="(optional) probe only this one model in use (default: every model in "
-                   "use: hub, spoke and per-agent overrides)")
+                   "use: hub, spoke and per-agent overrides). The top-level fields of contamination.json "
+                   "are then this model's (see `model`), and the run overwrites the file's models")
     q.add_argument("--yes", action="store_true", help="do not ask before spending above confirm_cost_usd")
     e = sub.add_parser("errors", help="print the run's error log (errors.log), oldest of the last N first",
                        description="Read-only: print the last events of the run's errors.log, one line "

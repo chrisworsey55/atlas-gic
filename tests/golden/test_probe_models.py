@@ -374,3 +374,91 @@ def test_probe_prompts_still_contain_no_real_ticker_or_date_for_every_model(mrun
             assert {i["sector"] for i in json.loads(user)["instruments"]} == {"Unclassified"}
             for s in c["samples"]:
                 assert s["date"] not in msg
+
+
+# ---------------------------------------------------------------------------- fix round 1
+
+class Rejecting(ProbeClient):
+    def complete(self, system, user, max_tokens):
+        from atlas.engine.llm import FatalApiError
+        self.calls.append((system, user, 0, 0))
+        raise FatalApiError(403, "permission_error", "this key cannot use the model sk-ant-SECRET0123456789")
+
+
+def test_fatal_error_on_the_second_model_keeps_the_first_models_results(mrun, keys, capsys):
+    (mrun / "contamination.json").write_text(json.dumps({"n": 99, "model": "stale"}))
+    cl = pair(spoke=Rejecting())
+    assert probe(mrun, cl) == 1
+    assert "HTTP 403" in capsys.readouterr().err
+    c = contamination(mrun)
+    assert c["model"] == HUB and c["models"][HUB]["n"] == 6 and c["n"] == 6  # not the stale file
+    sp = c["models"][SPOKE]
+    assert sp["failed_fatal"] is True and sp["incomplete"] is True and "SECRET" not in sp["error"]
+    assert json.loads((mrun / "probe.json").read_text())["by_model"][HUB] > 0  # spend recorded
+    assert main(["report", "--run-dir", str(mrun)]) == 0
+    sec = (mrun / "report" / "report.md").read_text().split("## Contamination probe (optional)")[1].split("\n## ")[0]
+    assert f"NOT probed: {SPOKE} (the API rejected a request" in sec
+
+
+def test_fatal_error_on_the_first_model_leaves_no_stale_file_and_skips_the_rest(mrun, keys):
+    (mrun / "contamination.json").write_text(json.dumps({"n": 99, "model": "stale"}))
+    cl = pair(hub=Rejecting())
+    assert probe(mrun, cl) == 1
+    assert cl[SPOKE].calls == []
+    c = contamination(mrun)
+    assert c["n"] == 0 and c["models"][HUB]["failed_fatal"] is True and c["models"][SPOKE]["skipped"] is True
+    assert main(["report", "--run-dir", str(mrun)]) == 0
+    sec = (mrun / "report" / "report.md").read_text().split("## Contamination probe (optional)")[1].split("\n## ")[0]
+    assert f"NOT probed: {HUB}" in sec and SPOKE in sec.split("NOT probed:")[1]
+
+
+def test_an_all_unusable_spoke_exits_1_but_keeps_the_results(mrun, keys, capsys):
+    assert probe(mrun, pair(spoke=ProbeClient("garbage"))) == 1
+    assert "unusable" in capsys.readouterr().err
+    c = contamination(mrun)
+    assert c["models"][SPOKE]["failed"] == 6 and c["models"][HUB]["failed"] == 0
+
+
+def test_failure_log_rows_are_labelled_per_model(mrun, keys):
+    from atlas.engine.failures import FailureLog
+    assert probe(mrun, pair(hub=ProbeClient("garbage"), spoke=ProbeClient("garbage")), samples=2) == 1
+    agents = set(FailureLog(mrun / "probe_failures.sqlite").rows()["agent"])
+    assert agents == {"contamination_probe", f"contamination_probe[{SPOKE}]"}
+
+
+def test_top_level_spent_usd_is_the_cumulative_probe_total_after_a_rerun(mrun, keys):
+    assert probe(mrun, pair(), samples=3) == 0
+    assert probe(mrun, pair(), samples=7) == 0
+    pj = json.loads((mrun / "probe.json").read_text())
+    c = contamination(mrun)
+    assert c["spent_usd"] == pytest.approx(pj["spent_usd"])  # cumulative over all runs, ALL models
+    assert sum(m["spend_usd"] for m in c["models"].values()) == pytest.approx(pj["spent_usd"])
+
+
+def test_restricted_run_is_documented_and_the_single_report_says_whose_results_they_are(mrun, keys, capsys):
+    from atlas.cli import build_parser
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["probe", "--help"])
+    assert "top-level fields" in " ".join(capsys.readouterr().out.split())
+    assert probe(mrun, pair(), "--model", SPOKE) == 0
+    assert main(["report", "--run-dir", str(mrun)]) == 0
+    sec = (mrun / "report" / "report.md").read_text().split("## Contamination probe (optional)")[1].split("\n## ")[0]
+    assert f"These results are for {SPOKE} only, not the hub model ({HUB})" in sec
+
+
+def test_report_has_per_period_lines_and_cumulative_spend_label(mrun, keys):
+    assert probe(mrun, pair()) == 0
+    assert main(["report", "--run-dir", str(mrun)]) == 0
+    sec = (mrun / "report" / "report.md").read_text().split("## Contamination probe (optional)")[1].split("\n## ")[0]
+    assert f"By period, {HUB}:" in sec and f"By period, {SPOKE}:" in sec and "date hits" in sec
+    assert "spend, cumulative" in sec and "shows only that run" in sec
+
+
+def test_an_unexpected_crash_leaves_no_stale_contamination_file(mrun, keys):
+    class Boom(ProbeClient):
+        def complete(self, system, user, max_tokens):
+            raise RuntimeError("boom")
+
+    (mrun / "contamination.json").write_text(json.dumps({"n": 99, "model": "stale"}))
+    assert probe(mrun, pair(spoke=Boom())) == 1
+    assert not (mrun / "contamination.json").exists()

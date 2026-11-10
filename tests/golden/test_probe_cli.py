@@ -308,7 +308,7 @@ def test_probe_fatal_api_error_aborts_clearly_without_a_contamination_result(run
     text = "".join(capsys.readouterr())
     assert "error: Anthropic API rejected the request (HTTP 403 permission_error)" in text
     assert "Traceback" not in text and FAKE_ANTHROPIC not in text
-    assert len(calls) == 1 and not (run / "contamination.json").exists()
+    assert len(calls) == 1 and json.loads((run / "contamination.json").read_text())["models"]["golden-stub-model"]["failed_fatal"]
 
 
 def test_probe_passes_max_output_tokens(run, keys, monkeypatch):  # noqa: F811

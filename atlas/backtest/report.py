@@ -340,11 +340,17 @@ def _coverage_lines(d: dict, models: dict) -> list[str]:
     system was checked."""
     probed = _model_names(d.get("probed_models")) or list(models)
     in_use = _model_names(d.get("models_in_use")) or probed
-    done = [m for m in probed if not (isinstance(models.get(m), dict) and models[m].get("skipped"))]
+    def bad(m):
+        e = models.get(m)
+        return isinstance(e, dict) and (e.get("skipped") or e.get("failed_fatal"))
+    done = [m for m in probed if not bad(m)]
     missing = [m for m in in_use if m not in done]
     out = ["Models probed: " + (", ".join(_err_text(m, 200) for m in done) if done else "none") + ".\n"]
+    failed = [m for m in probed if isinstance(models.get(m), dict) and models[m].get("failed_fatal")]
     if missing:
-        out.append("Warning: NOT probed: " + ", ".join(_err_text(m, 200) for m in missing)
+        out.append("Warning: NOT probed: " + ", ".join(
+            _err_text(m, 200) + (f" (the API rejected a request: {_err_text(models[m].get('error'), 200)})"
+                                 if m in failed else "") for m in missing)
                    + ". This probe does not cover the whole system: results that rely on these models "
                    "have no contamination check.\n")
     cut = [m for m in done if isinstance(models.get(m), dict) and models[m].get("incomplete")]
@@ -362,7 +368,7 @@ def _model_row(name: str, e) -> str:
         dr = float(e.get("date_rate", dh / n if n else 0.0))
         tr = float(e.get("ticker_rate", th / n if n else 0.0))
         cd, ct = e.get("chance_date"), e.get("chance_ticker")
-        status = ("skipped (budget)" if e.get("skipped") else "incomplete (budget)" if e.get("incomplete")
+        status = ("failed (API error)" if e.get("failed_fatal") else "skipped (budget)" if e.get("skipped") else "incomplete (budget)" if e.get("incomplete")
                   else "complete")
         cells = [str(n), str(dh), _f(dr, pct=True) if n else "n/a",
                  _f(float(cd), pct=True) if cd is not None else "n/a", str(th),
@@ -384,6 +390,10 @@ def _contamination_section(c, settings: Settings | None) -> list[str]:
         return _contamination_single(c, settings, [])
     coverage = _coverage_lines(d, models)
     if len(models) == 1:
+        top = d.get("model")
+        if settings is not None and isinstance(top, str) and top != settings.model:
+            coverage.append(f"These results are for {_err_text(top, 200)} only, not the hub model "
+                            f"({_err_text(settings.model, 200)}).\n")
         return _contamination_single(c, settings, coverage)
     tol = d.get("tolerance_days", settings.tolerance_days if settings is not None else None)
     out = [head, *coverage,
@@ -393,9 +403,20 @@ def _contamination_section(c, settings: Settings | None) -> list[str]:
            "1 / universe size. The sector label may identify the ticker; ticker hits are not evidence of date "
            "memory.\n",
            "| model | probes (n) | date hits | date-hit rate | chance (dates) | ticker hits | ticker-hit rate "
-           "| chance (tickers) | unusable replies | spend | status |", "|" + "---|" * 11]
+           "| chance (tickers) | unusable replies | spend, cumulative | status |", "|" + "---|" * 11]
     out += [_model_row(m, e) for m, e in models.items()]
     out.append("")
+    out.append("Spend is cumulative over every run of the probe in this run directory (the console line of "
+               "`atlas probe` shows only that run).\n")
+    for m, e in models.items():
+        bp = e.get("by_period") if isinstance(e, dict) else None
+        if isinstance(bp, dict) and bp:
+            try:
+                out.append(f"By period, {_err_text(m, 200)}: " + "; ".join(
+                    f"{_err_text(k, 40)} {int(v['date_hits'])}/{int(v['n'])} date hits "
+                    f"({_f(float(v['date_rate']), pct=True)})" for k, v in bp.items()) + ".\n")
+            except (KeyError, TypeError, ValueError, AttributeError):
+                out.append(f"By period, {_err_text(m, 200)}: n/a (unreadable).\n")
     out.append("Interpretation: each model was shown anonymised price data (no dates, no tickers) and asked to "
                "name the date and the ticker. A high date-hit rate, well above chance, means that model can "
                "place these snapshots in time, so trust results for those periods less. A low rate does not "
