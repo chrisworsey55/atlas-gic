@@ -24,7 +24,7 @@ from atlas.backtest.contamination import ContaminationScore  # noqa: E402,F401
 from atlas.backtest.nulltest import NullDistribution  # noqa: E402
 from atlas.backtest.runner import BacktestResult  # noqa: E402
 from atlas.config import Settings  # noqa: E402
-from atlas.engine.llm import sanitise  # noqa: E402
+from atlas.engine.llm import Budget, sanitise  # noqa: E402
 from atlas.errorlog import escape_controls  # noqa: E402
 from atlas.scoring.metrics import hit_rate, rank_ic  # noqa: E402
 from atlas.scoring.store import ScoreStore  # noqa: E402
@@ -342,19 +342,25 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                  null_meta: dict | None = None, null_source: str | None = None,
                  autoresearch_null_meta: list[dict | None] | None = None,
                  contamination: "ContaminationScore | dict | None" = None,
-                 errors: list[dict] | None = None) -> Path:
+                 errors: list[dict] | None = None,
+                 agent_models: dict[str, str] | None = None,
+                 spent_by_model: dict[str, float] | None = None) -> Path:
     """`ablation_by_period` (optional, period name -> ablation dict or None, plus "all") renders
     the CIO ablation per period with the holdout as the headline; without it the single
     `ablation` dict is shown as before. `contamination` (optional, a ContaminationScore or its
     dict form from contamination.json) adds a "Contamination probe (optional)" section; without
     it the section is absent. `errors` (optional, the events of errors.log) fills the "Errors"
-    section (None -> "not provided"). Neither changes the verdict."""
+    section (None -> "not provided"). Neither changes the verdict. `agent_models` (agent ->
+    model) and `spent_by_model` (model -> USD) matter only when more than one model is in use:
+    then the Agents table gets a `model` column, the Cost section one line per model and the
+    Limitations a mixed-models sentence; a single-model report is unchanged."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cutoff = settings.model_cutoff if settings is not None else None
     k = settings.shrinkage_k if settings is not None else 20.0
     failures = failures if failures is not None else pd.DataFrame()
     holdout_edit_ics = holdout_edit_ics or {}
+    mixed = agent_models is not None and len(set(agent_models.values())) > 1
 
     ranges = _period_ranges(result, cutoff)
     eq, spy, bsk = _norm(result.equity), _norm(result.spy), _norm(result.basket)
@@ -451,6 +457,8 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
                       "failures": int(fcount.get(a, 0))})
     adf = pd.DataFrame(arows, columns=["agent", "n_scored", "hit_rate", "rank_ic", "shrunk_ic",
                                        "final_weight", "failures"])
+    if mixed:
+        adf.insert(1, "model", [agent_models.get(a, "n/a") for a in adf["agent"]])
     adf.to_csv(out_dir / "agents.csv", index=False)
     md += ["## Agents\n",
            "Control-agent rows are shown but excluded from every real-agent mean/median. "
@@ -572,10 +580,21 @@ def build_report(result: BacktestResult, scores: ScoreStore, null: NullDistribut
     per_day = f"{cost_usd / n_days:.4f}" if n_days else "n/a"
     md += ["## Cost\n", f"Total API cost: ${cost_usd:.2f} over {n_days} trading days "
            f"(${per_day} per trading day).\n"]
+    if mixed and spent_by_model:
+        unattr = Budget.UNATTRIBUTED
+        md += ["Cost by model (one hard budget covers all of them):\n"]
+        md += [f"- {m}: ${v:.2f}" for m, v in sorted(spent_by_model.items()) if m != unattr]
+        if unattr in spent_by_model:
+            md.append(f"- {unattr}: ${spent_by_model[unattr]:.2f} (autoresearch, older-model checks and "
+                      "spend restored from a checkpoint written before per-model tracking)")
+        md.append("")
 
     # ---- limitations
     md += ["## Limitations\n"]
     md += [f"- {x}" for x in list(result.limitations) + EXTRA_LIMITATIONS]
+    if mixed:
+        md.append("- Mixed models: results cannot be attributed to the hub or the spokes (models: "
+                  + ", ".join(sorted(set(agent_models.values()))) + ").")
     md.append("")
     if result.halted:
         md.append(f"- Run HALTED: {result.halt_reason}")

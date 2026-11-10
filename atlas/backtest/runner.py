@@ -332,6 +332,8 @@ class _State:
     basket: dict[date, float] = field(default_factory=dict)
     bench_ref: dict[str, float] = field(default_factory=dict)
     spent_usd: float = 0.0
+    # per-model split of spent_usd (hub-and-spoke runs only; absent in single-model checkpoints)
+    spent_by_model: dict[str, float] | None = None
     predlog_head: tuple[int, str | None] = (0, None)
     halted: bool = False
     halt_reason: str | None = None
@@ -341,7 +343,7 @@ class _State:
 
     def to_json(self) -> dict:
         ds = lambda m: {dump_date(k): v for k, v in sorted(m.items())}  # noqa: E731
-        return {
+        out = {
             "version": STATE_VERSION, "fingerprint": self.fingerprint,
             "last_completed_day": dump_date(self.last_completed_day) if self.last_completed_day else None,
             "portfolio": {"cash": self.cash, "positions": dict(sorted(self.positions.items()))},
@@ -354,6 +356,9 @@ class _State:
             "skipped": ds(self.skipped), "risk_errors": ds(self.risk_errors),
             "last_known_prices": self.last_known,
         }
+        if self.spent_by_model is not None:
+            out["spent_by_model"] = dict(sorted(self.spent_by_model.items()))
+        return out
 
     @classmethod
     def from_json(cls, s: dict) -> "_State":
@@ -373,7 +378,21 @@ class _State:
             halted=bool(s["halted"]), halt_reason=s["halt_reason"],
             skipped=dl(s["skipped"]), risk_errors=dl(s["risk_errors"]),
             last_known=dict(s["last_known_prices"]),
+            spent_by_model=_load_by_model(s.get("spent_by_model")),
         )
+
+
+def _load_by_model(raw) -> dict[str, float] | None:
+    """The optional per-model spend of a checkpoint (None if absent: older checkpoints)."""
+    if raw is None:
+        return None
+    try:
+        out = {str(k): float(v) for k, v in raw.items()}
+    except (AttributeError, TypeError, ValueError):
+        raise ResumeRefused("checkpoint spent_by_model is corrupt") from None
+    if not all(math.isfinite(v) and v >= 0 for v in out.values()):
+        raise ResumeRefused("checkpoint spent_by_model is corrupt")
+    return out
 
 
 def clear_halt(checkpoint: Checkpoint) -> None:
@@ -499,8 +518,10 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
     One continuous portfolio spans all three periods; use ``cfg.periods.period_of`` to split
     the result per period. ``history_path`` (optional) receives one JSON line per day (see
     ``read_day_history``): the weights and state the pipeline was given and the day's fills.
-    All LLM calls and spend accounting go through ONE object,
-    ``pipeline.llm``: its spend is restored from the checkpoint so the budget spans resumes. ``run_dir`` holds the dry-run stub cache (a temp dir if omitted).
+    All spend accounting goes through ONE Budget, that of
+    ``pipeline.llm`` (in a hub-and-spoke run every model's CachedLLM in ``pipeline.llms`` shares
+    it): the checkpoint's total is restored into it once so the cap spans resumes, and
+    multi-model runs also checkpoint ``spent_by_model``. ``run_dir`` holds the dry-run stub cache (a temp dir if omitted).
     Raises CostConfirmationRequired, RunPaused, ResumeRefused (see module docstring).
     """
     elog = error_log if error_log is not None else NullErrorLog()
@@ -576,10 +597,30 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                             if sp.benchmark else sp for n, sp in pipeline.specs.items()}
 
         if raw is not None:
+            # ONCE, on the budget every model's CachedLLM shares (raise-only, so never doubled)
             active_llm.restore_spent(st.spent_usd)
             weightbook.save(st.weights)  # undo any update made by an uncommitted day
             if st.halted:
                 log.warning("run is HALTED (%s): no orders until clear_halt()", st.halt_reason)
+
+        # per-model spend (hub-and-spoke runs): the checkpoint's split plus what each model spent
+        # since the restore; without a stored split (an older checkpoint) the shared budget's own
+        # split, in which the restored total is Budget.UNATTRIBUTED
+        budget = active_llm.budget
+        per_model = not cfg.dry_run and len(set((pipeline.models or {}).values()) | {pipeline.llm.model}) > 1
+        stored_by_model = st.spent_by_model
+        at_restore = budget.spent_by_model()
+
+        def by_model() -> dict[str, float] | None:
+            if not per_model:
+                return None
+            if stored_by_model is None:
+                return budget.spent_by_model()
+            out = dict(stored_by_model)
+            for m, v in budget.spent_by_model().items():
+                if v > at_restore.get(m, 0.0):
+                    out[m] = out.get(m, 0.0) + (v - at_restore.get(m, 0.0))
+            return out
 
         portfolio = Portfolio(cash=st.cash, positions=dict(st.positions))
         cost_frac = 2 * s.slippage_bps / 1e4
@@ -589,6 +630,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
 
         def pause(reason: str, day: date, failed: dict[str, str], kind: str) -> RunPaused:
             committed.spent_usd = active_llm.spent_usd
+            committed.spent_by_model = by_model()
             checkpoint.save(committed.to_json())
             _emit(elog, "event", "run_paused", reason, level="warning", day=day, pause_kind=kind, failed=failed)
             return RunPaused(reason, day, failed, kind)
@@ -626,6 +668,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
                 raise pause(f"LLM budget exceeded: {e}", T, {}, "budget") from e
             except FatalApiError as e:  # not a pause: commit nothing of T, keep the spend, propagate
                 committed.spent_usd = active_llm.spent_usd
+                committed.spent_by_model = by_model()
                 checkpoint.save(committed.to_json())  # persist the spend before anything else
                 _emit(elog, "exception", "fatal_api_error", e, day=T)
                 raise
@@ -725,6 +768,7 @@ def run_backtest(cfg: BacktestConfig, store: PriceStore, pipeline: Pipeline, bro
             st.cash, st.positions = portfolio.cash, dict(portfolio.positions)
             st.weights = new_w
             st.spent_usd = active_llm.spent_usd
+            st.spent_by_model = by_model()
             st.predlog_head = predlog.head()
             st.last_completed_day = T
             day_results[T] = DayResult(T, day.regime, results,

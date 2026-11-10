@@ -52,6 +52,13 @@ settings; `report` reads only the stored record. Unknown config keys are rejecte
 did-you-mean hint. One LLM hard cap (budget_usd) spans the backtest, the control agent and
 autoresearch of a run directory.
 
+Hub and spoke (settings.spoke_model, per-agent `model`): one client and one CachedLLM per model
+in use, all on ONE shared Budget (the cap above) and the same response cache file (the key
+includes the model). Every model in use must be priced before any spend; the control agent runs
+on its own effective model (the spoke model when set); autoresearch proposals use the hub
+(settings.model) and replays each agent's own model. A multi-model checkpoint also records
+spent_by_model, and the report then shows a model column and per-model cost.
+
 (optional) ``atlas probe`` asks the model to guess the date and ticker of ANONYMISED snapshots of
 the run's own days (opaque ids, rebased prices, relative day index, sector labels) and records
 how often it succeeds; a high rate means the model can recognise those periods, so trust their
@@ -85,6 +92,7 @@ import math
 import os
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -112,7 +120,9 @@ from atlas.data.fred_provider import FredFetchError
 from atlas.data.store import PriceStore
 from atlas.engine.failures import CALL_FAILURE, FailureLog
 from atlas.errorlog import ErrorLog, NullErrorLog, escape_controls, read_events
-from atlas.engine.llm import BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, StubClient, sanitise
+from atlas.engine.llm import (
+    Budget, BudgetExceeded, CachedLLM, FatalApiError, LLMResponse, StubClient, sanitise,
+)
 from atlas.engine.pipeline import Pipeline
 from atlas.portfolio.models import Portfolio
 from atlas.portfolio.simbroker import SimBroker
@@ -366,9 +376,57 @@ def require_prices(settings: Settings) -> tuple[float, float]:
         raise UsageError(str(e)) from None
 
 
-def anthropic_client(settings: Settings):
+def agent_models(settings: Settings, specs: list[AgentSpec]) -> dict[str, str]:
+    """agent name -> effective model (Settings.agent_model), for every agent incl. control."""
+    return {sp.name: settings.agent_model(sp) for sp in specs}
+
+
+def models_in_use(settings: Settings, specs: list[AgentSpec]) -> list[str]:
+    """Distinct models a run uses: the hub (`settings.model`, which also writes autoresearch
+    proposals) first, then the others in agent order."""
+    return list(dict.fromkeys([settings.model, *agent_models(settings, specs).values()]))
+
+
+def require_model_prices(settings: Settings, specs: list[AgentSpec]) -> dict[str, tuple[float, float]]:
+    """Prices of EVERY model in use (hub, spoke, per-agent overrides, control), checked before
+    any spend: an unpriced model is a usage error because the shared cap could not be enforced."""
+    try:
+        return {m: settings.prices_for(m) for m in models_in_use(settings, specs)}
+    except UnknownModelPrice as e:
+        raise UsageError(str(e)) from None
+
+
+def models_table(settings: Settings, specs: list[AgentSpec]) -> list[str]:
+    """One line per model in use: its role and the agents it serves."""
+    by = agent_models(settings, specs)
+    lines = ["models in use:"]
+    for m in models_in_use(settings, specs):
+        role = ("hub" if m == settings.model else "spoke" if m == settings.spoke_model else "per-agent override")
+        names = [n for n, mm in by.items() if mm == m]
+        lines.append(f"  {m} ({role}): {', '.join(names) if names else 'autoresearch proposals only'}")
+    return lines
+
+
+def anthropic_client(settings: Settings, model: str | None = None):
+    """A client for `model` (default: the hub, `settings.model`). Every client reads the one
+    ANTHROPIC_API_KEY from the environment through the SDK; no key is stored or printed."""
     from atlas.engine.llm import AnthropicClient
-    return AnthropicClient(settings.model, effort=settings.effort)
+    return AnthropicClient(model or settings.model, effort=settings.effort)
+
+
+def client_for(llm_client, settings: Settings, model: str, *, dry_run: bool = False):
+    """The client serving `model`. `llm_client` (tests) is one client for every model or a
+    mapping model -> client; otherwise _NoCalls in a dry run, else a real per-model client."""
+    if isinstance(llm_client, Mapping):
+        try:
+            return llm_client[model]
+        except KeyError:
+            raise UsageError(f"no client was supplied for model '{model}'") from None
+    if llm_client is not None:
+        return llm_client
+    if dry_run:
+        return _NoCalls()
+    return anthropic_client(settings, model)
 
 
 def resolve_periods(rc: RunConfig) -> Periods:
@@ -436,7 +494,9 @@ class Run:
     periods: Periods
     store: PriceStore
     macro_series: list[str]
-    llm: CachedLLM | None = None
+    llm: CachedLLM | None = None  # the hub (settings.model): proposals, cap narrowing, restore
+    llms: dict[str, CachedLLM] | None = None  # model -> CachedLLM, all sharing llm.budget
+    models: dict[str, str] | None = None  # agent -> effective model (every agent, control too)
     failures: FailureLog | None = None
     pipeline: Pipeline | None = None
     notes: list[str] = field(default_factory=list)
@@ -517,6 +577,7 @@ def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = No
         raise UsageError(f"cannot load limits file {lim_path}: {type(e).__name__}") from None
     specs = load_specs(rc)
     check_cutoffs(settings, specs)
+    prices = require_model_prices(settings, specs)  # every model in use, before any spend
     prompts = load_prompts(rc, specs)
     periods = resolve_periods(rc)
     notes = []
@@ -531,18 +592,22 @@ def build_run(rc: RunConfig, *, offline: bool = False, fred_key: str | None = No
     run = Run(rc, settings, limits, specs, prompts, periods, store, series, notes=notes,
               errors=open_error_log(rc.path(ERRORS_NAME)))
     if llm_client is not None or not offline:
-        client = llm_client
-        if client is None:
-            if dry_run:
-                client = _NoCalls()
-            else:
-                client = anthropic_client(settings)
-        run.llm = CachedLLM(client, rc.llm_cache_path, settings.model, require_prices(settings),
-                            settings.budget_usd)
+        # one client and one CachedLLM per model, all on ONE Budget (one hard cap across models)
+        # and the same cache file (the cache key includes the model)
+        budget = Budget(settings.budget_usd)
+        run.llms = {m: CachedLLM(client_for(llm_client, settings, m, dry_run=dry_run), rc.llm_cache_path, m,
+                                 prices[m], settings.budget_usd, budget=budget)
+                    for m in models_in_use(settings, specs)}
+        run.llm = run.llms[settings.model]
+        run.models = agent_models(settings, specs)
         run.failures = FailureLog(rc.path(failures_name), error_log=run.errors)
         run.pipeline = Pipeline(specs, prompts, run.llm, run.failures, run.universe, settings.min_valid_agents,
-                                max_tokens=settings.max_output_tokens)
+                                max_tokens=settings.max_output_tokens, llms=run.llms, models=run.models)
     return run
+
+
+def mixed_models(settings: Settings, specs: list[AgentSpec]) -> bool:
+    return len(models_in_use(settings, specs)) > 1
 
 
 def _write_json(path: Path, obj) -> None:
@@ -756,6 +821,39 @@ def spend_so_far(run_dir: Path) -> dict[str, float]:
     return spent
 
 
+def spend_by_model(run_dir: Path, settings: Settings, specs: list[AgentSpec]) -> dict[str, float]:
+    """The run directory's spend (the same total as spend_so_far) split by model: the
+    backtest from the checkpoint's spent_by_model, the control agent at its own model, the
+    probe at the hub model. Spend that cannot be split (autoresearch, older-model checks, a
+    checkpoint written before per-model tracking) is Budget.UNATTRIBUTED."""
+    run_dir = Path(run_dir)
+    spent = spend_so_far(run_dir)
+    raw = _load_checkpoint(Checkpoint(run_dir / CHECKPOINT)) or {}
+    out: dict[str, float] = {}
+
+    def add(model: str, usd: float) -> None:
+        if usd > 0:
+            out[model] = out.get(model, 0.0) + usd
+
+    bt = raw.get("spent_by_model")
+    if bt is not None:
+        try:
+            split = {str(m): float(v) for m, v in bt.items()}
+        except (AttributeError, TypeError, ValueError):
+            raise OperationalError(f"checkpoint is corrupt (spent_by_model): {run_dir / CHECKPOINT}") from None
+        if not all(math.isfinite(v) and v >= 0 for v in split.values()):
+            raise OperationalError(f"checkpoint is corrupt (spent_by_model): {run_dir / CHECKPOINT}")
+        for m, v in split.items():
+            add(m, v)
+    else:
+        add(Budget.UNATTRIBUTED, spent["backtest"])
+    control = next((sp for sp in specs if sp.kind == "control"), None)
+    add(settings.agent_model(control) if control is not None else Budget.UNATTRIBUTED, spent["control"])
+    add(settings.model, spent["probe"])
+    add(Budget.UNATTRIBUTED, spent["autoresearch"] + spent["older_model"])
+    return out
+
+
 def _spent_by(spent: dict[str, float], *names: str) -> float:
     return sum(spent[n] for n in names)
 
@@ -797,6 +895,8 @@ def cmd_backtest(args, llm_client=None) -> int:
         print(f"note: {n}")
     if args.dry_run:
         print(f"dry run: zero LLM calls (built-in neutral stub); no keys needed; state in {rc.run_dir}")
+    if args.dry_run or mixed_models(run.settings, run.specs):
+        print("\n".join(models_table(run.settings, run.specs)))
     checkpoint = Checkpoint(rc.path(CHECKPOINT))
     lcd = _last_completed(checkpoint)
     stored = read_stored(rc.run_dir)
@@ -824,8 +924,10 @@ def cmd_backtest(args, llm_client=None) -> int:
     except MissingPriceData as e:
         raise OperationalError(str(e)) from None
     todo = [d for d in all_days if lcd is None or d > lcd]
-    n_agents = sum(1 for sp in run.specs if sp.kind != "control") + (1 if args.with_control else 0)
-    est = estimate_cost(cfg, len(todo), n_agents)
+    # each agent priced at its own model (the control agent at its model when --with-control)
+    est_models = [run.models[sp.name] for sp in run.specs if sp.kind != "control"] + (
+        [run.models[control[0].name]] if args.with_control else [])
+    est = estimate_cost(cfg, len(todo), len(est_models), est_models)
     confirmed = args.yes
     if est > run.settings.confirm_cost_usd:
         if not _confirm(est, run.settings.confirm_cost_usd, args.yes):
@@ -895,8 +997,11 @@ def run_control_pass(run: Run, scores: ScoreStore, result: BacktestResult, all_d
         other = spend_so_far(run.rc.run_dir)  # one hard cap across backtest, control, autoresearch
         remaining = max(0.0, run.settings.budget_usd - result.spent_usd - prev
                         - _spent_by(other, "autoresearch", "probe", "older_model"))
-        llm = CachedLLM(run.llm.client, run.rc.llm_cache_path, run.settings.model,
-                        require_prices(run.settings), remaining)
+        # the control agent's own model (the spoke model when set) with that model's prices; a
+        # private cap of what remains, so llm.spent_usd is the control agent's spend alone
+        model = run.models[spec.name]
+        llm = CachedLLM(run.llms[model].client, run.rc.llm_cache_path, model,
+                        run.settings.prices_for(model), remaining)
     last = max(result.equity.index)
     days = [d for d in all_days if d <= last]
     done = 0
@@ -1067,7 +1172,9 @@ def _make_replay(run: Run) -> Replay:
     if _last_completed(ckpt) is None:
         raise OperationalError(f"no stored run in {rc.run_dir}: run `atlas backtest --config ...` first")
     ar_failures = FailureLog(rc.path(AR_FAILURES), error_log=run.errors)
-    pipe = Pipeline(run.specs, run.prompts, run.llm, ar_failures, run.universe, run.settings.min_valid_agents)
+    # replays route each agent to its own model (same clients, same shared budget as run.llm)
+    pipe = Pipeline(run.specs, run.prompts, run.llm, ar_failures, run.universe, run.settings.min_valid_agents,
+                    llms=run.llms, models=run.models)
     return Replay(run, pipe, run.trading_days(), read_day_history(rc.path(HISTORY_NAME), ckpt),
                   predlog_results(rc.path(PREDLOG)))
 
@@ -1121,6 +1228,9 @@ def cmd_autoresearch(args, llm_client=None) -> int:
           "(run it from a dedicated branch of a clean checkout)")
     run = build_run(rc, fred_key=fred_key, llm_client=llm_client)
     stored_run(rc, run, "autoresearch")  # train/holdout split and settings of the STORED run (ruling U)
+    if agent_models(run.settings, run.specs) != run.models or models_in_use(run.settings, run.specs) != list(run.llms):
+        # cannot happen while model settings stay outside ALLOWED_DRIFT; never replay on other models
+        raise OperationalError("the stored run's agent models differ from the clients built for this command")
     replay = _make_replay(run)
     if run.settings.confirm_on_validation:
         # same eligibility as the loop: validation days whose scoring exit is also inside validation
@@ -1346,7 +1456,10 @@ def cmd_report(args, llm_client=None) -> int:
                         autoresearch_null_meta=ar_metas,
                         holdout_edit_ics=None, final_weights=final_weights,
                         dropped_picks=failures.dropped_picks_summary(), turnover=turnover,
-                        contamination=contamination, errors=error_events)
+                        contamination=contamination, errors=error_events,
+                        **({"agent_models": agent_models(settings, specs),
+                            "spent_by_model": spend_by_model(run_dir, settings, specs)}
+                           if mixed_models(settings, specs) else {}))
     print(f"null distribution: {null_src}; CIO ablation: {'computed' if by_period else 'not provided'}; "
           f"turnover: {'computed' if turnover is not None else 'not provided'}")
     print(f"wrote {path}")
@@ -1423,9 +1536,8 @@ def cmd_probe(args, llm_client=None) -> int:
     est = samples * (settings.est_input_tokens_per_call * p_in + 100 * p_out) / 1e6
     if est > settings.confirm_cost_usd and not _confirm(est, settings.confirm_cost_usd, args.yes):
         return EXIT_USAGE
-    client = llm_client
-    if client is None:
-        client = anthropic_client(settings)
+    # the hub model only (its own prices); a private cap of what remains of the run's one cap
+    client = client_for(llm_client, settings, settings.model)
     llm = CachedLLM(client, rc.llm_cache_path, settings.model, (p_in, p_out), remaining)
     universe = list(dict.fromkeys(settings.universe))
     labels = probe_sector_labels(universe)
